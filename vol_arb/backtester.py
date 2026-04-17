@@ -114,6 +114,15 @@ class BacktestConfig(BaseModel):
     profit_filter_min_ratio: float = 0.0    # min est_net / |est_gross|
     profit_filter_edge_discount: float = 0.5  # model captures ~50% of predicted edge
     profit_filter_min_abs: float = 0.0      # min est_net_per_btc in $ (0 = ratio-only)
+    # Empirical-Bayes shrinkage for est_gross: blend the realized per-BTC gross
+    # EMA with the per-signal theoretical prior (edge*vega*discount). The blend
+    # weight λ = count / (count + τ) grows smoothly with the number of realized
+    # trades. This replaces the old hard cliff (count>=200 switch) which could
+    # create a self-reinforcing deadlock: if the realized EMA landed below the
+    # gate at warmup-end, the filter blocked all trades, which froze the EMA,
+    # which kept the filter blocking. τ=200 matches the former warmup threshold
+    # semantically (50/50 blend at 200 obs) and degenerates smoothly thereafter.
+    profit_filter_shrinkage_tau: float = 200.0
 
     # A2: Slippage-adjusted dynamic threshold — adds slip-in-vol-pts to threshold
     use_slip_adjusted_threshold: bool = False
@@ -1200,8 +1209,16 @@ class VolArbBacktester:
         T_years = df["T_years"].values
         sigma_dec = iv_entry / 100.0  # IV in decimal for BS delta
 
-        # Adverse selection on maker fills (same magnitude for all instruments)
-        effective_entry_iv = iv_entry + signal * cfg.maker_adverse_selection_iv
+        # Maker adverse-selection penalty is the MAKER's cost — a fill that
+        # earns spread but is adversely selected by informed counterparties.
+        # Taker fills pay half-spread via the slippage model (bar_taker_slip
+        # × size_mult, added to straddle_slip in the per-bar loop) and should
+        # NOT also be charged this penalty. The up-front vega_pnl_btc is
+        # computed WITHOUT the penalty; it is subtracted inside the PnL loop
+        # ONLY on bars where `maker_filled_arr[i] == True` (SOR confirmed a
+        # maker fill). Fix 2026-04-18 — previously the penalty was applied
+        # unconditionally to every trade, double-counting spread cost on
+        # taker fills (100% of current trades) by 0.5 * Σ|vega|*N ≈ $1.48M NC.
 
         # Realized vol (from TSRV, decimal) — drives the simulated price path.
         # Use lagged vol_ann: vol_ann[T] is the realized vol OF bar T (open-stamped),
@@ -1254,12 +1271,12 @@ class VolArbBacktester:
         # scaled by the strangle's actual vega.
         atm_iv_entry = df["iv_used"].values
         atm_iv_exit = iv_exit  # iv_exit is already ATM (from align_exits on iv_used)
-        # Adverse selection penalty still applies to the entry (maker fill model)
-        atm_effective_entry_iv = atm_iv_entry + signal * cfg.maker_adverse_selection_iv
-        # dIV: strangles use ATM-to-ATM move; ATM straddles use the original formula
+        # dIV: strangles use ATM-to-ATM move; ATM straddles use the original
+        # formula. Both use UNPENALIZED entry IVs — the maker adverse-selection
+        # cost is handled per-bar inside the loop (see docstring above).
         is_routed = instrument_type != 0
-        dIV_atm_consistent = atm_iv_exit - atm_effective_entry_iv
-        dIV_original = iv_exit - effective_entry_iv
+        dIV_atm_consistent = atm_iv_exit - atm_iv_entry
+        dIV_original = iv_exit - iv_entry
         dIV = np.where(is_routed, dIV_atm_consistent, dIV_original)
 
         vega_pnl_btc = signal * vega_s * dIV
@@ -1695,10 +1712,16 @@ class VolArbBacktester:
                             skip_trade = True
                             slip_thresh_filtered_arr[i] = True
 
-                    # A1: Pre-trade expected profit filter
-                    # Uses rolling EMA of actual per-BTC gross PnL (once warmed
-                    # up) for an accurate profit estimate, plus edge*vega*discount
-                    # as a theoretical cross-check.
+                    # A1: Pre-trade expected profit filter.
+                    # Uses an empirical-Bayes shrinkage estimator for expected
+                    # per-BTC gross PnL: blend the rolling EMA of realized gross
+                    # (observed only on executed trades) with a per-signal
+                    # theoretical prior (edge*vega*discount, always fresh from
+                    # the current bar). Shrinkage weight λ = n/(n+τ) where n is
+                    # the count of executed trades and τ=profit_filter_shrinkage_tau.
+                    # Because the theoretical prior never goes stale, the estimator
+                    # cannot self-reinforce a lockout even if the realized EMA
+                    # drops below the gate.
                     if cfg.use_profit_filter and not skip_trade:
                         est_hedge = (
                             _hedge_cost_ema
@@ -1706,15 +1729,15 @@ class VolArbBacktester:
                             else 2.0 * cfg.perp_taker_fee * S[i]
                         )
                         est_costs = _est_full_slip + est_hedge + option_fee_btc[i]
-                        # Two profit estimates: rolling EMA and theoretical
                         est_theo = (
                             edge_arr[i] * _vega_abs
                             * cfg.profit_filter_edge_discount
                         )
+                        _tau = max(cfg.profit_filter_shrinkage_tau, 1e-6)
+                        _lam = _gross_pnl_count / (_gross_pnl_count + _tau)
                         est_gross = (
-                            _gross_pnl_per_btc_ema
-                            if _gross_pnl_count >= 200
-                            else est_theo
+                            _lam * _gross_pnl_per_btc_ema
+                            + (1.0 - _lam) * est_theo
                         )
                         est_net = est_gross - est_costs
                         est_ratio = est_net / max(abs(est_gross), 1e-6)
@@ -1727,7 +1750,10 @@ class VolArbBacktester:
                             skip_trade = True
                             profit_filtered_arr[i] = True
 
-                    # A3: Profit-ratio position scaling (soft — doesn't skip)
+                    # A3: Profit-ratio position scaling (soft — doesn't skip).
+                    # Same empirical-Bayes shrinkage estimator as A1 so the two
+                    # stay coherent — otherwise A3 could scale down to the floor
+                    # on a frozen EMA while A1 (if disabled) passes the trade.
                     if cfg.use_profit_scaling and not skip_trade and N[i] > 0:
                         est_hedge = (
                             _hedge_cost_ema
@@ -1735,11 +1761,15 @@ class VolArbBacktester:
                             else 2.0 * cfg.perp_taker_fee * S[i]
                         )
                         est_costs = _est_full_slip + est_hedge + option_fee_btc[i]
-                        est_gross = (
-                            _gross_pnl_per_btc_ema
-                            if _gross_pnl_count >= 200
-                            else edge_arr[i] * _vega_abs
+                        est_theo = (
+                            edge_arr[i] * _vega_abs
                             * cfg.profit_filter_edge_discount
+                        )
+                        _tau = max(cfg.profit_filter_shrinkage_tau, 1e-6)
+                        _lam = _gross_pnl_count / (_gross_pnl_count + _tau)
+                        est_gross = (
+                            _lam * _gross_pnl_per_btc_ema
+                            + (1.0 - _lam) * est_theo
                         )
                         est_net = est_gross - est_costs
                         est_ratio = est_net / max(abs(est_gross), 1e-6)
@@ -1826,8 +1856,22 @@ class VolArbBacktester:
                             straddle_slip += 2.0 * _exit_bar_slip
                     slippage_arr[i] = straddle_slip
 
+                    # Maker adverse-selection penalty — applied ONLY when a
+                    # maker fill was confirmed by SOR (maker_filled_arr[i]).
+                    # Taker fills already paid half-spread via straddle_slip
+                    # and must not be charged this penalty. Because straddle
+                    # vega is always >=0 for a long straddle and the penalty
+                    # shifts entry IV against the trade direction (signal*penalty),
+                    # the per-BTC cost is `vega_s * penalty` regardless of signal.
+                    maker_adv_sel_penalty = (
+                        vega_s[i] * cfg.maker_adverse_selection_iv
+                        if maker_filled_arr[i]
+                        else 0.0
+                    )
+
                     # Per-BTC net PnL: vega + theta + discrete hedge PnL
                     #                  - option fees - option slippage - hedge costs
+                    #                  - maker adverse selection (maker fills only)
                     pnl_per_btc = (
                         vega_pnl_btc[i]
                         + theta_pnl_btc[i]
@@ -1835,6 +1879,7 @@ class VolArbBacktester:
                         - option_fee_btc[i]
                         - straddle_slip
                         - hedge_costs_btc[i]
+                        - maker_adv_sel_penalty
                     )
                     trade_pnl[i] = N[i] * pnl_per_btc
 

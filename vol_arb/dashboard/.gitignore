@@ -1,0 +1,10 @@
+node_modules/
+dist/
+public/report.json
+public/report.json.gz
+*.log
+.DS_Store
+
+# Override root .gitignore's `data/` rule — this `src/data/` holds source code.
+!src/data/
+!src/data/**

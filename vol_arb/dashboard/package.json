@@ -1,0 +1,35 @@
+{
+  "name": "btc-volarb-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview --port 8765",
+    "etl": "python etl/build_report.py --in ../output/BTC_v2_trade_log.parquet --out public/report.json"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@visx/shape": "^3.12.0",
+    "@visx/scale": "^3.12.0",
+    "@visx/axis": "^3.12.0",
+    "@visx/grid": "^3.12.0",
+    "@visx/heatmap": "^3.12.0",
+    "@visx/group": "^3.12.0",
+    "@visx/responsive": "^3.12.0",
+    "@visx/tooltip": "^3.12.0",
+    "d3-array": "^3.2.4",
+    "d3-time-format": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/d3-array": "^3.2.1",
+    "@types/d3-time-format": "^4.0.3",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1"
+  }
+}

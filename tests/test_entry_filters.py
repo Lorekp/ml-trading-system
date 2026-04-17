@@ -241,7 +241,10 @@ def test_btc_production_v2_preset():
     assert cfg.use_profit_scaling is True
     assert cfg.profit_scaling_floor == 0.3
     assert cfg.target_margin_utilization == 0.15
-    assert cfg.holding_minutes == 30
+    # Foundation fix 2026-04-17: hold aligned to prediction horizon [D, D+15m].
+    # Previously 30m (collected un-forecast theta in 2nd bar); flipped to 15m.
+    # See vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md.
+    assert cfg.holding_minutes == 15
     # sizing_model INTENTIONALLY unchanged at composite_v2 — Kelly
     # broke compound-mode scaling per Phase B.3 re-test.
     assert cfg.sizing_model == "composite_v2"
@@ -255,7 +258,8 @@ def test_v2_composes_with_realistic_costs():
     assert cfg.base_spread_iv == 2.0
     # v2 additions applied
     assert cfg.use_drl_hedging is True
-    assert cfg.holding_minutes == 30
+    # Foundation fix 2026-04-17: hold aligned to [D, D+15m] prediction window.
+    assert cfg.holding_minutes == 15
     assert cfg.skip_long_if_term_slope_gt == 0.0
 
 

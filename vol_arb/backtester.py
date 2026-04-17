@@ -403,9 +403,17 @@ class BacktestConfig(BaseModel):
         3. ``target_margin_utilization=0.15`` (up from 0.075) — capital-
            scale against lower MDD from profit_scaling, recovered PnL
            to exceed v1 (Phase A.4 combo).
-        4. ``holding_minutes=30`` (up from 15) — longer vega exposure
-           exceeds fee break-even; theta PnL flips positive (Phase B.2,
-           +43% PnL vs v1-based, +14% OOS Sharpe).
+        4. ``holding_minutes=15`` — matches the model's prediction
+           horizon ``[D, D+15m]`` exactly, so the trade's exposure
+           window is the SAME 15-min bar the model was trained to
+           forecast. A prior iteration used ``holding_minutes=30``
+           (Phase B.2, +43% PnL / +14% OOS Sharpe) but that gain was
+           dominated by theta carry over the second (un-forecast)
+           15-min bar, not by signal edge extraction. Holding to
+           15m disentangles signal quality from theta-carry and
+           gives a foundation where PnL directly reflects forecast
+           skill. Foundation fix 2026-04-17; see
+           ``vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md``.
         5. ``skip_long_if_term_slope_gt=0.0`` — drop LONG signals in IV
            contango (svi_term_slope_1w_2w > 0). 5/5 years negative in
            contango longs vs 5/5 positive in backwardation. Natural
@@ -433,10 +441,11 @@ class BacktestConfig(BaseModel):
         Expected v2 vs v1 baseline:
           v1: $308K NC over 5y, Sharpe 8.31, MDD 9.01%,
               compound $4.06M (41.6x on $100K)
-          v2: ~$726K NC over 5y (+135%), Sharpe ~12.6, MDD ~9.9%,
-              compound ~$12.0M (121x on $100K), all 5 years positive,
-              OOS Sharpe ~10.7 (easy) / ~12.8 (hard split),
-              ~10.0 (very-hard 1-year-train split).
+          v2 (pre-foundation-fix, hold=30m, historical): $726K NC,
+              Sharpe 12.56, MDD 9.91%. Superseded by foundation fix.
+          v2 (post-foundation-fix, hold=15m, current): numbers land
+              after regen of BTC_v2_trade_log.parquet; see
+              ``vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md``.
         """
         return self.with_btc_production_filters().model_copy(update=dict(
             entry_threshold_long=12.0,
@@ -444,7 +453,7 @@ class BacktestConfig(BaseModel):
             use_profit_scaling=True,
             profit_scaling_floor=0.3,
             target_margin_utilization=0.15,
-            holding_minutes=30,
+            holding_minutes=15,
             # sizing_model stays "composite_v2" (the v1 default) —
             # Kelly tested but broke compound-mode path.
             skip_long_if_term_slope_gt=0.0,

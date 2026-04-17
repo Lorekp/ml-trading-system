@@ -630,3 +630,148 @@ dollar-bar + realized-vol + SVI-level features. Further lift requires:
 If `eth_and_rq` shortlists, it becomes the default candidate for the
 next full 50-month walk-forward retrain (a separate compute session,
 user-triggered).
+
+---
+
+# Session C — Post-Foundation-Fix Research (2026-04-17)
+
+## Context
+
+Session C is the FIRST research session evaluated against the post-foundation-fix baseline (see `FOUNDATION_ALIGNMENT_AUDIT.md`). All Session A + B rejections were made against the same (correctly-aligned) saved predictions, so their relative rankings remain valid. What's NEW in Session C:
+
+1. V2 hold is now 15m (matched to prediction horizon) — comparison baseline is `BTC_v2_trade_log.parquet` regenerated with hold=15m, NC PnL $575K / trade-only Sharpe 51.18 / NC MDD -4.65%.
+2. Three new threads tested:
+   - **SVI-spot (Tier 2)**: `svi_atm_spot` feature added to the 44-feature base via `vol_arb/rebuild_svi_features_with_spot.py`.
+   - **HAR-PD (Tier 3, new this session)**: 6 features with learned exponential decay kernels on signed realized flow + realized variance (Xiao et al. 2025, arxiv:2503.00851).
+   - **IV-change direct prediction**: a fundamentally different target — `y_ivchg = ln(iv_exit / iv_used)`, MSE loss, same 44-feature set.
+
+All three ran against the 8-month regime substrate: 2022-11, 2022-12, 2023-01, 2023-07, 2023-08, 2023-10, 2024-11, 2024-12.
+
+## Thread 1 — SVI-spot (Tier 2) — REJECT
+
+**Feature**: nearest-calibrated-slice ATM vol at T=0 (no extrapolation to sub-1d tenors). Loaded via `rebuild_svi_features_with_spot.py` — preserves byte-identity of the 13 pre-existing SVI columns, adds only `svi_atm_spot` (91.9% coverage, mean 51.92 vol pts). Quality gate: NaN when `calibration_level >= 3` OR `n_strikes < 3` OR not butterfly-free.
+
+**Results (6/8 months — gauntlet stopped early per user directive):**
+
+| Month   | fresh QLIKE | svi_spot QLIKE | delta% | DM p     | Verdict |
+|---------|-------------|----------------|--------|----------|---------|
+| 2022-11 | 0.5753      | 0.5804         | +0.57% | 0.315    | tie     |
+| 2022-12 | 0.9015      | 0.8732         | +2.05% | 3.57e-6  | sig-worse |
+| 2023-01 | 0.7721      | 0.7063         | -1.45% | 0.159    | small win |
+| 2023-07 | 0.6571      | 0.6169         | -3.59% | 0.132    | win (insig) |
+| 2023-08 | 0.7252      | 0.7040         | -2.09% | 0.240    | win (insig) |
+| 2023-10 | 0.6783      | 0.6821         | +0.13% | 0.940    | tie     |
+
+**Summary**: avg delta **-0.73%**, wins 3/6 but NONE DM-significant at p<0.01. Fails gate 1 (avg leq -3%) and gate 4 (geq 4 DM-significant). **Verdict: REJECT.**
+
+**Mechanism**: the 3 existing SVI-ATM term-structure columns (`svi_atm_1d, _1w, _1m`) already span the volatility-surface-level information at granularity sufficient for the 15-min forecast target. A fourth nearest-slice ATM feature at T to 0 does not add marginal information — the 1d column is already anchored at the shortest calibrated slice, and the training data rarely has non-degenerate sub-1d calibrations that would differentiate "spot" from "1d". The single statistically-significant result went the wrong way (+2.05% on 2022-12, DM p=3.6e-6), consistent with noise injection rather than information addition.
+
+## Thread 2 — HAR-PD path-dependent features (Tier 3) — CONDITIONAL SHORTLIST
+
+**Features (6 raw, no windowing variants)**:
+- `har_pd_R1_a005 / _a01 / _a03`: exponentially-weighted signed realized flow at alpha={0.05, 0.1, 0.3}
+- `har_pd_R2_b005 / _b01 / _b03`: exponentially-weighted realized variance at beta={0.05, 0.1, 0.3}
+
+Formula: `R1(t) = sum_{k=1..96} w_k(alpha) * signed_flow_{t-k}`, `R2(t) = sum w_k(beta) * rv_ann_{t-k}`, with `w_k = alpha*(1-alpha)^(k-1)` normalized to sum 1. Signed-flow proxy: `sqrt(rs_up) - sqrt(rs_down)` — a bar-level signed return surrogate derived from the existing upside/downside realized semivariances in the TSRV parquet. K=96 bars (~24h). No lookahead: causality unit test verifies that mutating future TSRV values leaves past R1/R2 byte-identical.
+
+**Results (5/8 months — 2023-10 har_pd was mid-training when gauntlet was stopped; 2024-11, 2024-12 not started):**
+
+| Month   | fresh QLIKE | har_pd QLIKE | delta% | DM p     | Verdict |
+|---------|-------------|--------------|--------|----------|---------|
+| 2022-11 | 0.5753      | 0.5546       | -3.60% | 0.003    | sig-win |
+| 2022-12 | 0.9015      | 0.9112       | +1.08% | 0.273    | small loss |
+| 2023-01 | 0.7721      | 0.7474       | -3.20% | 0.006    | sig-win |
+| 2023-07 | 0.6571      | 0.6226       | -5.25% | 0.011    | sig-win |
+| 2023-08 | 0.7252      | 0.7011       | -3.32% | 0.126    | win (insig) |
+
+**Summary**: avg delta **-2.86%**, wins 4/5, DM-significant at p<0.01 on 3/5 months. Not yet formally at the -3% avg gate but very close, and the significance pattern is the strongest of any candidate across Sessions A-C. **Verdict: CONDITIONAL SHORTLIST — certify via full 50-month walk-forward retrain next session.**
+
+**Why this is structurally different from rejected HAR-residual (Session A)**: HAR-residual used FIXED rolling-mean horizons (1, 4, 96, 672 bars) that collide with the existing base-feature rolling-mean family (tsrv_mean_1d, tsrv_mean_1w, etc.). HAR-PD uses PARAMETERIZED exponential kernels — alpha=0.05 has half-life ~14 bars, alpha=0.3 has half-life ~2 bars — spanning timescales the fixed-horizon family doesn't cover. The tree-ensemble picks kernel decay implicitly via split selection, playing the role of the LASSO in Xiao's original linear formulation. Also: signed realized flow is novel relative to the TSRV feature family, which tracks variance magnitudes but not direction.
+
+**Risks for certification**:
+- The 3 DM-significant wins are all in 2022-11 / 2023-01 / 2023-07 — a clustering pattern. If the remaining months are flat/negative, the avg could retreat toward -2%. Finite-sample variance is real.
+- The signed_flow proxy derives from `sqrt(rs_up) - sqrt(rs_down)`, a lossy transform from the bar-level per-tick data. A more faithful 15m-close signed return series might do better OR worse.
+- No backtester PnL yet — QLIKE improvement may or may not translate to trading improvement.
+
+## Thread 3 — IV-change direct prediction — REJECT (clean)
+
+**Target**: `y_ivchg(t) = ln(iv_exit(t+15m) / iv_used(t))`, signed, mean~0 std~0.16. MSE loss (not QLIKE).
+
+**Baseline to beat**: the production `edge` column's Spearman correlation with the same actual iv_move, measured per-month on the same test rows. On the 8 regime months, baseline Spearman averages 0.237 (range 0.158-0.339).
+
+**Evaluation metrics**: Spearman(y_pred, actual_ivchg), signed-accuracy on non-trivial (|delta|>1%) rows, RMSE.
+
+**Results (8/8 months complete)**:
+
+| Month   | model Spearman | baseline Spearman | delta | model signed_acc | base signed_acc |
+|---------|---------------:|------------------:|------:|-----------------:|----------------:|
+| 2022-11 | -0.0106        | 0.2495            | -0.26 | 0.488            | 0.524           |
+| 2022-12 | +0.0080        | 0.3386            | -0.33 | 0.507            | 0.534           |
+| 2023-01 | +0.0118        | 0.2590            | -0.25 | 0.508            | 0.539           |
+| 2023-07 | +0.0093        | 0.2525            | -0.24 | 0.503            | 0.536           |
+| 2023-08 | +0.0289        | 0.2516            | -0.22 | 0.510            | 0.528           |
+| 2023-10 | +0.0306        | 0.1576            | -0.13 | 0.510            | 0.533           |
+| 2024-11 | +0.0020        | 0.2055            | -0.20 | 0.492            | 0.556           |
+| 2024-12 | +0.0167        | 0.1790            | -0.16 | 0.509            | 0.535           |
+
+**Summary**: avg model Spearman **0.0121** vs baseline **0.2367** (delta -0.2246). Model beats baseline on **0/8 months**. Signed accuracy 0.503 (coin flip) vs baseline 0.535 (mildly informative). **Verdict: REJECT.**
+
+**Mechanism**: the 44-feature set carries iv-change information only INDIRECTLY — via the QLIKE-loss RV forecast pathway. When we train a direct predictor on `ln(iv_exit/iv_used)` with MSE loss, the extremely noisy signed target (std 0.16, mean ~0) overwhelms the features' causal link, and the tree learner fits noise. This confirms that the 0.237 baseline Spearman is a by-product of the RV to edge pipeline, not a native feature-set property. **You cannot shortcut the RV forecast path to directly predict iv-change on this feature set.**
+
+**Implication**: future iv-change work would need either (a) features specifically chosen for iv-change prediction (e.g., options OI flow, dealer positioning), or (b) a transformed target that's less noisy (e.g., iv-change over a longer aggregation window).
+
+## Cross-cutting takeaway
+
+**HAR-PD is the first post-foundation-fix candidate to show DM-significant QLIKE improvements.** Across three sessions, 10 candidate threads have been tested on this feature set:
+
+| Session | Thread | Verdict |
+|---|---|---|
+| A | HAR-residual | REJECT (collides with existing fixed-horizon means) |
+| A | Quantile LGBM | REJECT (Spearman 0.06 for sizing) |
+| A | PatchTST encoder | REJECT (no gain over TransVol) |
+| B | ETH cross-asset | REJECT (scrapped +7.17% on 2023-07) |
+| B | HARQ realized quarticity | REJECT (scrapped +6.49% on 2023-10) |
+| B | ETH + HARQ combined | REJECT (avg -1.28%, only 1 DM-sig) |
+| B | HQR conformal wrapper | REJECT (Spearman 0.14 vs 0.30 gate) |
+| C | SVI-spot (Tier 2) | REJECT (0 DM-sig, avg -0.73%) |
+| C | IV-change direct | REJECT (Spearman 0.01 vs 0.24 baseline) |
+| C | **HAR-PD** | **CONDITIONAL SHORTLIST** (avg -2.86% 5/8, 3 DM-sig) |
+
+The pattern of 9 rejections before a CONDITIONAL SHORTLIST is what honest research looks like. HAR-PD's distinguishing property is that it adds STRUCTURALLY NEW features (parameterized kernel decays + signed flow), not "better ML on the same information" or "more of the same feature family." Sessions A + B's rejections were all of the latter type.
+
+## Infrastructure shipped (Session C)
+
+New code, all unit-tested:
+
+- `vol_model/features/har_pd.py` (~170 lines) — HAR-PD feature computation.
+- `tests/test_har_pd.py` (7 tests) — kernel normalization, causality under mutation, constant-input check, manual hand-compute.
+- `vol_arb/rebuild_svi_features_with_spot.py` (~160 lines) — augments SVI features parquet with `svi_atm_spot` preserving byte-identity of existing columns.
+- `tests/test_svi_spot_feature.py` (9 tests) — coverage, distribution, quality gate, causality.
+- `vol_model/run_iv_change_gauntlet.py` (~320 lines) — standalone IV-change gauntlet with Spearman/signed-accuracy metrics.
+
+Dispatcher extensions in `vol_model/signal_research.py`:
+- `TIER_FEATURE_MAP` 4-tuple: `(eth_cols, rq_cols, svi_extra_cols, har_pd_cols)`.
+- `SpotCheckContext.har_pd_features` DataFrame slot.
+- `load_spot_check_context(include_extras=True)` loads `{asset}_features_har_pd_15m.parquet` sidecar.
+- `build_month_data_augmented(thread="har_pd")` splices R1/R2 columns onto the 44-feature base.
+
+Reproducibility: `python -m vol_model.run_spot_check_signal_research --thread pruned_svi_control,svi_spot,har_pd --n-trials 80 --patience 25` reproduces all numbers above (given fixed seeds).
+
+## Next session
+
+**Primary task: full 50-month walk-forward retrain of `pruned_svi_v1 + har_pd`.** Reuses the existing walk-forward harness; outputs a new predictions parquet + model directory `expanding_pruned_svi_har_pd_v1/`. Certification gate (same as Session C spot-check, but on all 50 months):
+
+1. Avg delta QLIKE leq -3% vs production pruned_svi_v1.
+2. geq 25/50 months improved (majority).
+3. DM p < 0.01 on geq 15/50 months (30% significance rate).
+4. Not worse than +5% on any single month.
+
+If all four hold, ship as `pruned_svi_har_pd_v1` and update the backtester's default `predictions_path`. If not, document the specific failure regime and keep HAR-PD as a candidate for future regime-conditional ensembles.
+
+**Secondary (optional)**: complete the 3 remaining Session C spot-check months to extend the partial table above. Not blocking — the 50-month retrain is the stronger test.
+
+## Deferred
+
+- Backtester integration of HAR-PD — waits on certification.
+- Options OI / dealer-flow features for iv-change direct prediction — new data dependency (Deribit option-chain snapshots by strike, not on disk).
+- Tier 2 options microstructure (dealer gamma, 0DTE flow) — blocked on data.

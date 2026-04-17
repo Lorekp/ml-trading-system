@@ -1,0 +1,284 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECRETS — never commit. Multiple defensive layers: name, extension, dir.
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+*.env.*
+# Allowlist the non-secret template AFTER the deny rules so it wins
+!.env.example
+
+# API credentials / tokens by convention
+credentials.*
+secrets.*
+*_credentials.*
+*_secrets.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+.netrc
+.pgpass
+
+# Cloud provider credentials
+.aws/
+.gcp/
+.azure/
+*google-credentials*.json
+*service-account*.json
+
+# Session / auth tokens (apps often dump these in JSON)
+*_token.json
+*_token.txt
+auth.json
+session.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DATA — historical trades, LOB, databases. Always large, regenerable.
+# ─────────────────────────────────────────────────────────────────────────────
+data/
+!data/.gitkeep
+downloader/**/*.parquet
+downloader/**/*.csv
+downloader/**/*.zst
+downloader/**/*.zip
+
+# DB files (SQLite / LevelDB / RocksDB artifacts)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Large columnar / binary formats
+*.parquet
+*.feather
+*.hdf5
+*.h5
+*.pkl
+*.pickle
+*.npz
+*.npy
+*.arrow
+*.orc
+
+# Compressed archives + delimited exports
+*.lz4
+*.zst
+*.gz
+*.tar
+*.zip
+*.csv.lz4
+*.csv.gz
+*.csv.zst
+
+# CSVs are regenerable — track only docs-style CSVs in docs/ and configs/
+*.csv
+!docs/**/*.csv
+!configs/**/*.csv
+!vol_model/output/pruned_features.csv
+!vol_model/output/*_pruned_features.csv
+!vol_model/output/*_drop_features.csv
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODEL WEIGHTS / SERIALIZED ARTIFACTS
+# ─────────────────────────────────────────────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+*.bin
+*.ckpt
+*.tflite
+*.pb
+
+# Directories that typically hold the above
+models/
+vol_model/output/models/
+tokenizer_checkpoint/
+checkpoints/
+ckpt/
+saved_models/
+
+# Scikit-learn / LightGBM / XGBoost (joblib dumps)
+*.joblib
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RESULTS / OUTPUTS — backtest artifacts, plots, logs, JSON dumps
+# ─────────────────────────────────────────────────────────────────────────────
+v3-results/
+v4-results/
+results/
+experiments/
+vol_arb/output/
+vol_model/output/
+TSRV/output/
+deribit_paper/output/
+scripts/forensic/output/
+kronos_3090_package/output/
+
+# Keep human-authored documentation from output dirs (opt-in allowlist).
+# These are the .md writeups + .json configs we DO want under version control.
+!vol_model/output/*.md
+!vol_model/output/SIGNAL_RESEARCH_NOTES.md
+!vol_model/output/LABEL_SHIFT_AUDIT.md
+!TSRV/PIPELINE_DOCUMENTATION.md
+
+# Logs (all formats)
+*.log
+logs/
+*.stackdump
+nohup.out
+
+# Plots / images auto-generated from code
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.svg
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BACKUPS / SNAPSHOTS — can contain historical secrets
+# ─────────────────────────────────────────────────────────────────────────────
+backups/
+*.bak
+*.old
+*.orig
+*~
+*.swp
+*.swo
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PYTHON
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+wheels/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+pyvenv.cfg
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+nosetests.xml
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NODE / JS (when present)
+# ─────────────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnp.*
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IDE / EDITOR
+# ─────────────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.tmproj
+*.tmproject
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  OS
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  VENDORED / THIRD-PARTY CODE (treat as external; use submodules if needed)
+# ─────────────────────────────────────────────────────────────────────────────
+vendor/
+library/hftbacktest/
+kronos_3090_package/kronos/
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SCRATCH / THROWAWAY FILES (prefix convention: _gen, _test, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+_gen*.py
+_nb*.*
+_test_*.txt
+test_stdin.txt
+append_content.py
+append_sections.py
+temp_*.md
+temp_*.txt
+debug_*.py
+bt_debug.*
+# One-off "write this blob to disk" helpers used during research; not real code
+write_all.py
+write_hft.py
+write_hft_sections.py
+write_stdin.py
+write_tutorials_script.py
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RUNTIME STATE
+# ─────────────────────────────────────────────────────────────────────────────
+*.pid
+*.sock
+*.lock
+!poetry.lock
+!uv.lock
+!Pipfile.lock
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CLAUDE / AI TOOL LOCAL STATE (defensive — none expected but guard anyway)
+# ─────────────────────────────────────────────────────────────────────────────
+.claude/
+.cursor/

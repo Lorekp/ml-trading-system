@@ -1,0 +1,41 @@
+data:
+  data_path: ../../crypto_15m.csv
+  lookback_window: 512
+  predict_window: 48
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.85
+  val_ratio: 0.15
+  test_ratio: 0.0
+training:
+  tokenizer_epochs: 20
+  basemodel_epochs: 15
+  batch_size: 64
+  log_interval: 100
+  num_workers: 8
+  seed: 42
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 1.0e-06
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 1
+model_paths:
+  pretrained_tokenizer: NeoQuasar/Kronos-Tokenizer-base
+  pretrained_predictor: NeoQuasar/Kronos-base
+  exp_name: crypto_15m_10assets
+  base_path: ../../output
+  base_save_path: ''
+  finetuned_tokenizer: ../../tokenizer_checkpoint
+  tokenizer_save_name: tokenizer
+  basemodel_save_name: basemodel
+experiment:
+  name: crypto_15m_10assets
+  description: Fine-tune Kronos predictor on crypto 15m data (10 assets)
+  use_comet: false
+  train_tokenizer: false
+  train_basemodel: true
+  skip_existing: false
+device:
+  use_cuda: true
+  device_id: 0

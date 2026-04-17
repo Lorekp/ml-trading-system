@@ -1,0 +1,291 @@
+"""Configuration for the Deribit paper-trading engine.
+
+Single source of truth for all knobs.  Loads credentials + env-specific
+settings from the project ``.env`` file, and mirrors strategy-level
+defaults from ``BacktestConfig`` / ``DRLHedgingConfig`` so the paper run
+reproduces the backtester's behaviour exactly.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    _DOTENV_AVAILABLE = True
+except ImportError:
+    _DOTENV_AVAILABLE = False
+
+
+def _load_env() -> None:
+    """Load ``.env`` from the project root if python-dotenv is installed.
+
+    Kept optional so tests that don't need environment variables don't
+    have to install python-dotenv.  If ``.env`` is missing or dotenv is
+    not installed, we fall back to ``os.environ`` directly.
+    """
+    if not _DOTENV_AVAILABLE:
+        return
+    project_root = Path(__file__).resolve().parent.parent
+    env_path = project_root / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=False)
+
+
+@dataclass
+class PaperConfig:
+    """All configuration for the paper-trading engine.
+
+    Grouped by concern: venue/credentials, strategy knobs, execution,
+    risk, monitoring, paths.  Most strategy knobs mirror
+    ``vol_arb.backtester.BacktestConfig`` defaults so a paper run is a
+    faithful live replica of the backtest.
+    """
+
+    # ── Venue / credentials ─────────────────────────────────────────
+    # Deribit testnet by default — flip to ``prod`` only after Phase 7
+    # validation passes + passphrase confirmation at the CLI.
+    venue: str = "testnet"  # "testnet" | "prod"
+    client_id: str = ""
+    client_secret: str = ""
+    rest_base_url: str = "https://test.deribit.com/api/v2"
+    ws_url: str = "wss://test.deribit.com/ws/api/v2"
+
+    # ── Strategy (mirrors BacktestConfig) ──────────────────────────
+    currency: str = "BTC"
+    holding_minutes: int = 15
+    bar_minutes: int = 15
+    base_spread_iv: float = 1.5
+    spread_jump_k: float = 3.0
+    entry_threshold: float = 25.0       # mirrors BacktestConfig: shorts need 25 vp edge
+    entry_threshold_long: float = 30.0  # longs require more edge (higher slippage on entry)
+    option_maker_fee: float = 0.0003    # Deribit: 0.03% of underlying (same maker & taker)
+    perp_taker_fee: float = 0.0005     # Deribit: 0.05% taker (maker gets -0.01% rebate)
+    perp_slippage_bps: float = 2.0
+    delta_hedge_band: float = 0.05
+    hedge_sim_steps: int = 10
+    maker_adverse_selection_iv: float = 0.5
+    # DTE filter for which option expiries to consider for the straddle leg
+    dte_min_days: int = 1
+    dte_max_days: int = 14
+    # Moneyness band for ATM straddle strike selection
+    moneyness_lo: float = 0.95
+    moneyness_hi: float = 1.05
+
+    # ── Position sizing ────────────────────────────────────────────
+    initial_equity: float = 1.0              # demo BTC (testnet starts with ~10 BTC)
+    target_margin_utilization: float = 0.05  # mirrors BacktestConfig
+    # Deribit ATM option IM = max(0.15 - OTM/spot, 0.10) + mark_price.
+    # For ATM straddles: 0.15 + mark ≈ 0.20.  The backtester uses 0.10
+    # (understates real margin); the paper engine uses the realistic value
+    # so sizing and risk checks match what the exchange will enforce.
+    im_fraction: float = 0.20
+    max_participation_rate: float = 0.10
+    short_sizing_penalty: float = 0.50
+    baseline_target_dvol: float = 50.0
+    max_jump_fraction_for_shorts: float = 0.15
+
+    # ── Execution ──────────────────────────────────────────────────
+    maker_wait_seconds: int = 60              # wait this long for maker fill before falling back to taker
+    intra_bar_hedge_ticks: int = 10           # matches backtester's hedge_sim_steps
+    order_retry_max: int = 3                  # retry transient errors this many times
+    max_slippage_pct: float = 0.5             # IOC cap above best ask / below best bid
+    sizing_liq_cap: float = 1.5              # max upscale in liquid markets (conservative for live)
+    sizing_edge_cap: float = 3.0             # mirrors BacktestConfig: max edge multiplier
+    sizing_dd_floor: float = 0.25            # mirrors BacktestConfig: min scale at deep drawdown
+    execution_cost_ema_bars: int = 200        # bars for rolling execution cost EMA
+
+    # ── Risk ───────────────────────────────────────────────────────
+    max_open_positions: int = 5
+    max_margin_util_hard: float = 0.20        # hard cap; kill switch trips above this
+    max_single_trade_btc: float = 2.0
+    kill_switch_daily_dd_pct: float = 2.0     # halt if daily DD > this (% of peak equity)
+    kill_switch_consecutive_errors: int = 3
+    network_outage_seconds: int = 120         # halt if no WS messages for this long
+    max_consecutive_empty_bars: int = 3       # trip kill switch after N bars with zero trades
+    min_perp_trades_per_bar: int = 5          # skip signal if bar has fewer perp trades
+    max_orphan_close_retries: int = 3         # C1: retry orphaned position closes on startup
+    svi_max_stale_hours: float = 4.0          # C3: refuse to trade if SVI older than this
+    equity_reconcile_bars: int = 96           # R3: reconcile with exchange every N bars (~1 day)
+
+    # ── DRL hedger ─────────────────────────────────────────────────
+    # W5 (2026-04-12): promoted SAC v4 (true bucketed VPIN, 5M steps)
+    # after statistically significant A/B improvement over v3.
+    # Rollback: change these two paths back to production_sac_v3_final.
+    drl_policy_path: str = "vol_arb/drl_hedging/models/production_sac_v4_final.zip"
+    drl_vecnormalize_path: str = "vol_arb/drl_hedging/models/production_sac_v4_final_vecnormalize.pkl"
+    drl_svi_params_path: str = "vol_arb/output/svi_surface_params_1h.parquet"
+    # Algorithm for model loading ("risk_averse_sac" = SAC family, "tqc" = TQC)
+    drl_algorithm: str = "risk_averse_sac"
+
+    # ── Live VPIN ─────────────────────────────────────────────────
+    # Warm-start state from the offline recompute (5y of bucket history).
+    # Set to "" to disable live VPIN (falls back to vpin_fallback constant).
+    vpin_state_path: str = "vol_arb/output/vpin_streamer_state.json"
+    vpin_fallback: float = 0.189          # training-distribution mean
+    binance_ws_url: str = ""              # sentinel -> resolved from currency in __post_init__
+
+    # ── Model inference ────────────────────────────────────────────
+    # lgbm_models_dir holds the LightGBM ``.txt`` + ``_features.json``
+    # manifests for the walk-forward variant in use.  W3.1 (2026-04-11)
+    # switched this to the Stage 18 T2.1 pruned+SVI variant.
+    lgbm_models_dir: str = "vol_model/output/models/expanding_pruned_svi_v1"
+    # The pruned+SVI variant reuses TransVol checkpoints from the
+    # earlier ``expanding_hybrid/`` run — no TransVol re-training was
+    # needed because T2.1 only prunes LightGBM-level features.  So the
+    # transvol weights live in a different directory than the LightGBM
+    # models.  Loader must accept both paths independently.
+    transvol_models_dir: str = "vol_model/output/models/expanding_hybrid"
+    # Historical feature parquets loaded at engine startup to seed the
+    # baseline row the FeatureAssembler uses when it can't compute a
+    # feature fresh on the live bar.  Two parquets are merged: the
+    # 126-column base features + the 13-column SVI features.
+    features_parquet: str = ""              # sentinel -> resolved from currency + bar_minutes
+    svi_features_parquet: str = ""          # sentinel -> resolved from bar_minutes
+
+    # ── SVI live calibration ───────────────────────────────────────
+    svi_recalibrate_hours: int = 1           # run calibrate_surface() every N hours
+    svi_rolling_window_hours: int = 2        # use the last N hours of option trades as input
+    svi_bucket_freq: str = "1h"
+
+    # ── TSRV live ──────────────────────────────────────────────────
+    tsrv_rolling_window_hours: int = 2       # use the last N hours of perp trades
+
+    # ── Market data buffers ────────────────────────────────────────
+    perp_buffer_hours: int = 24              # 24h rolling perp trade buffer in memory
+    option_buffer_hours: int = 4             # 4h rolling option trade buffer in memory
+
+    # ── Monitoring / Telegram ──────────────────────────────────────
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    heartbeat_minutes: int = 60              # Telegram heartbeat cadence
+    log_level: str = "INFO"
+
+    # ── Paths ──────────────────────────────────────────────────────
+    state_dir: str = "deribit_paper/state"
+    logs_dir: str = "deribit_paper/logs"
+    metrics_parquet: str = "deribit_paper/state/live_metrics.parquet"
+    sqlite_db: str = "deribit_paper/state/paper.db"
+
+    # ── Small-account sizing ─────────────────────────────────────────
+    # When True, size_position() returns the exchange minimum (0.1 BTC)
+    # instead of 0.0 when the formula underproduces.  The risk check
+    # still gates whether the trade is affordable.
+    min_trade_floor: bool = False
+
+    # ── Safety ─────────────────────────────────────────────────────
+    # This MUST default to True.  The flag is checked by every execution
+    # path and by the CLI before allowing any live orders.  The only way
+    # to disable it is an explicit ``--live`` flag + passphrase confirm.
+    dry_run: bool = True
+
+    def __post_init__(self) -> None:
+        """Resolve sentinel defaults from (currency, bar_minutes)."""
+        ccy_lower = self.currency.lower()
+        asset_pair = f"{self.currency.upper()}USDT"
+        tf = f"{self.bar_minutes}m"
+        if not self.binance_ws_url:
+            self.binance_ws_url = (
+                f"wss://fstream.binance.com/ws/{ccy_lower}usdt@aggTrade"
+            )
+        if not self.features_parquet:
+            self.features_parquet = (
+                f"vol_model/output/{asset_pair}_features_{tf}.parquet"
+            )
+        if not self.svi_features_parquet:
+            self.svi_features_parquet = (
+                f"vol_arb/output/svi_features_{tf}.parquet"
+            )
+
+    @property
+    def bar_seconds(self) -> int:
+        """Bar duration in seconds (e.g. 900 for 15-min bars)."""
+        return self.bar_minutes * 60
+
+    @property
+    def bars_per_day(self) -> int:
+        """Number of bars per calendar day (e.g. 96 for 15-min bars)."""
+        return 1440 // self.bar_minutes
+
+    @property
+    def asset_pair(self) -> str:
+        """Exchange asset pair string (e.g. 'BTCUSDT')."""
+        return f"{self.currency.upper()}USDT"
+
+    @classmethod
+    def from_env(cls) -> "PaperConfig":
+        """Construct a ``PaperConfig`` populated from environment variables.
+
+        Credential fields are loaded from ``.env`` via python-dotenv if
+        available, otherwise from ``os.environ`` directly.  Unset
+        credentials remain empty strings — the client will fail loudly
+        on the first authenticated call rather than silently hanging.
+        """
+        _load_env()
+        cfg = cls()
+        cfg.client_id = os.environ.get("DERIBIT_TESTNET_CLIENT_ID", "")
+        cfg.client_secret = os.environ.get("DERIBIT_TESTNET_CLIENT_SECRET", "")
+        rest_env = os.environ.get("DERIBIT_TESTNET_BASE_URL")
+        if rest_env:
+            cfg.rest_base_url = rest_env
+        ws_env = os.environ.get("DERIBIT_TESTNET_WS_URL")
+        if ws_env:
+            cfg.ws_url = ws_env
+        cfg.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        # PAPER_DRY_RUN env var can set dry_run=False only if explicitly "false"
+        dry_run_env = os.environ.get("PAPER_DRY_RUN", "true").lower()
+        cfg.dry_run = dry_run_env != "false"
+        return cfg
+
+    @classmethod
+    def for_small_account(cls, equity_usd: float = 750.0) -> "PaperConfig":
+        """Create a config tuned for small live accounts ($500–$2000).
+
+        Enables ``min_trade_floor`` so the sizing formula returns the
+        exchange minimum (0.1 BTC) when equity is too low for the
+        composite_v2 formula to produce a full lot.  As equity grows
+        past ~$20K the formula naturally takes over and the floor
+        becomes non-binding.
+
+        Does NOT hardcode ``max_single_trade_btc`` — that would lock
+        the account to 0.1 BTC forever even as it scales.
+        """
+        cfg = cls.from_env()
+        btc_approx = 100_000.0  # overridden from REST at startup
+        cfg.max_open_positions = 1
+        cfg.kill_switch_daily_dd_pct = 5.0
+        cfg.initial_equity = equity_usd / btc_approx
+        cfg.min_trade_floor = True
+        return cfg
+
+    def ensure_dirs(self) -> None:
+        """Create state and logs directories if they don't exist."""
+        for path in (self.state_dir, self.logs_dir):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    def switch_to_prod(self) -> None:
+        """Flip the venue URLs to production Deribit.
+
+        This should ONLY be called after Phase 7 validation passes and
+        the user has explicitly confirmed via CLI passphrase.  The
+        default venue is testnet and stays testnet unless this is
+        invoked.  ``DERIBIT_PROD_CLIENT_ID`` / ``_SECRET`` must be set
+        separately — we refuse to reuse testnet credentials on prod.
+        """
+        self.venue = "prod"
+        self.rest_base_url = "https://www.deribit.com/api/v2"
+        self.ws_url = "wss://www.deribit.com/ws/api/v2"
+        self.client_id = os.environ.get("DERIBIT_PROD_CLIENT_ID", "")
+        self.client_secret = os.environ.get("DERIBIT_PROD_CLIENT_SECRET", "")
+        if not self.client_id or not self.client_secret:
+            raise RuntimeError(
+                "switch_to_prod() requires DERIBIT_PROD_CLIENT_ID and "
+                "DERIBIT_PROD_CLIENT_SECRET in the environment — refusing "
+                "to reuse testnet credentials on production."
+            )
+
+
+DEFAULT_CONFIG = PaperConfig()

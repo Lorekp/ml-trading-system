@@ -1,0 +1,243 @@
+#!/usr/bin/env python
+"""Generate backtest dashboard plots from production trade log."""
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+tl = pd.read_parquet('vol_arb/output/backtest_tradelog_production.parquet')
+active = tl[(tl['signal'] != 0) & (tl['N_contracts'] > 0)].copy()
+
+fig = plt.figure(figsize=(20, 28))
+gs = GridSpec(6, 2, figure=fig, hspace=0.35, wspace=0.25)
+
+# 1. Portfolio Value (compound) — LOG SCALE, 3 lines
+ax1 = fig.add_subplot(gs[0, :])
+initial_price = tl['index_price'].iloc[0]
+
+# Line 1: BTC buy & hold
+btc_hodl = 100_000 * (tl['index_price'] / initial_price)
+ax1.plot(tl.index, btc_hodl, color='#ff7f0e', linewidth=0.8, alpha=0.7, label='BTC Buy & Hold')
+
+# Line 2: Strategy (USD) — existing equity curve
+ax1.plot(tl.index, tl['equity'], color='#1f77b4', linewidth=0.8, label='Strategy (USD)')
+
+# Line 3: Strategy with BTC appreciation — PnL earned in BTC, capital held in BTC
+pnl_btc = (tl['net_pnl'] / tl['index_price']).values
+cum_btc = 100_000 / initial_price + np.cumsum(pnl_btc)
+strategy_btc_usd = cum_btc * tl['index_price'].values
+ax1.plot(tl.index, strategy_btc_usd, color='#2ca02c', linewidth=0.8, alpha=0.8, label='Strategy (BTC-denominated)')
+
+ax1.set_yscale('log')
+ax1.set_title('Portfolio Value (Compound, Log Scale)', fontsize=14, fontweight='bold')
+ax1.set_ylabel('Equity ($)')
+ax1.yaxis.set_major_formatter(plt.FuncFormatter(
+    lambda x, _: f'${x/1e6:.1f}M' if x >= 1e6 else f'${x/1e3:.0f}K' if x >= 1e3 else f'${x:.0f}'))
+ax1.grid(True, alpha=0.3, which='both')
+ax1.axhline(100_000, color='gray', linestyle='--', alpha=0.5, label='Initial $100K')
+ax1.legend(fontsize=9, loc='upper left')
+
+# 2. Drawdown
+ax2 = fig.add_subplot(gs[1, :])
+peak = tl['equity'].cummax()
+dd = (tl['equity'] - peak) / peak * 100
+ax2.fill_between(tl.index, dd, 0, color='#d62728', alpha=0.4)
+ax2.plot(tl.index, dd, color='#d62728', linewidth=0.5)
+ax2.set_title('Drawdown (%)', fontsize=14, fontweight='bold')
+ax2.set_ylabel('Drawdown %')
+ax2.set_ylim(dd.min() * 1.1, 2)
+ax2.grid(True, alpha=0.3)
+max_dd_date = dd.idxmin()
+ax2.annotate(f'Max DD: {dd.min():.1f}%', xy=(max_dd_date, dd.min()),
+             fontsize=9, color='darkred', fontweight='bold',
+             xytext=(30, 20), textcoords='offset points',
+             arrowprops=dict(arrowstyle='->', color='darkred'))
+
+# 3. Monthly PnL
+ax3 = fig.add_subplot(gs[2, 0])
+monthly = active['net_pnl'].resample('ME').sum() / 1000
+colors = ['#2ca02c' if x >= 0 else '#d62728' for x in monthly]
+ax3.bar(monthly.index, monthly.values, width=20, color=colors, alpha=0.85, edgecolor='white', linewidth=0.5)
+ax3.set_title('Monthly Net PnL', fontsize=13, fontweight='bold')
+ax3.set_ylabel('PnL ($K)')
+ax3.grid(True, alpha=0.3, axis='y')
+ax3.axhline(0, color='black', linewidth=0.5)
+win_months = (monthly > 0).sum()
+total_months = len(monthly)
+ax3.text(0.02, 0.95, f'{win_months}/{total_months} winning months ({100*win_months/total_months:.0f}%)',
+         transform=ax3.transAxes, fontsize=9, verticalalignment='top',
+         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+# 4. Rolling Sharpe (90-day)
+ax4 = fig.add_subplot(gs[2, 1])
+daily_ret = active['net_pnl'].resample('D').sum()
+daily_ret = daily_ret[daily_ret != 0]
+rolling_sharpe = (daily_ret.rolling(90).mean() / daily_ret.rolling(90).std()) * np.sqrt(365)
+ax4.plot(rolling_sharpe.index, rolling_sharpe.values, color='#9467bd', linewidth=1)
+ax4.axhline(0, color='black', linewidth=0.5)
+ax4.axhline(2, color='green', linestyle='--', alpha=0.5, label='Sharpe=2')
+ax4.set_title('Rolling 90-Day Sharpe Ratio', fontsize=13, fontweight='bold')
+ax4.set_ylabel('Sharpe')
+ax4.grid(True, alpha=0.3)
+ax4.legend(fontsize=9)
+ax4.set_ylim(-5, 20)
+
+# 5. Position Size Distribution — BTC + bps of equity
+ax5 = fig.add_subplot(gs[3, 0])
+sizes_btc = active['N_contracts'].values
+sizes_btc = sizes_btc[sizes_btc > 0]
+notional = active['N_contracts'] * active['index_price']
+pos_bps = (notional / active['equity'] * 10_000).values
+pos_bps = pos_bps[~np.isnan(pos_bps) & (pos_bps > 0)]
+
+ax5.hist(sizes_btc, bins=50, color='#17becf', alpha=0.75, edgecolor='white', linewidth=0.5)
+ax5.set_xlabel('Position Size (BTC)', fontsize=10)
+ax5.set_ylabel('Count', color='#17becf', fontsize=10)
+ax5.tick_params(axis='x', labelcolor='#17becf')
+
+ax5b = ax5.twiny()
+ax5b.hist(pos_bps, bins=50, color='#ff7f0e', alpha=0.45, edgecolor='white', linewidth=0.5)
+ax5b.set_xlabel('Position Size (bps of equity)', fontsize=10, color='#ff7f0e')
+ax5b.tick_params(axis='x', labelcolor='#ff7f0e')
+
+ax5.set_title('Position Size Distribution', fontsize=13, fontweight='bold', pad=18)
+ax5.grid(True, alpha=0.3, axis='y')
+ax5.text(0.95, 0.95,
+         f'BTC: mean={sizes_btc.mean():.1f}, med={np.median(sizes_btc):.1f}\n'
+         f'bps: mean={pos_bps.mean():.0f}, med={np.median(pos_bps):.0f}',
+         transform=ax5.transAxes, fontsize=9, verticalalignment='top', horizontalalignment='right',
+         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+# 6. PnL by Component — full breakdown including ALL costs (fees + slippage + hedge)
+ax6 = fig.add_subplot(gs[3, 1])
+# Order: signal terms first (green-ish), cost terms after (red-ish). Costs are
+# entered as negative values (money OUT of the book) so a positive bar = gain,
+# negative bar = cost. Net = sum of all bars.
+components = {
+    'Vega PnL': active['vega_pnl'].sum() / 1000,
+    'Delta Hedge': active['delta_hedge_pnl'].sum() / 1000,
+    'Theta PnL': active['theta_pnl'].sum() / 1000,
+    'Option Fees': -active['option_fees'].sum() / 1000,
+    'Slippage': -active['slippage'].sum() / 1000,
+    'Hedge Costs': -active['hedge_costs'].sum() / 1000,
+}
+colors = ['#2ca02c', '#1f77b4', '#9467bd', '#d62728', '#ff7f0e', '#8c564b']
+bars = ax6.barh(list(components.keys()), list(components.values()), color=colors)
+ax6.set_title('PnL Attribution ($K, compound) — signal vs all costs',
+              fontsize=13, fontweight='bold')
+ax6.set_xlabel('$K')
+ax6.grid(True, alpha=0.3, axis='x')
+ax6.axvline(0, color='black', linewidth=0.5)
+# Expand x-limits so bars + labels don't clip at the edges
+all_vals = list(components.values())
+x_min = min(min(all_vals), 0)
+x_max = max(max(all_vals), 0)
+x_margin = (x_max - x_min) * 0.18
+ax6.set_xlim(x_min - x_margin, x_max + x_margin)
+for bar, val in zip(bars, components.values()):
+    xpos = bar.get_width() + (x_margin * 0.10 if val >= 0 else -x_margin * 0.10)
+    ha = 'left' if val >= 0 else 'right'
+    ax6.text(xpos, bar.get_y() + bar.get_height() / 2,
+             f'${val:,.0f}K', va='center', ha=ha, fontsize=9)
+# Net-of-all-components note — sanity check vs net_pnl sum
+net_from_components = sum(components.values())
+net_from_pnl = active['net_pnl'].sum() / 1000
+ax6.text(0.98, 0.02,
+         f'Σ components: ${net_from_components:,.0f}K\n'
+         f'net_pnl total: ${net_from_pnl:,.0f}K',
+         transform=ax6.transAxes, fontsize=8, ha='right', va='bottom',
+         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+# 7. Cumulative PnL by Year
+ax7 = fig.add_subplot(gs[4, 0])
+for year in sorted(active.index.year.unique()):
+    yearly = active[active.index.year == year]['net_pnl'].cumsum() / 1000
+    if len(yearly) == 0:
+        continue
+    yearly.index = yearly.index - pd.Timestamp(f'{year}-01-01', tz='UTC')
+    days = yearly.index.total_seconds() / 86400
+    ax7.plot(days, yearly.values, label=str(year), linewidth=1.2)
+ax7.set_title('Cumulative PnL by Year', fontsize=13, fontweight='bold')
+ax7.set_xlabel('Day of Year')
+ax7.set_ylabel('Cumulative PnL ($K)')
+ax7.legend(fontsize=8, ncol=3)
+ax7.grid(True, alpha=0.3)
+
+# 8. Per-Trade PnL Distribution (bps of equity) — side-by-side bars
+ax8 = fig.add_subplot(gs[4, 1])
+active_pnl_bps = active['net_pnl'] / active['equity'] * 10_000
+longs_bps = active_pnl_bps[active['signal'] == 1]
+shorts_bps = active_pnl_bps[active['signal'] == -1]
+bins = np.linspace(-100, 100, 51)
+bin_width = bins[1] - bins[0]
+long_counts, _ = np.histogram(longs_bps.clip(-100, 100), bins=bins)
+short_counts, _ = np.histogram(shorts_bps.clip(-100, 100), bins=bins)
+bin_centers = 0.5 * (bins[:-1] + bins[1:])
+bar_w = bin_width * 0.45
+ax8.bar(bin_centers - bar_w / 2, long_counts, width=bar_w, color='#2ca02c', alpha=0.85,
+        label=f'Long ({len(longs_bps):,})')
+ax8.bar(bin_centers + bar_w / 2, short_counts, width=bar_w, color='#d62728', alpha=0.85,
+        label=f'Short ({len(shorts_bps):,})')
+ax8.set_yscale('log')
+ax8.set_title('Per-Trade PnL Distribution (bps of equity)', fontsize=13, fontweight='bold')
+ax8.set_xlabel('Net PnL (bps of equity)')
+ax8.set_ylabel('Count')
+ax8.legend(fontsize=9)
+ax8.grid(True, alpha=0.3, axis='y', which='both')
+
+# 9. Slippage Over Time
+ax9 = fig.add_subplot(gs[5, 0])
+slip_weekly = active['slippage'].resample('W').mean()
+ax9.plot(slip_weekly.index, slip_weekly.values, color='#ff7f0e', linewidth=0.8)
+ax9.fill_between(slip_weekly.index, 0, slip_weekly.values, color='#ff7f0e', alpha=0.2)
+ax9.set_title('Weekly Average Slippage per Trade', fontsize=13, fontweight='bold')
+ax9.set_ylabel('Slippage ($)')
+ax9.grid(True, alpha=0.3)
+
+# 10. Trade Count per Month
+ax10 = fig.add_subplot(gs[5, 1])
+monthly_trades = active['net_pnl'].resample('ME').count()
+longs_monthly = active[active['signal'] == 1]['net_pnl'].resample('ME').count().reindex(monthly_trades.index, fill_value=0)
+shorts_monthly = active[active['signal'] == -1]['net_pnl'].resample('ME').count().reindex(monthly_trades.index, fill_value=0)
+ax10.bar(monthly_trades.index, shorts_monthly.values, width=20, color='#d62728', alpha=0.85, edgecolor='white', linewidth=0.5, label='Short')
+ax10.bar(monthly_trades.index, longs_monthly.values, width=20, bottom=shorts_monthly.values, color='#2ca02c', alpha=0.85, edgecolor='white', linewidth=0.5, label='Long')
+ax10.set_title('Trades per Month', fontsize=13, fontweight='bold')
+ax10.set_ylabel('Count')
+ax10.legend(fontsize=9)
+ax10.grid(True, alpha=0.3, axis='y')
+
+# Summary stats box
+# NC Sharpe is the scale-invariant signal-quality number; compound Sharpe drifts
+# with equity. Report both so the dashboard stays honest.
+sharpe_compound = float((daily_ret.mean() / daily_ret.std()) * np.sqrt(365))
+# NC daily Sharpe from the non-compound PnL stream
+nc_daily = active['net_pnl_nc'].resample('D').sum() if 'net_pnl_nc' in active.columns else daily_ret
+nc_daily = nc_daily[nc_daily != 0]
+sharpe_nc = float((nc_daily.mean() / nc_daily.std()) * np.sqrt(365)) if len(nc_daily) > 1 else 0.0
+# NC trade-level Sharpe (per-trade scale-invariant)
+r_nc = active['net_pnl_nc'].values if 'net_pnl_nc' in active.columns else active['net_pnl'].values
+years = (active.index.max() - active.index.min()).days / 365.25
+trade_sharpe_nc = float(r_nc.mean() / r_nc.std() * np.sqrt(len(r_nc) / years)) if r_nc.std() > 0 else 0.0
+
+total_pnl = active['net_pnl'].sum()
+total_pnl_nc = active['net_pnl_nc'].sum() if 'net_pnl_nc' in active.columns else total_pnl
+max_dd_val = dd.min()
+n_trades = len(active)
+end_equity = tl['equity'].iloc[-1]
+mult = end_equity / tl['equity'].iloc[0]
+fig.suptitle(
+    f'BTC Vol-Arb v2 Backtest \u2014 '
+    f'NC Sharpe {trade_sharpe_nc:.1f} (trade) / {sharpe_nc:.1f} (daily) | '
+    f'Compound PnL ${total_pnl/1e6:.1f}M ({mult:.0f}x) | '
+    f'NC PnL ${total_pnl_nc/1e3:.0f}K | '
+    f'{max_dd_val:.1f}% MaxDD | {n_trades:,} trades\n'
+    f'Config: with_btc_production_filters_v2 + realistic_costs | '
+    f'thr_S/L=22/12 vp, DTE\u22655d, skip-long-14-16-UTC, skip-long-contango, '
+    f'hold=30m, PS(floor=0.3), util=15%, DRL-hedging, taker-only',
+    fontsize=13, fontweight='bold', y=1.0)
+
+plt.savefig('vol_arb/output/backtest_dashboard.png', dpi=150, bbox_inches='tight', facecolor='white')
+print('Saved to vol_arb/output/backtest_dashboard.png')

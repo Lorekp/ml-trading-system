@@ -1,0 +1,11 @@
+portfolio:
+  max_exposure: 0.60
+  max_per_asset: 0.20
+
+assets:
+  BTC: "BTCUSDT"
+  ETH: "ETHUSDT"
+  XRP: "XRPUSDT"
+  BNB: "BNBUSDT"
+  SUI: "SUIUSDT"
+  LINK: "LINKUSDT"

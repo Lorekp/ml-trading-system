@@ -1,0 +1,241 @@
+"""Rolling in-memory buffers for live market data.
+
+Three buffer types:
+
+- :class:`TradeBuffer` — rolling window of option or perp trades, keyed
+  by ``timestamp``.  Supports append (O(1)), slice-by-window (O(N)
+  where N is the number of trades in the window), and time-based
+  eviction (O(1) amortised when called periodically).
+- :class:`IndexPriceBuffer` — rolling window of ``(timestamp, price)``
+  tuples for the BTC index.  Used to attach the close-of-bar spot
+  reference to each bar.
+
+Key invariants:
+
+1. **Append is fast**: ``deque.append`` is O(1).
+2. **Dedup on replay**: after a WS disconnect + resubscribe, Deribit
+   may re-send trades we've already seen.  Each trade carries a
+   ``trade_id``; we keep a bounded set of recent IDs and drop
+   duplicates.  The dedup set is bounded so it can't grow forever.
+3. **Eviction is lazy**: we only trim the head when ``evict_older()`` is
+   called (typically on each bar tick).  This avoids per-append scans.
+4. **Thread safety**: asyncio is single-threaded; no locks needed.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import deque
+from dataclasses import dataclass
+from typing import Iterable
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+# Maximum number of trade_ids to keep in the dedup set.  Larger = more
+# protection against reorder on reconnect; smaller = less memory.
+# 50k is ample — it covers ~several hours of BTC option flow.
+_DEDUP_RECENT_MAX = 50_000
+
+
+@dataclass
+class Trade:
+    """Canonical trade record from Deribit.
+
+    Mirrors the fields we care about from the ``trades.*`` channels.
+    ``direction`` is ``+1`` for buys (taker bought), ``-1`` for sells.
+    Instrument-specific fields like ``strike``, ``option_type``,
+    ``expiry_dt`` are populated for option trades only.
+    """
+    trade_id: str
+    timestamp: pd.Timestamp          # UTC
+    instrument_name: str
+    price: float                      # USD per BTC for perps; vol / USD per contract for options
+    amount: float                     # base units (BTC)
+    direction: int                    # +1 (buy) / -1 (sell)
+    # Option-specific fields — None for perps
+    strike: float | None = None
+    option_type: str | None = None    # "C" or "P"
+    expiry_dt: pd.Timestamp | None = None
+    iv: float | None = None           # % (as Deribit reports)
+    index_price: float | None = None
+    mark_price: float | None = None
+
+
+class TradeBuffer:
+    """Rolling in-memory buffer of trades with time-based eviction + dedup.
+
+    Two retention strategies are supported:
+
+    - ``window_seconds`` — retain trades with timestamp newer than
+      ``(now - window_seconds)``.  The buffer is trimmed lazily on
+      ``evict_older()``.
+    - ``max_len`` — hard cap; oldest trades are dropped when the cap
+      is exceeded.
+
+    Both can be active simultaneously.  The ``window_seconds`` value is
+    the primary retention, ``max_len`` is a safety backstop to prevent
+    unbounded growth if ``evict_older()`` is never called.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        window_seconds: float,
+        max_len: int | None = None,
+    ):
+        self.name = name
+        self.window_seconds = window_seconds
+        self._trades: deque[Trade] = deque(maxlen=max_len)
+        self._seen_ids: deque[str] = deque(maxlen=_DEDUP_RECENT_MAX)
+        self._seen_set: set[str] = set()
+
+    def __len__(self) -> int:
+        return len(self._trades)
+
+    def append(self, trade: Trade) -> bool:
+        """Append a trade if not a duplicate.  Returns True if added."""
+        if trade.trade_id in self._seen_set:
+            return False
+
+        # Evict oldest seen ID if the dedup deque is full
+        if len(self._seen_ids) == self._seen_ids.maxlen:
+            oldest = self._seen_ids[0]
+            self._seen_set.discard(oldest)
+
+        self._seen_ids.append(trade.trade_id)
+        self._seen_set.add(trade.trade_id)
+        self._trades.append(trade)
+        return True
+
+    def extend(self, trades: Iterable[Trade]) -> int:
+        """Append many trades.  Returns the number actually added."""
+        added = 0
+        for t in trades:
+            if self.append(t):
+                added += 1
+        return added
+
+    def evict_older(self, now: pd.Timestamp) -> int:
+        """Drop trades older than ``now - window_seconds``.
+
+        Returns the number of evicted trades.  Call this periodically
+        (on bar close is ideal) to keep memory bounded.
+        """
+        cutoff = now - pd.Timedelta(seconds=self.window_seconds)
+        evicted = 0
+        while self._trades and self._trades[0].timestamp < cutoff:
+            self._trades.popleft()
+            evicted += 1
+        if evicted:
+            logger.debug(
+                "%s evicted %d trades older than %s (len now %d)",
+                self.name, evicted, cutoff, len(self._trades),
+            )
+        return evicted
+
+    def slice_window(
+        self, start: pd.Timestamp, end: pd.Timestamp,
+    ) -> list[Trade]:
+        """Return trades with ``start <= timestamp < end``.
+
+        Half-open interval to match the backtester's bar convention
+        (a bar at ``T`` covers ``[T - 15min, T)``).
+        """
+        return [t for t in self._trades if start <= t.timestamp < end]
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """Convert the entire buffer to a pandas DataFrame.
+
+        Column order matches ``vol_arb/pipeline.py`` conventions so the
+        live feature builder can pass the result straight into the batch
+        pipeline's functions.
+        """
+        if not self._trades:
+            return pd.DataFrame(columns=[
+                "timestamp", "trade_id", "instrument_name", "price", "amount",
+                "direction", "strike", "option_type", "expiry_dt", "iv",
+                "index_price", "mark_price",
+            ])
+        rows = [
+            {
+                "timestamp": t.timestamp,
+                "trade_id": t.trade_id,
+                "instrument_name": t.instrument_name,
+                "price": t.price,
+                "amount": t.amount,
+                "direction": t.direction,
+                "strike": t.strike,
+                "option_type": t.option_type,
+                "expiry_dt": t.expiry_dt,
+                "iv": t.iv,
+                "index_price": t.index_price,
+                "mark_price": t.mark_price,
+            }
+            for t in self._trades
+        ]
+        return pd.DataFrame(rows)
+
+    def clear(self) -> None:
+        self._trades.clear()
+        self._seen_ids.clear()
+        self._seen_set.clear()
+
+
+class IndexPriceBuffer:
+    """Rolling buffer of ``(timestamp, index_price)`` pairs.
+
+    Much lighter-weight than :class:`TradeBuffer` because there's no
+    dedup requirement — index prices are published as a continuous
+    stream, every sample is unique by timestamp.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str = "index_price",
+        window_seconds: float = 3600.0,
+        max_len: int | None = 10_000,
+    ):
+        self.name = name
+        self.window_seconds = window_seconds
+        self._samples: deque[tuple[pd.Timestamp, float]] = deque(maxlen=max_len)
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def append(self, timestamp: pd.Timestamp, price: float) -> None:
+        self._samples.append((timestamp, price))
+
+    def evict_older(self, now: pd.Timestamp) -> int:
+        cutoff = now - pd.Timedelta(seconds=self.window_seconds)
+        evicted = 0
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+            evicted += 1
+        return evicted
+
+    def latest(self) -> float | None:
+        """Return the most recent index price, or ``None`` if empty."""
+        if not self._samples:
+            return None
+        return self._samples[-1][1]
+
+    def at_or_before(self, ts: pd.Timestamp) -> float | None:
+        """Return the latest index price with ``timestamp <= ts``.
+
+        Used to pin the close-of-bar index price when aggregating.
+        Linear scan from the tail, so O(N) worst case but typical
+        call site is the freshest-wins case → O(1).
+        """
+        # Walk from most recent backwards
+        for t, p in reversed(self._samples):
+            if t <= ts:
+                return p
+        return None
+
+    def clear(self) -> None:
+        self._samples.clear()

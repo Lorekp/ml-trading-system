@@ -1,0 +1,47 @@
+# Normalize line endings across platforms. Windows checkouts keep CRLF for
+# .bat / .cmd; everything else uses LF in the repo.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Mark common binaries explicitly so git doesn't try to diff them
+*.parquet binary
+*.feather binary
+*.pkl binary
+*.pickle binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.safetensors binary
+*.npz binary
+*.npy binary
+*.h5 binary
+*.hdf5 binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.lz4 binary
+*.zst binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+
+# Jupyter notebooks: let `nbdime` handle diffs if installed; otherwise git
+# treats them as text (which is noisy but fine for small notebooks).
+*.ipynb text
+
+# Python source: clear text
+*.py text diff=python
+
+# Markdown + docs: text
+*.md text
+*.txt text
+*.rst text
+
+# Shell scripts: LF + executable
+*.sh text eol=lf

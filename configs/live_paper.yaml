@@ -1,0 +1,153 @@
+# Live Paper Trading Configuration
+# ===============================
+# Mirrors signal engine defaults from configs/default.yaml
+# with absolute confidence mode for live filtering.
+#
+# Secrets injected from environment variables:
+#   MEXC_API_KEY, MEXC_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+signal:
+  model:
+    C: 0.1
+    penalty: "l1"
+    solver: "saga"
+    max_iter: 1000
+    seed: 42
+    fwd_bars: 4
+
+  features:
+    feature_list:
+      - ret_1
+      - ret_3
+      - ret_7
+      - ret_14
+      - bar_range
+      - vol_zscore
+      - rsi_14
+      - stoch_rsi
+      - macd_hist
+      - bb_pct_b
+      - atr_14
+      - dist_swing_high
+      - dist_swing_low
+    winsor_lo: 0.01
+    winsor_hi: 0.99
+    vol_filter_quantile: 0.50
+    vol_zscore_window: 30
+    swing_lookback: 20
+
+  portfolio:
+    starting_capital: 10000.0
+    max_dd: 0.15
+    delever_start: 0.075
+    slippage: 0.0001
+    max_exposure: 0.80
+    max_per_asset: 0.06
+    base_sizing_pct: 0.02
+    max_signal_mult: 2.0
+
+  regime_filter:
+    enabled: false           # Regime filter DISABLED — validated improvement
+    timeframe: "4h"          # (kept for reference, not used)
+    ema_span: 20
+
+  confidence_filter:
+    mode: "absolute"
+    threshold: 0.08          # Raised from 0.04 — validated +0.77 Sharpe improvement
+
+  signal:
+    step_size: 0.1
+
+  data:
+    data_dirs:
+      - "data/binance-1m"
+      - "data/homeserver-mirror/binance-1m"
+    timeframe: "15min"
+    regime_timeframe: "4h"
+
+  assets:
+    BTC: "BTCUSDT"
+    ETH: "ETHUSDT"
+    XRP: "XRPUSDT"
+    BNB: "BNBUSDT"
+    SUI: "SUIUSDT"
+    LINK: "LINKUSDT"
+
+exchange:
+  name: "mexc"
+  base_url: "https://futures.mexc.com"
+  ws_url: "wss://contract.mexc.com/edge"
+  # api_key and api_secret injected from MEXC_API_KEY / MEXC_API_SECRET env vars
+  rate_limit_per_sec: 20
+  timeout_s: 10.0
+
+telegram:
+  # bot_token and chat_id injected from TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars
+  enabled: true
+  notify_on:
+    - signal
+    - trade
+    - error
+    - daily
+    - startup
+
+paper:
+  slippage_bps: 5.0  # Conservative: 5 bps (was 1 bps — closer to live limit orders)
+  starting_capital: 10000.0
+
+scheduler:
+  bar_interval_m: 15
+  poll_offset_s: 5
+  retry_count: 3
+  retry_delay_s: 2.0
+
+risk:
+  max_positions: 10
+  max_per_asset_pct: 0.03
+  max_total_exposure_pct: 0.90
+  daily_dd_halt_pct: 0.05
+  confidence_threshold: 0.08    # Matches signal.confidence_filter.threshold
+  hold_bars: 4
+  base_sizing_pct: 0.04         # Conservative prop firm sizing (backtest: 82 days to 10%, 3.3% max daily DD)
+  max_signal_mult: 2.0
+  leverage: 1                   # No exchange leverage needed — position sizing handles it
+
+db_path: "data/live/paper_state.db"
+log_level: "INFO"
+
+# 30 assets selected by VOLUME RANK (not backtest Sharpe — avoids overfitting).
+# Criteria: 12+ months on Binance futures, >$30M 24h volume, no meme coins.
+# Meme coins (DOGE, PEPE, BONK, SHIB) excluded for prop firm safety —
+# flash crash risk outweighs 9% PnL contribution.
+# Rolling Sharpe circuit breaker drops underperformers automatically.
+assets:
+  BTC: "BTCUSDT"
+  ETH: "ETHUSDT"
+  SOL: "SOLUSDT"
+  XRP: "XRPUSDT"
+  ZEC: "ZECUSDT"
+  BNX: "BNXUSDT"
+  BNB: "BNBUSDT"
+  ENJ: "ENJUSDT"
+  TAO: "TAOUSDT"
+  ADA: "ADAUSDT"
+  ANKR: "ANKRUSDT"
+  SUI: "SUIUSDT"
+  AVAX: "AVAXUSDT"
+  LINK: "LINKUSDT"
+  NEAR: "NEARUSDT"
+  FIL: "FILUSDT"
+  DOT: "DOTUSDT"
+  SXP: "SXPUSDT"
+  ENA: "ENAUSDT"
+  BCH: "BCHUSDT"
+  LTC: "LTCUSDT"
+  UNI: "UNIUSDT"
+  WLD: "WLDUSDT"
+  TRX: "TRXUSDT"
+  FTM: "FTMUSDT"
+  AAVE: "AAVEUSDT"
+  FET: "FETUSDT"
+  APT: "APTUSDT"
+  HBAR: "HBARUSDT"
+  XLM: "XLMUSDT"

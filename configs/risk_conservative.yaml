@@ -1,0 +1,31 @@
+# Conservative Risk Profile Override
+# ====================================
+# Ultra-safe settings for initial live testing:
+# - 3 positions max
+# - 40% max exposure
+# - 3% daily drawdown halt
+# - 1% base sizing
+# - Higher confidence threshold
+#
+# Use alongside live_mexc.yaml or live_paper.yaml.
+
+risk:
+  max_positions: 3
+  max_per_asset_pct: 0.03
+  max_total_exposure_pct: 0.40
+  daily_dd_halt_pct: 0.03
+  confidence_threshold: 0.15
+  hold_bars: 4
+  base_sizing_pct: 0.01
+  max_signal_mult: 1.5
+  stop_loss_pct: 0.015
+  stop_loss_max_wait_s: 300
+
+circuit_breakers:
+  drawdown_halt_pct: 0.10
+  api_error_limit: 3
+  api_error_window_m: 10
+  api_error_recovery_m: 60
+  position_mismatch_pct: 0.05
+  kill_switch_path: "KILL"
+  reconcile_interval_bars: 2

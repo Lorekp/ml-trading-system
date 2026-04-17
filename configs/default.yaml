@@ -1,0 +1,124 @@
+model:
+  C: 0.1
+  penalty: "l1"
+  solver: "saga"
+  max_iter: 1000
+  seed: 42
+  fwd_bars: 4
+  signal_model_type: "regime_xgboost"
+
+features:
+  feature_list:
+    - ret_1
+    - ret_3
+    - ret_7
+    - ret_14
+    - bar_range
+    - vol_zscore
+    - rsi_14
+    - stoch_rsi
+    - macd_hist
+    - bb_pct_b
+    - atr_14
+    - dist_swing_high
+    - dist_swing_low
+    - entropy
+    - parkinson_vol_20
+    - cs_spread
+    - ffd_close
+    - ffd_ret_1
+  winsor_lo: 0.01
+  winsor_hi: 0.99
+  vol_filter_quantile: 0.50
+  vol_zscore_window: 30
+  swing_lookback: 20
+  fracdiff_d: 0.4
+  fracdiff_threshold: 0.001
+  feature_research_enabled: true
+  sadf_min_window: 50
+  sadf_step: 10
+
+portfolio:
+  starting_capital: 10000.0
+  max_dd: 0.15
+  delever_start: 0.075
+  slippage: 0.0001
+  max_exposure: 0.80
+  max_per_asset: 0.06
+  base_sizing_pct: 0.02
+  max_signal_mult: 2.0
+  sizing_mode: "probability_edge"
+  use_regime_exposure_multiplier: true
+  regime_exposure_floor: 0.50
+
+regime_filter:
+  enabled: true
+  timeframe: "4h"
+  ema_span: 20
+
+confidence_filter:
+  mode: "percentile"
+  threshold: 70.0
+
+close_model:
+  enabled: false
+  decision_timeframes: ["5min", "10min", "15min"]
+  production_decision_timeframe: "15min"
+  research_decision_timeframes: ["5min", "10min", "15min"]
+  max_hold_minutes: 60
+  min_hold_minutes: 15
+  retrain_frequency_months: 1
+  lookbacks: [1, 2, 3, 4, 6, 8, 10, 12]
+  model_type: "xgboost"
+  label_mode: "residual_triple_barrier"
+  threshold: 0.5
+  threshold_metric: "sharpe"
+  threshold_min_precision: 0.55
+  calibration: "isotonic"
+  use_afml_optimization: true
+  pct_embargo: 0.01
+  time_decay_last_weight: 0.5
+  min_signal_strength: 0.1
+  pt_mult: 1.0
+  sl_mult: 1.0
+  min_improvement_bps: 2.0
+  de_risk_mode: "partial_ladder"
+  partial_exit_ladder: [0.50, 0.75, 0.90]
+  partial_exit_remaining: [1.00, 0.50, 0.25, 0.00]
+  execution_cost_scenarios: [1.0, 2.0, 3.0]
+  regime_timeframes: ["1h", "4h"]
+  xgb_max_depth_grid: [3, 4, 5]
+  xgb_min_child_weight_grid: [10, 20, 40]
+  xgb_subsample_grid: [0.6, 0.8, 1.0]
+  xgb_colsample_grid: [0.6, 0.8, 1.0]
+  xgb_learning_rate_grid: [0.03, 0.05, 0.08]
+  xgb_max_grid_trials: 12
+  xgb_early_stopping_rounds: 30
+
+signal:
+  step_size: 0.1
+
+data:
+  data_dirs:
+    - "data/binance-1m"
+    - "data/homeserver-mirror/binance-1m"
+  timeframe: "15min"
+  regime_timeframe: "4h"
+
+assets:
+  BTC: "BTCUSDT"
+  ETH: "ETHUSDT"
+  XRP: "XRPUSDT"
+  BNB: "BNBUSDT"
+  SUI: "SUIUSDT"
+  LINK: "LINKUSDT"
+  SOL: "SOLUSDT"
+  ADA: "ADAUSDT"
+  AVAX: "AVAXUSDT"
+  DOT: "DOTUSDT"
+  NEAR: "NEARUSDT"
+  DOGE: "DOGEUSDT"
+  ARB: "ARBUSDT"
+  OP: "OPUSDT"
+  UNI: "UNIUSDT"
+  AAVE: "AAVEUSDT"

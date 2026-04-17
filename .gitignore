@@ -135,6 +135,14 @@ logs/
 *.stackdump
 nohup.out
 
+# TensorBoard / MLFlow / Weights & Biases training artifacts
+tb_logs/
+runs/
+mlruns/
+wandb/
+events.out.tfevents.*
+*.tfevents.*
+
 # Plots / images auto-generated from code
 *.png
 *.jpg

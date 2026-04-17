@@ -111,19 +111,22 @@ saved_models/
 # ─────────────────────────────────────────────────────────────────────────────
 #  RESULTS / OUTPUTS — backtest artifacts, plots, logs, JSON dumps
 # ─────────────────────────────────────────────────────────────────────────────
-v3-results/
-v4-results/
-results/
-experiments/
-vol_arb/output/
-vol_model/output/
-TSRV/output/
-deribit_paper/output/
-scripts/forensic/output/
-kronos_3090_package/output/
+# Blanket-ignore all *contents* of research output dirs but permit the
+# allowlists below to reach through (file-glob form, not directory form —
+# git's "parent dir excluded ⇒ can't re-include" rule would otherwise block
+# the negations).
+v3-results/**
+v4-results/**
+results/**
+experiments/**
+vol_arb/output/**
+vol_model/output/**
+TSRV/output/**
+deribit_paper/output/**
+scripts/forensic/output/**
+kronos_3090_package/output/**
 
-# Keep human-authored documentation from output dirs (opt-in allowlist).
-# These are the .md writeups + .json configs we DO want under version control.
+# Keep human-authored markdown writeups tracked (opt-in allowlist)
 !vol_model/output/*.md
 !vol_model/output/SIGNAL_RESEARCH_NOTES.md
 !vol_model/output/LABEL_SHIFT_AUDIT.md

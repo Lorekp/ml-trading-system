@@ -77,15 +77,20 @@ ADD_SVI_FEATURES = ("svi_atm_1d",)
 ETH_TSRV_FEATURES = ("eth_tsrv_mean_1d", "eth_tsrv_mean_1w", "eth_tsrv_ema50")
 RQ_FEATURES = ("rq_1d", "rq_1w")
 SVI_SPOT_FEATURES = ("svi_atm_spot",)
+HAR_PD_FEATURES = (
+    "har_pd_R1_a005", "har_pd_R1_a01", "har_pd_R1_a03",
+    "har_pd_R2_b005", "har_pd_R2_b01", "har_pd_R2_b03",
+)
 
 # Tier-to-feature-pool dispatch. Consumed by build_month_data_augmented.
-TIER_FEATURE_MAP: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
-    # name: (eth_cols, rq_cols, svi_extra_cols)
-    "control": ((), (), ()),
-    "eth": (ETH_TSRV_FEATURES, (), ()),
-    "rq": ((), RQ_FEATURES, ()),
-    "eth_and_rq": (ETH_TSRV_FEATURES, RQ_FEATURES, ()),
-    "svi_spot": ((), (), SVI_SPOT_FEATURES),
+# Tuple: (eth_cols, rq_cols, svi_extra_cols, har_pd_cols).
+TIER_FEATURE_MAP: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
+    "control":     ((), (), (), ()),
+    "eth":         (ETH_TSRV_FEATURES, (), (), ()),
+    "rq":          ((), RQ_FEATURES, (), ()),
+    "eth_and_rq":  (ETH_TSRV_FEATURES, RQ_FEATURES, (), ()),
+    "svi_spot":    ((), (), SVI_SPOT_FEATURES, ()),
+    "har_pd":      ((), (), (), HAR_PD_FEATURES),
 }
 
 
@@ -111,6 +116,7 @@ class SpotCheckContext:
     eth_tsrv_features: pd.DataFrame = field(default_factory=pd.DataFrame)
     rq_features: pd.DataFrame = field(default_factory=pd.DataFrame)
     svi_spot_features: pd.DataFrame = field(default_factory=pd.DataFrame)
+    har_pd_features: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -369,6 +375,27 @@ def load_spot_check_context(
 
     baseline_predictions = _load_baseline_predictions(asset)
 
+    # HAR-PD sidecar (Tier 3): separate parquet built via
+    # `python -m vol_model.features.har_pd --asset {asset}`. Features:
+    # R1 (signed-flow exponential) + R2 (realized-variance exponential) at
+    # 3 kernel decays each, 6 raw features total. Strictly past-only per the
+    # causality unit test (test_har_pd.py::test_causality_mutating_future_*).
+    har_pd_df = pd.DataFrame()
+    if include_extras:
+        har_pd_path = Path("vol_model/output") / f"{asset}_features_har_pd_15m.parquet"
+        if har_pd_path.exists():
+            har_pd_df = pd.read_parquet(har_pd_path)
+            logger.info(
+                "Loaded HAR-PD sidecar: %d rows x %d cols from %s",
+                len(har_pd_df), har_pd_df.shape[1], har_pd_path,
+            )
+        else:
+            logger.warning(
+                "HAR-PD sidecar missing (%s); har_pd thread will be empty. "
+                "Run `python -m vol_model.features.har_pd --asset %s` first.",
+                har_pd_path, asset,
+            )
+
     return SpotCheckContext(
         asset=asset,
         vol_config=vol_config,
@@ -384,6 +411,7 @@ def load_spot_check_context(
         eth_tsrv_features=eth_df,
         rq_features=rq_df,
         svi_spot_features=svi_spot_only,
+        har_pd_features=har_pd_df,
     )
 
 
@@ -590,7 +618,7 @@ def build_month_data_augmented(
         raise ValueError(
             f"unknown thread '{thread}'; expected one of {sorted(TIER_FEATURE_MAP)}"
         )
-    eth_cols, rq_cols, svi_extra_cols = TIER_FEATURE_MAP[thread]
+    eth_cols, rq_cols, svi_extra_cols, har_pd_cols = TIER_FEATURE_MAP[thread]
 
     md = build_month_data(ctx, month_str)
     if md is None:
@@ -618,6 +646,13 @@ def build_month_data_augmented(
             present = [c for c in svi_extra_cols if c in ctx.svi_spot_features.columns]
             if present:
                 extras.append(ctx.svi_spot_features[present].reindex(md.X_month.index))
+    if har_pd_cols:
+        if ctx.har_pd_features.empty:
+            logger.warning("%s: HAR-PD pool unavailable (sidecar missing); skipping HAR-PD", month_str)
+        else:
+            present = [c for c in har_pd_cols if c in ctx.har_pd_features.columns]
+            if present:
+                extras.append(ctx.har_pd_features[present].reindex(md.X_month.index))
 
     if not extras:
         # Thread is effectively control — return as-is

@@ -27,7 +27,15 @@ class BacktestConfig(BaseModel):
     #   - vol_arb/output/SVI_BACKTEST_NOTE.md (parquet switch)
     #   - project_t2_1_retrain.md in memory (T2.1 pruned+SVI retrain result)
     vol_arb_path: str = "vol_arb/output/BTC_vol_arb_svi.parquet"
-    predictions_path: str = "vol_model/output/BTCUSDT_pruned_svi_predictions.parquet"
+    # pruned_svi_har_pd_v1: pruned_svi_v1 + 6 HAR-PD path-dependent features
+    # (Xiao 2025, arxiv:2503.00851). Certified 2026-04-18 over the full 50-month
+    # walk-forward with −3.67% avg ΔQLIKE, 39/50 months improved, 29/50 DM-sig
+    # at p<0.01 (all three Session-C gates pass). V2 backtest with this
+    # predictor: NC Sharpe 9.58→9.69, Compound PnL $14.5M→$15.0M (+3.7%),
+    # profitable months 94%→96%. The previous pruned_svi_v1 parquet is still
+    # on disk; override via --predictions-path if you need to reproduce
+    # pre-HAR-PD results.
+    predictions_path: str = "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions.parquet"
 
     # Dynamic spread model
     base_spread_iv: float = 1.5   # base IV bid-ask spread (vol points)

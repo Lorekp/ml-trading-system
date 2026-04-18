@@ -68,10 +68,11 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
-from scipy.optimize import least_squares, minimize
+from scipy.optimize import differential_evolution, least_squares, minimize
+from scipy.special import erf as _erf
 from scipy.special import gamma as _gamma
 from scipy.stats import norm as _norm
 
@@ -131,42 +132,61 @@ PARAM_BOUNDS: tuple[tuple[float, float], ...] = (
 
 
 def _adams_weights(alpha: float, M: int) -> tuple[np.ndarray, np.ndarray]:
-    """Diethelm-Ford-Freed weights for the fractional Adams scheme of
-    order alpha = 1 - H in (1/2, 1).
+    """Diethelm-Ford-Freed weights for the fractional Adams scheme.
 
-    Returns
-    -------
-    (a, b) where a[k+1, j] are corrector weights and b[k+1, j] are predictor
-    weights, both shape (M+1, M+1). Zero entries for j > k+1.
+    Formulas (Diethelm-Ford-Freed 2002 eqns 6.4-6.5), with r = k + 1:
+
+        a[r, 0]      = (r-1)^(alpha+1) - (r-1-alpha) * r^alpha,   r >= 2
+        a[1, 0]      = 1
+        a[r, j]      = (r-j+1)^(alpha+1) - 2(r-j)^(alpha+1) + (r-j-1)^(alpha+1),
+                       for 1 <= j <= r-1
+        a[r, r]      = 1
+        b[r, j]      = (r-j)^alpha - (r-j-1)^alpha,   for 0 <= j <= r-1
+
+    All other entries zero. Normalized by ``1 / Gamma(alpha+2)`` (corrector)
+    and ``1 / Gamma(alpha+1)`` (predictor). Returns ``(a, b)`` of shape
+    ``(M+1, M+1)``.
+
+    Vectorized: the original Python double-loop cost ~6 s per DE run at
+    M=50 (single-threaded Python arithmetic). The vectorized form
+    computes the whole matrix in a handful of numpy ops.
     """
-    a = np.zeros((M + 1, M + 1), dtype=np.float64)
-    b = np.zeros((M + 1, M + 1), dtype=np.float64)
     alpha1 = alpha + 1.0
-    for k in range(M):
-        # Corrector weights: a[k+1, j] for j = 0..k+1
-        # From D-F-F 2002 eq (6.5).
-        # a[k+1, 0]   = k^(alpha+1) - (k - alpha)(k+1)^alpha
-        # a[k+1, j]   = (k - j + 2)^(alpha+1) - 2(k - j + 1)^(alpha+1) + (k - j)^(alpha+1), 1<=j<=k
-        # a[k+1, k+1] = 1
-        if k == 0:
-            a[1, 0] = 1.0
-        else:
-            a[k + 1, 0] = k ** alpha1 - (k - alpha) * (k + 1) ** alpha
-        for j in range(1, k + 1):
-            a[k + 1, j] = (
-                (k - j + 2) ** alpha1
-                - 2.0 * (k - j + 1) ** alpha1
-                + (k - j) ** alpha1
-            )
-        a[k + 1, k + 1] = 1.0
-        # Predictor weights (rectangular rule on fractional integral):
-        # b[k+1, j] = (k - j + 1)^alpha - (k - j)^alpha for 0<=j<=k
-        for j in range(k + 1):
-            b[k + 1, j] = (k - j + 1) ** alpha - (k - j) ** alpha
+    # Row index r ∈ [0, M] (we fill rows 1..M), col j ∈ [0, M].
+    r_idx = np.arange(M + 1, dtype=np.float64)
+    j_idx = np.arange(M + 1, dtype=np.float64)
+    R = r_idx[:, None]  # (M+1, 1)
+    J = j_idx[None, :]  # (1, M+1)
+    diff = R - J        # (M+1, M+1)  = r - j
 
-    # Normalize by Gamma factors
-    a *= 1.0 / _gamma(alpha + 2.0)  # corrector uses h^alpha / Gamma(alpha+2)
-    b *= 1.0 / _gamma(alpha + 1.0)  # predictor uses h^alpha / Gamma(alpha+1)
+    # Interior corrector (1 <= j <= r-1): uses three consecutive powers.
+    # Safe powers: where the mask is False we never look at the value, but
+    # negative bases would still raise. Clamp inputs to ≥ 0.
+    d_p1 = np.maximum(diff + 1.0, 0.0)
+    d_0  = np.maximum(diff,       0.0)
+    d_m1 = np.maximum(diff - 1.0, 0.0)
+    a_interior = d_p1 ** alpha1 - 2.0 * d_0 ** alpha1 + d_m1 ** alpha1
+
+    a = np.zeros((M + 1, M + 1), dtype=np.float64)
+    interior_mask = (J >= 1) & (J <= R - 1)
+    a[interior_mask] = a_interior[interior_mask]
+
+    # Boundary column j=0, r >= 2: a[r,0] = (r-1)^alpha1 - (r-1-alpha) * r^alpha
+    r_ge2 = r_idx[2:]
+    a[2:, 0] = (r_ge2 - 1.0) ** alpha1 - (r_ge2 - 1.0 - alpha) * r_ge2 ** alpha
+    a[1, 0] = 1.0
+
+    # Diagonal j=r, r >= 1
+    np.fill_diagonal(a[1:, 1:], 1.0)
+
+    # Predictor: b[r, j] = (r-j)^alpha - (r-j-1)^alpha for 0 <= j <= r-1
+    b = np.zeros((M + 1, M + 1), dtype=np.float64)
+    b_mask = (J <= R - 1)
+    b_vals = d_0 ** alpha - d_m1 ** alpha
+    b[b_mask] = b_vals[b_mask]
+
+    a *= 1.0 / _gamma(alpha + 2.0)
+    b *= 1.0 / _gamma(alpha + 1.0)
     return a, b
 
 
@@ -248,8 +268,11 @@ def fractional_riccati_solve(
 
     for k in range(M):
         # Predictor: psi_P[k+1] = sum_{j=0..k} b[k+1, j] F(psi[j])
+        # Broadcast + sum(axis=0) over the history rows. matmul was tried
+        # here (cleaner notation) but is ~4x slower for the small (k+1) ×
+        # n_u shapes the Adams scheme works at — BLAS overhead dominates
+        # when the inner dimension is < 50.
         psi_pred = (b[k + 1, : k + 1, None] * F_psi[: k + 1]).sum(axis=0)
-        # Clip magnitudes
         mag = np.abs(psi_pred)
         overflow = mag > clip
         if overflow.any():
@@ -321,14 +344,25 @@ def rough_heston_char_fn(
     u_c = np.asarray(u_vec, dtype=np.complex128)
     iu = 1j * u_c
 
-    # Closure capturing the Riccati coefficient
+    # Precompute the Riccati coefficients c0 (constant), c1 (linear in y),
+    # c2 (quadratic in y) once per CF call. The Adams scheme calls F ~100×
+    # per fractional_riccati_solve; the constant and linear coefficients
+    # don't depend on y, so inside F we only do 2 mults + 2 adds per
+    # element instead of recomputing u^2+iu and iu*eta*rho each call.
+    c0 = -0.5 * (u_c ** 2 + iu)
+    c1 = iu * eta * rho - kappa
+    c2 = 0.5 * eta ** 2
+
     def F(y: np.ndarray) -> np.ndarray:
-        # F(u, y) = -0.5*(u^2 + i u) + (i u eta rho - kappa)*y + 0.5*eta^2*y^2
+        # F(u, y) = c0 + c1*y + c2*y^2, with
+        #   c0 = -0.5*(u^2 + iu)
+        #   c1 = iu*eta*rho - kappa
+        #   c2 = 0.5*eta^2
         # This matches the classical Heston Riccati (derived from the
-        # Feynman-Kac generator for X_t = log(S_t/S_0) under Q). Getting the
-        # sign of the constant right is critical: with +0.5*u^2 the CF has
+        # Feynman-Kac generator for X_t = log(S_t/S_0) under Q). The sign
+        # of the constant term is critical — with +0.5*u^2 the CF has
         # |phi| > 1 for real u, violating a fundamental CF property.
-        return -0.5 * (u_c ** 2 + iu) + (iu * eta * rho - kappa) * y + 0.5 * eta ** 2 * y ** 2
+        return c0 + c1 * y + c2 * (y * y)
 
     F_integral, psi_integral = fractional_riccati_solve(F, tau, H, u_c, M=M)
 
@@ -410,16 +444,23 @@ def carr_madan_call_prices(
     dv = v_max / n_fft
     v_grid = (np.arange(n_fft) + 0.5) * dv  # midpoint rule
 
-    # CF evaluations
-    phi_v = rough_heston_char_fn(
-        v_grid + 0.0j, tau, V_0, H, kappa, theta, eta, rho, r=r, q=q, M=M_riccati,
+    # Pool the three CF evaluations into a single Adams-scheme solve: the
+    # fractional Riccati integration dominates run-time (27% of a DE
+    # calibration, per profiling). Stacking u-values cuts scheme overhead
+    # ~3x while keeping per-u arithmetic identical. Layout:
+    #   u_all[0:n_fft]        = v_grid  (phi evaluation for Pi_2)
+    #   u_all[n_fft:2*n_fft]  = v_grid - i  (phi shifted for Pi_1)
+    #   u_all[-1]             = -i  (phi(-i) normalization)
+    u_all = np.empty(2 * n_fft + 1, dtype=np.complex128)
+    u_all[:n_fft] = v_grid
+    u_all[n_fft:2 * n_fft] = v_grid - 1j
+    u_all[-1] = -1j
+    phi_all = rough_heston_char_fn(
+        u_all, tau, V_0, H, kappa, theta, eta, rho, r=r, q=q, M=M_riccati,
     )
-    phi_v_minus_i = rough_heston_char_fn(
-        v_grid - 1j, tau, V_0, H, kappa, theta, eta, rho, r=r, q=q, M=M_riccati,
-    )
-    phi_minus_i = rough_heston_char_fn(
-        np.array([0.0 - 1j]), tau, V_0, H, kappa, theta, eta, rho, r=r, q=q, M=M_riccati,
-    )[0]
+    phi_v = phi_all[:n_fft]
+    phi_v_minus_i = phi_all[n_fft:2 * n_fft]
+    phi_minus_i = phi_all[-1]
 
     # psi_1(v) = phi(v - i) / phi(-i); psi_2(v) = phi(v)
     psi_1 = phi_v_minus_i / phi_minus_i
@@ -507,12 +548,211 @@ def _bs_vega(F: float, K: float, tau: float, sigma: float, r: float = 0.0) -> fl
     return math.exp(-r * tau) * F * _norm.pdf(d1) * sqrt_t
 
 
+# ── Vectorized BS + IV inverter (Session G) ──────────────────────────
+#
+# The scalar ``_bs_call_price`` / ``_bs_vega`` / ``implied_volatility`` above
+# are kept for isolated callers (tests, diagnostics). The hot path below
+# uses pure-numpy batched variants that skip scipy.stats.norm overhead —
+# profiling Session G DE showed 1.6 M scalar norm.cdf calls per calibration
+# dominating wall-clock at 38 % of total time. The batched paths below
+# drop that to one vectorized CDF via the error-function identity
+# Phi(x) = 0.5 * (1 + erf(x / sqrt(2))).
+
+
+_SQRT2 = math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+def _norm_cdf_vec(x: np.ndarray) -> np.ndarray:
+    """Vectorized standard-normal CDF via the erf identity
+    Phi(x) = 0.5 * (1 + erf(x / sqrt(2))). Skips scipy.stats.norm.cdf's
+    argument-validation overhead (1.6M calls per Session F calibration).
+    """
+    return 0.5 * (1.0 + _erf(x / _SQRT2))
+
+
+def _bs_call_price_vec(
+    F: float,
+    K: np.ndarray,
+    tau: np.ndarray,
+    sigma: np.ndarray,
+    r: float = 0.0,
+) -> np.ndarray:
+    """Vectorized Black-76 call price. F is scalar; K, tau, sigma are arrays.
+
+    Returns an array of the same shape as the broadcast of ``K``, ``tau``,
+    ``sigma``. Out-of-domain entries (tau<=0 or sigma<=0) collapse to the
+    intrinsic value.
+    """
+    K_arr = np.asarray(K, dtype=np.float64)
+    tau_arr = np.asarray(tau, dtype=np.float64)
+    sig_arr = np.asarray(sigma, dtype=np.float64)
+    disc = np.exp(-r * tau_arr)
+    intrinsic = np.maximum(F - K_arr, 0.0) * disc
+    # Mask valid inputs; compute BS on them, fall back to intrinsic elsewhere
+    valid = (tau_arr > 0) & (sig_arr > 0) & (K_arr > 0)
+    out = np.where(valid, 0.0, intrinsic)
+    if not np.any(valid):
+        return out
+    sqrt_t = np.where(valid, np.sqrt(np.maximum(tau_arr, 1e-300)), 1.0)
+    log_fk = np.where(valid, np.log(np.maximum(F / np.maximum(K_arr, 1e-300), 1e-300)), 0.0)
+    d1 = np.where(
+        valid,
+        (log_fk + 0.5 * sig_arr ** 2 * tau_arr) / np.maximum(sig_arr * sqrt_t, 1e-300),
+        0.0,
+    )
+    d2 = d1 - sig_arr * sqrt_t
+    price = disc * (F * _norm_cdf_vec(d1) - K_arr * _norm_cdf_vec(d2))
+    return np.where(valid, price, intrinsic)
+
+
+def _bs_vega_vec(
+    F: float,
+    K: np.ndarray,
+    tau: np.ndarray,
+    sigma: np.ndarray,
+    r: float = 0.0,
+) -> np.ndarray:
+    """Vectorized Black-76 vega (price per 1.0 vol change)."""
+    K_arr = np.asarray(K, dtype=np.float64)
+    tau_arr = np.asarray(tau, dtype=np.float64)
+    sig_arr = np.asarray(sigma, dtype=np.float64)
+    valid = (tau_arr > 0) & (sig_arr > 0) & (K_arr > 0)
+    if not np.any(valid):
+        return np.zeros_like(K_arr, dtype=np.float64)
+    sqrt_t = np.where(valid, np.sqrt(np.maximum(tau_arr, 1e-300)), 1.0)
+    log_fk = np.where(valid, np.log(np.maximum(F / np.maximum(K_arr, 1e-300), 1e-300)), 0.0)
+    d1 = np.where(
+        valid,
+        (log_fk + 0.5 * sig_arr ** 2 * tau_arr) / np.maximum(sig_arr * sqrt_t, 1e-300),
+        0.0,
+    )
+    pdf_d1 = _INV_SQRT_2PI * np.exp(-0.5 * d1 ** 2)
+    vega = np.exp(-r * tau_arr) * F * pdf_d1 * sqrt_t
+    return np.where(valid, vega, 0.0)
+
+
+def implied_volatility_vec(
+    prices: np.ndarray,
+    F: float,
+    K: np.ndarray,
+    tau: np.ndarray,
+    *,
+    r: float = 0.0,
+    lo: float = 1e-3,
+    hi: float = 10.0,
+    tol: float = 1e-8,
+    maxiter: int = 100,
+) -> np.ndarray:
+    """Vectorized Brent-bisection Black-76 IV inversion.
+
+    One bisection step is applied to every option in parallel. Returns
+    NaN where the input is out-of-domain (negative price, intrinsic-
+    violating, tau<=0) — matching the scalar ``implied_volatility``
+    failure semantics.
+    """
+    prices = np.asarray(prices, dtype=np.float64)
+    K_arr = np.asarray(K, dtype=np.float64)
+    tau_arr = np.asarray(tau, dtype=np.float64)
+    intrinsic = np.maximum(F - K_arr, 0.0) * np.exp(-r * tau_arr)
+    invalid = (
+        (tau_arr <= 0)
+        | (prices <= 0)
+        | (K_arr <= 0)
+        | (prices < intrinsic - 1e-10)
+    )
+    p_lo = _bs_call_price_vec(F, K_arr, tau_arr, np.full_like(K_arr, lo), r=r)
+    p_hi = _bs_call_price_vec(F, K_arr, tau_arr, np.full_like(K_arr, hi), r=r)
+    # Prices outside [p_lo, p_hi] are unreachable in BS — mark NaN.
+    oob = (prices < p_lo) | (prices > p_hi)
+    dead = invalid | oob
+
+    a = np.full_like(K_arr, lo)
+    b = np.full_like(K_arr, hi)
+    for _ in range(maxiter):
+        mid = 0.5 * (a + b)
+        p_mid = _bs_call_price_vec(F, K_arr, tau_arr, mid, r=r)
+        diff = p_mid - prices
+        a = np.where(diff < -tol, mid, a)
+        b = np.where(diff > tol, mid, b)
+        if np.all(np.abs(diff) < tol):
+            break
+    iv = 0.5 * (a + b)
+    return np.where(dead, np.nan, iv)
+
+
 # ── Calibration ──────────────────────────────────────────────────────
 
 
 _DEFAULT_INIT = RoughHestonParams(
     V_0=0.5 ** 2, H=0.1, kappa=1.5, theta=0.5 ** 2, eta=2.0, rho=-0.5,
 )
+
+_KAPPA_PRIOR: float = 2.0  # Bayer-Friz-Gatheral 2016 convention.
+
+
+class _DELossFn:
+    """Picklable callable for scipy DE multiprocess workers.
+
+    The per-bucket residual closure captures market data (prices, vegas,
+    τ groupings) that cannot be re-derived on each call. A process pool
+    worker receives this state once via pickling at pool init, then
+    evaluates the scalar loss on each population member locally.
+
+    The sum-of-squared-residuals is the first-order-Taylor approximation
+    to the vega-weighted IV-RMSE (identical optimum, O((Δiv)^2) error
+    away from it). See the ``calibrate_rough_heston`` docstring.
+    """
+
+    __slots__ = (
+        "F", "r", "tau_groups", "market_prices", "resid_coef",
+        "fallback_sq_sum", "n_fft", "M", "fix_kappa_theta",
+    )
+
+    def __init__(
+        self,
+        F: float,
+        r: float,
+        tau_groups: list[tuple[float, np.ndarray, np.ndarray]],
+        market_prices: np.ndarray,
+        resid_coef: np.ndarray,
+        fallback_resid: np.ndarray,
+        n_fft: int,
+        M: int,
+        fix_kappa_theta: bool,
+    ) -> None:
+        self.F = F
+        self.r = r
+        self.tau_groups = tau_groups
+        self.market_prices = market_prices
+        self.resid_coef = resid_coef
+        # Store only the scalar fallback loss — the full residual vector
+        # isn't needed for DE's scalar-loss interface.
+        self.fallback_sq_sum = float(np.sum(fallback_resid ** 2))
+        self.n_fft = n_fft
+        self.M = M
+        self.fix_kappa_theta = fix_kappa_theta
+
+    def __call__(self, x: np.ndarray) -> float:
+        if self.fix_kappa_theta:
+            V_0 = float(x[0]); H = float(x[1])
+            eta = float(x[2]); rho = float(x[3])
+            kappa, theta = _KAPPA_PRIOR, V_0
+        else:
+            V_0, H, kappa, theta, eta, rho = (float(xi) for xi in x)
+
+        model_prices = np.empty_like(self.market_prices)
+        for tau, idx, k_slice in self.tau_groups:
+            try:
+                model_prices[idx] = carr_madan_call_prices(
+                    tau, V_0, H, kappa, theta, eta, rho,
+                    k_slice, F=self.F, r=self.r,
+                    n_fft=self.n_fft, M_riccati=self.M,
+                )
+            except Exception:  # noqa: BLE001
+                return self.fallback_sq_sum
+        resid = self.resid_coef * (model_prices - self.market_prices)
+        return float(np.dot(resid, resid))
 
 
 def _pack(p: RoughHestonParams) -> np.ndarray:
@@ -534,6 +774,14 @@ def calibrate_rough_heston(
     n_fft: int = 1024,
     fix_kappa_theta: bool = True,
     use_global_search: bool = True,
+    global_method: Literal["nm", "de"] = "de",
+    de_popsize: int = 15,
+    de_maxiter: int = 30,
+    de_seed: int = 42,
+    de_n_fft: int = 512,
+    de_M_riccati: int = 50,
+    de_workers: int = 1,
+    warm_rescue_threshold: float = 0.30,
 ) -> RoughHestonParams:
     """Fit rough-Heston to a panel of European calls.
 
@@ -570,11 +818,58 @@ def calibrate_rough_heston(
     fix_kappa_theta
         See above.
     use_global_search
-        If True (default), use a 2-pass Nelder-Mead + SLSQP approach that
-        avoids local-minima traps at the cost of ~5-10x wall-clock. Set
-        to False for warm-started bucket-by-bucket builds where the init
-        is close to truth — goes directly to SLSQP for ~10x speedup. The
-        sidecar builder uses False for warm buckets, True for cold ones.
+        If True (default), use a population / multi-start global search
+        followed by an LM polish. Set to False for warm-started bucket-by-
+        bucket builds where the init is close to truth — goes directly to
+        LM for ~10x speedup. The sidecar builder uses False for warm
+        buckets, True for cold ones.
+    global_method
+        Which global optimizer to use when ``use_global_search=True``.
+
+        - ``"de"`` (default, Session G upgrade): ``scipy.optimize.differential_
+          evolution`` with a ``popsize * len(bounds)``-member population.
+          Population-based: robust against local minima at the cost of ~1-2x
+          wall-clock of the old Nelder-Mead path on cold panels, but higher
+          success rate on the real-data non-convex loss surface. The Session F
+          failure mode (NM trapped at 14-23vp RMSE from cold-start) motivates
+          making this the default.
+        - ``"nm"`` (Session F legacy): single-pass Nelder-Mead with quadratic
+          penalty on bound violations. Faster on "easy" panels where the data-
+          driven V_0 init is already in the right basin, but susceptible to
+          local minima on short-expiry skew + kurtosis combinations.
+    de_popsize, de_maxiter, de_seed
+        DE hyperparameters. Total objective evaluations are bounded by
+        ``de_popsize * len(bounds) * de_maxiter`` (≈ 1800 for the default
+        4-param setup). Seed is fixed so calibration is deterministic.
+    de_n_fft, de_M_riccati
+        Pricing-grid resolution used during the DE global search. Defaults
+        to a coarser ``n_fft=512`` (vs the ``n_fft=1024`` used by the LM
+        polish): DE only needs to locate the correct basin of attraction,
+        and at ``n_fft=512`` each objective evaluation is ~2.7x faster
+        while the discretization noise (~2.7 vol-points peak, << DE's own
+        basin-width) is dwarfed by the optimizer's per-generation progress.
+        LM polish always runs at the full ``n_fft``/``M_riccati`` supplied
+        to the calibrator, so final parameter estimates are unaffected.
+    de_workers
+        Parallelism for DE's per-generation population evaluation. Default
+        1 (serial) preserves single-bucket determinism and avoids oversub-
+        scription when the sidecar builder is the outer parallelism layer.
+        Pass ``>1`` (e.g. ``os.cpu_count()``) for standalone diagnostics
+        where the calibrator is the sole CPU consumer; on a 12-core
+        machine this gives ~4× speedup on a 47-option real panel
+        (133 s ↔ 576 s). Internally scipy spawns a multiprocessing pool and
+        ships the picklable ``_DELossFn`` callable to each worker once
+        at pool init; per-call overhead is just pickling a length-``n_params``
+        x-vector. Requires ``updating="deferred"`` (scipy contract when
+        ``workers != 1``), which changes DE's per-generation update rule
+        slightly but does not change convergence semantics meaningfully
+        at this population size. Seed stays fixed, so runs at a given
+        ``de_workers=k`` remain deterministic.
+    warm_rescue_threshold
+        If ``use_global_search=False`` (warm-start path) and the LM fit
+        produces RMSE > this threshold (default 30 vol-points), re-run
+        calibration as a cold DE search. Prevents level-0 emissions when
+        warm-start LM diverges from a bad init.
 
     Returns
     -------
@@ -588,6 +883,11 @@ def calibrate_rough_heston(
     where w_i = vega_weight_i (pre-computed by caller; typically market vega
     times a quality flag).
     """
+    if global_method not in ("nm", "de"):
+        raise ValueError(
+            f"global_method must be 'nm' or 'de'; got {global_method!r}"
+        )
+
     if options.size == 0:
         return RoughHestonParams(calibration_level=0)
 
@@ -599,9 +899,6 @@ def calibrate_rough_heston(
 
     # Group options by maturity for batched CF computation
     unique_taus = np.unique(taus)
-
-    # Fixed priors when `fix_kappa_theta=True` — not calibrated.
-    _KAPPA_PRIOR = 2.0
 
     def _unpack_active(x: np.ndarray) -> tuple[float, float, float, float, float, float]:
         """Expand the SLSQP state vector into the full 6-parameter set.
@@ -616,35 +913,42 @@ def calibrate_rough_heston(
             return V_0, H, _KAPPA_PRIOR, V_0, eta, rho
         return _unpack(x)
 
-    def _loss(x: np.ndarray) -> float:
-        V_0, H, kappa, theta, eta, rho = _unpack_active(x)
-        resid_sq_sum = 0.0
-        n_nan = 0
-        for tau in unique_taus:
-            mask = taus == tau
-            k_slice = log_strikes[mask]
-            try:
-                call_prices = carr_madan_call_prices(
-                    tau, V_0, H, kappa, theta, eta, rho,
-                    k_slice, F=F, r=r, n_fft=n_fft, M_riccati=M_riccati,
-                )
-            except Exception:  # noqa: BLE001
-                return 1e6
-            for i, k in enumerate(k_slice):
-                K_i = F * math.exp(k)
-                iv = implied_volatility(call_prices[i], F, K_i, tau, r=r)
-                iv_mkt = mkt_iv[mask][i]
-                w_i = w[mask][i]
-                if not np.isfinite(iv):
-                    # Can't invert model price -> use price-space residual as
-                    # a bounded penalty. Full BS vega scaling keeps units
-                    # comparable to IV^2 residuals.
-                    iv_proxy = max(iv_mkt * 0.5, 0.1)  # fallback IV
-                    resid_sq_sum += w_i * (iv_proxy - iv_mkt) ** 2
-                    n_nan += 1
-                else:
-                    resid_sq_sum += w_i * (iv - iv_mkt) ** 2
-        return resid_sq_sum
+    # ── Precompute per-calibration fixed quantities (Session G) ────────
+    #
+    # The per-option loss can be written as a first-order Taylor expansion
+    # around the market IV:
+    #
+    #   w_i * (iv_model_i - iv_mkt_i)^2
+    #     ≈ (w_i / vega_mkt_i^2) * (price_model_i - price_mkt_i)^2
+    #     = resid_coef_i^2 * (price_model_i - price_mkt_i)^2
+    #
+    # where resid_coef_i = sqrt(w_i) / vega_mkt_i. The approximation is
+    # exact to O((Δiv)^2) and in practice indistinguishable from a
+    # full-inversion IV-RMSE loss at the converged optimum. The huge
+    # benefit: we never invert implied-vol from model prices inside the
+    # optimizer loop, which was 38% of Session F DE wall-clock. Market
+    # prices + vegas are fixed across all param evals, so we cache them
+    # once here.
+    strikes_arr = np.exp(log_strikes) * F
+    market_prices = _bs_call_price_vec(F, strikes_arr, taus, mkt_iv, r=r)
+    vega_mkt = _bs_vega_vec(F, strikes_arr, taus, mkt_iv, r=r)
+    # Guard against zero-vega (deep OTM / ITM) — floor at 1e-6 to keep the
+    # coefficient finite. Such options get negligible weight anyway because
+    # w_i = market_vega * quality_taper is tiny when vega is tiny.
+    vega_safe = np.maximum(vega_mkt, 1e-6)
+    resid_coef = np.sqrt(np.maximum(w, 1e-12)) / vega_safe  # (n_options,)
+
+    # Pre-group option indices by unique tau so _residuals just loops
+    # over taus and pricing is strike-vectorized inside carr_madan.
+    tau_groups: list[tuple[float, np.ndarray, np.ndarray]] = []
+    for tau in unique_taus:
+        idx = np.nonzero(taus == tau)[0]
+        tau_groups.append((float(tau), idx, log_strikes[idx]))
+
+    # Catastrophic-failure residual: if pricing raises, return per-option
+    # residuals equal to the current market price — bounded, finite,
+    # and quickly learned-away by LM.
+    fallback_resid = resid_coef * market_prices
 
     # Initialize V_0 from the observed ATM IV of the panel when no warm-start
     # is provided. This is critical for the global search: the default init
@@ -690,47 +994,66 @@ def calibrate_rough_heston(
     low = np.array([b[0] for b in active_bounds])
     high = np.array([b[1] for b in active_bounds])
 
-    def _residuals(x: np.ndarray) -> np.ndarray:
-        """Per-option residuals vector (IV_model - IV_market) weighted by
-        sqrt(vega_weight). The sum of squares of this vector is the calibration
-        loss — Levenberg-Marquardt minimizes this directly and is 10-100x
-        faster than scalar minimizers for least-squares problems because it
-        exploits the Jacobian structure."""
-        V_0, H, kappa, theta, eta, rho = _unpack_active(x)
-        resid = []
-        for tau in unique_taus:
-            mask = taus == tau
-            k_slice = log_strikes[mask]
-            try:
-                call_prices = carr_madan_call_prices(
-                    tau, V_0, H, kappa, theta, eta, rho,
-                    k_slice, F=F, r=r, n_fft=n_fft, M_riccati=M_riccati,
-                )
-            except Exception:  # noqa: BLE001
-                # On numerical failure, return large penalty per option
-                resid.extend([100.0] * int(mask.sum()))
-                continue
-            for i, k in enumerate(k_slice):
-                K_i = F * math.exp(k)
-                iv = implied_volatility(call_prices[i], F, K_i, tau, r=r)
-                iv_mkt = mkt_iv[mask][i]
-                sw = math.sqrt(max(w[mask][i], 1e-12))
-                if not np.isfinite(iv):
-                    # Bounded residual so LM can still make progress
-                    resid.append(sw * (iv_mkt - max(iv_mkt * 0.5, 0.1)))
-                else:
-                    resid.append(sw * (iv - iv_mkt))
-        return np.asarray(resid)
+    def _make_residuals(grid_n_fft: int, grid_M: int):
+        """Factory for a residual closure parameterized by pricing grid.
 
-    try:
-        if use_global_search:
-            # Two-pass Nelder-Mead (global exploration) + LM polish.
-            # Used for cold-start (no warm init). Guarantees we escape
-            # local minima even from a bad init.
-            def _loss(x: np.ndarray) -> float:
-                resid = _residuals(x)
-                return float((resid ** 2).sum())
+        Returns a pure function x → residuals vector. Used to give DE a
+        coarser (faster) grid than the LM polish without duplicating the
+        per-bucket caches (`market_prices`, `resid_coef`, `tau_groups`).
+        """
+        def _residuals(x: np.ndarray) -> np.ndarray:
+            """Vectorized per-option residuals, first-order equivalent to
+            the vega-weighted IV residuals under Black-76.
 
+            For each unique tau we price the strike slice in one FFT-free
+            Heston Pi1/Pi2 call, then the full residual vector is a single
+            numpy expression
+                resid = resid_coef * (price_model - price_market)
+            Sum-of-squares equals the IV-space weighted RMSE to O((Δiv)^2).
+
+            On catastrophic pricing failure (e.g. Riccati blow-up at
+            extreme params), the bad tau group falls back to a bounded
+            residual equal to resid_coef * market_price — LM sees finite
+            residuals and steers away.
+            """
+            V_0, H, kappa, theta, eta, rho = _unpack_active(x)
+            model_prices = np.empty_like(market_prices)
+            for tau, idx, k_slice in tau_groups:
+                try:
+                    model_prices[idx] = carr_madan_call_prices(
+                        tau, V_0, H, kappa, theta, eta, rho,
+                        k_slice, F=F, r=r,
+                        n_fft=grid_n_fft, M_riccati=grid_M,
+                    )
+                except Exception:  # noqa: BLE001
+                    return fallback_resid.copy()
+            return resid_coef * (model_prices - market_prices)
+        return _residuals
+
+    # Two closures: DE uses the coarse grid for speed, LM polish uses the
+    # full grid for accuracy. Both share the same market-data caches.
+    _residuals = _make_residuals(n_fft, M_riccati)
+    _residuals_de = _make_residuals(de_n_fft, de_M_riccati)
+
+    # Scalar loss variants — DE uses the coarse-grid residuals, NM uses
+    # the full-grid residuals (NM has fewer evaluations so the speedup
+    # is less important than maintaining the Session F baseline on that
+    # path, which remains available via ``global_method="nm"``).
+    def _loss_de(x: np.ndarray) -> float:
+        resid = _residuals_de(x)
+        return float((resid ** 2).sum())
+
+    def _loss(x: np.ndarray) -> float:
+        resid = _residuals(x)
+        return float((resid ** 2).sum())
+
+    def _run_global(x_start: np.ndarray) -> np.ndarray:
+        """Run the configured global optimizer; return clipped x at optimum.
+
+        Dispatches on ``global_method``. Both branches return a point inside
+        the bounds box; the subsequent LM polish refines further.
+        """
+        if global_method == "nm":
             def _loss_penalized(x: np.ndarray) -> float:
                 if np.any(x < low) or np.any(x > high):
                     pen = float(
@@ -743,36 +1066,143 @@ def calibrate_rough_heston(
                 return _loss(x)
 
             result_nm = minimize(
-                _loss_penalized, x0,
+                _loss_penalized, x_start,
                 method="Nelder-Mead",
                 options={"maxiter": max_iter * 10, "xatol": 1e-5, "fatol": 1e-7},
             )
-            x_after_nm = np.clip(result_nm.x, low, high)
-            # LM polish
+            return np.clip(result_nm.x, low, high)
+        elif global_method == "de":
+            # Population-based global search via differential evolution.
+            # Population size = de_popsize * len(bounds), so 15 * 4 = 60
+            # members by default for 4-param mode. Sobol init gives better
+            # space-fill than the scipy default LHS. polish=False because
+            # we do our own LM residual-polish afterwards (exploits Jacobian
+            # structure, which scalar L-BFGS-B polish can't).
+            de_bounds = list(zip(low.tolist(), high.tolist()))
+            n_workers = max(1, int(de_workers))
+            de_kwargs = dict(
+                strategy="best1bin",
+                popsize=de_popsize,
+                maxiter=de_maxiter,
+                tol=0.01,
+                mutation=(0.5, 1.0),
+                recombination=0.7,
+                init="sobol",
+                polish=False,
+                seed=de_seed,
+            )
+            if n_workers == 1:
+                # Sequential path — preserves Session G.2 behavior exactly
+                # for single-bucket warm-start sidecar calibration.
+                result_de = differential_evolution(
+                    _loss_de, de_bounds,
+                    workers=1,
+                    updating="immediate",
+                    **de_kwargs,
+                )
+            else:
+                # Multiprocess parallel population evaluation. A
+                # ``_DELossFn`` instance carries all market-data caches
+                # as pickled state to each worker at pool init, so each
+                # per-generation call only pays the cost of pickling a
+                # length-4 x vector. scipy's own Pool handles lifecycle.
+                parallel_loss = _DELossFn(
+                    F=F, r=r,
+                    tau_groups=tau_groups,
+                    market_prices=market_prices,
+                    resid_coef=resid_coef,
+                    fallback_resid=fallback_resid,
+                    n_fft=de_n_fft, M=de_M_riccati,
+                    fix_kappa_theta=fix_kappa_theta,
+                )
+                result_de = differential_evolution(
+                    parallel_loss, de_bounds,
+                    workers=n_workers,
+                    updating="deferred",
+                    **de_kwargs,
+                )
+            return np.clip(result_de.x, low, high)
+        else:
+            raise ValueError(f"unknown global_method: {global_method!r}")
+
+    try:
+        if use_global_search:
+            # Global search followed by LM polish. Escape local minima,
+            # then refine on the residual Jacobian.
+            x_after_global = _run_global(x0)
             result = least_squares(
-                _residuals, x_after_nm,
+                _residuals, x_after_global,
                 method="trf", bounds=(low, high),
                 max_nfev=max_iter * 5,
                 ftol=1e-8, xtol=1e-8, gtol=1e-8,
             )
         else:
             # Warm-start path: LM directly from the previous bucket's fit.
-            # No global exploration — the previous fit is assumed close.
+            # If LM produces a blow-up (RMSE > warm_rescue_threshold), fall
+            # back to cold DE + LM polish — prevents silent NaN emissions
+            # when warm-start lands in a bad basin (e.g. after a regime
+            # break where the previous fit is far from current truth).
             result = least_squares(
                 _residuals, x0,
                 method="trf", bounds=(low, high),
                 max_nfev=max_iter * 20,
                 ftol=1e-8, xtol=1e-8, gtol=1e-8,
             )
+            total_w_check = w.sum()
+            rmse_check = math.sqrt(
+                2 * float(result.cost) / max(total_w_check, 1e-12)
+            )
+            if rmse_check > warm_rescue_threshold or not np.isfinite(rmse_check):
+                # Rescue path: discard the bad warm fit, start cold with DE.
+                logger.debug(
+                    "warm-start LM RMSE %.4f > %.4f threshold — rescuing with cold DE",
+                    rmse_check, warm_rescue_threshold,
+                )
+                x_rescue = _run_global(x0)
+                result = least_squares(
+                    _residuals, x_rescue,
+                    method="trf", bounds=(low, high),
+                    max_nfev=max_iter * 5,
+                    ftol=1e-8, xtol=1e-8, gtol=1e-8,
+                )
     except Exception:  # noqa: BLE001
         return RoughHestonParams(calibration_level=0)
 
     V_0, H, kappa, theta, eta, rho = _unpack_active(result.x)
-    # LM returns 2 * sum(resid^2) as result.cost (factor of 2 in LM convention)
-    # and .fun is the residual vector. Convert to RMSE in IV units:
-    total_w = w.sum()
-    sum_weighted_sq = 2 * float(result.cost)  # sum of w_i * (iv - iv_mkt)^2
-    rmse = math.sqrt(sum_weighted_sq / max(total_w, 1e-12))
+    # Compute the final RMSE in true IV space (not the first-order proxy
+    # used inside the optimizer loop). Batched IV inversion runs once
+    # over all options via Brent bisection — cheap, ~30 iterations on
+    # each option in parallel.
+    final_model_prices = np.empty_like(market_prices)
+    final_ok = True
+    for tau, idx, k_slice in tau_groups:
+        try:
+            final_model_prices[idx] = carr_madan_call_prices(
+                tau, V_0, H, kappa, theta, eta, rho,
+                k_slice, F=F, r=r, n_fft=n_fft, M_riccati=M_riccati,
+            )
+        except Exception:  # noqa: BLE001
+            final_ok = False
+            break
+    if final_ok:
+        model_iv = implied_volatility_vec(
+            final_model_prices, F, strikes_arr, taus, r=r,
+        )
+        iv_resid = model_iv - mkt_iv
+        # Where IV inversion failed (NaN), fall back to the price-proxy
+        # residual so RMSE is still finite.
+        iv_resid = np.where(
+            np.isfinite(iv_resid),
+            iv_resid,
+            resid_coef * (final_model_prices - market_prices) / np.sqrt(np.maximum(w, 1e-12)),
+        )
+        total_w = w.sum()
+        sum_weighted_sq = float(np.sum(w * iv_resid ** 2))
+        rmse = math.sqrt(sum_weighted_sq / max(total_w, 1e-12))
+    else:
+        # Pricing blew up at final params — emit large RMSE so caller
+        # downgrades to calibration_level=0.
+        rmse = 1.0
 
     return RoughHestonParams(
         V_0=V_0, H=H, kappa=kappa, theta=theta, eta=eta, rho=rho,

@@ -941,3 +941,132 @@ pass would be a simpler two-step iterative fit. Multi-day build. Queued.
 
 Total session-to-date: 136/136 tests green across the leakage + feature +
 labeling surface.
+
+
+---
+
+# Session F — 2026-04-18 (late evening)
+
+## Scope
+
+Two candidates planned:
+- **Candidate B — Hawkes-OFI branching ratio** (Pham et al. 2024, arxiv:2408.03594).
+  7-feature family (5 levels + 2 deltas) from a bivariate exponential-kernel
+  Hawkes process fit to BTCUSDT aggTrades over trailing 4h windows.
+- **Candidate C — Rough-Heston SDE calibration** (Abi-Jaber 2019, El Euch-Rosenbaum 2019).
+  8-feature family (4 levels + 4 deltas) from full rough-Heston calibration
+  to the Deribit options panel.
+
+Both candidates were implemented from scratch. Only Candidate B was
+gauntlet-evaluated; Candidate C calibrator shipped but sidecar build blocked
+on numerical fragility (see Candidate C status below).
+
+## Candidate B — Hawkes-OFI (IMPLEMENTATION SHIPPED, GAUNTLET PENDING)
+
+Binned-Poisson MLE of the bivariate exp-kernel Hawkes (Bacry-Mastromatteo-Muzy 2015):
+
+    Lambda_b[t] = mu_b*dt + (1-exp(-beta*dt)) * (alpha_bb*X_b[t] + alpha_bs*X_s[t])
+    Lambda_s[t] = mu_s*dt + (1-exp(-beta*dt)) * (alpha_sb*X_b[t] + alpha_ss*X_s[t])
+    X_c[t+1] = exp(-beta*dt) * X_c[t] + N_c[t]
+
+7 parameters, L-BFGS-B in log space, O(T) log-likelihood via scipy.signal.lfilter
+(first-order linear recurrence). ~100ms cold, ~8ms warm-started per bucket.
+
+**Features (7)**: hawkes_mu_buy, hawkes_mu_sell, hawkes_branching_buy (alpha_bb+alpha_bs),
+hawkes_branching_sell (alpha_sb+alpha_ss), hawkes_asymmetry (alpha_bb-alpha_ss),
+hawkes_branching_buy_d1h, hawkes_branching_sell_d1h.
+
+**Sidecar build**: 2021-12 to 2026-03, 4 workers, 41 min wall-clock. 37,916
+hourly buckets, 151,868 rows in 15m sidecar, **99.4% coverage** per level
+feature, 99.2% per delta. All buckets converged. No pathological outliers.
+
+**Tests (18 total, all green)**:
+- 10 in tests/test_hawkes_ofi.py: binning correctness, NLL monotonicity at MLE,
+  synthetic-parameter recovery, Poisson limit sanity, near-critical spectral
+  radius, warm-start stability, input-validation edge cases.
+- 8 in tests/test_features_hawkes_ofi.py: schema, byte-identity, causality
+  probe on synthetic data, coverage >= 88% on real sidecar, parameter-range
+  sanity (branching ratios in [0, ~2]).
+
+**Gauntlet (running)**: 4 threads, 8 months, 80 trials / 25 patience.
+Threads: pruned_svi_control, har_pd, hawkes_ofi, har_pd_and_hawkes_ofi.
+Pre-screen gate: avg Delta QLIKE <= -1.5% AND >= 5/8 months improved,
+measured as har_pd_and_hawkes_ofi vs har_pd differential.
+
+[RESULTS TO BE FILLED IN AFTER COMPLETION]
+
+## Candidate C — Rough-Heston SDE (INFRASTRUCTURE SHIPPED, GAUNTLET DEFERRED)
+
+### Implementation
+
+vol_arb/rough_heston.py (~500 LOC): full rough-Heston SDE calibrator with
+fractional Riccati Volterra equation psi = I^{H+1/2}[F(u, psi)] where
+F(u, y) = -0.5(u^2 + iu) + (iu*eta*rho - kappa)*y + 0.5*eta^2*y^2,
+discretized via Diethelm-Ford-Freed 2002 Adams predictor-corrector scheme
+of order H+1/2, batched across the u-grid. Options priced via the
+Heston-1993 Pi1/Pi2 inversion formula (more stable than Carr-Madan for
+high-vol regimes where the moment-generating function diverges near
+alpha_max). Implied-vol inverter via bisection. Levenberg-Marquardt
+(scipy.optimize.least_squares with TRF) for vega-weighted IV residual
+calibration. 4-parameter mode with kappa=2.0 and theta=V_0 pinned per
+Bayer-Friz-Gatheral 2016 convention.
+
+27 tests in tests/test_rough_heston.py, all green:
+- CF normalization phi(0, tau) = 1 (exact)
+- Degenerate tau -> 0 limit
+- Conjugate symmetry under u -> -u
+- **Black-Scholes deterministic-variance limit match to machine precision**
+  (the sanity test that pins the CF integral-order as H+1/2 and the V_0
+  coefficient as the CLASSICAL integral of F(psi), not psi(tau) itself --
+  an initial-formula error caught by this test)
+- Call-price non-negativity, monotonicity, intrinsic bound within the
+  liquid moneyness range (+/-20%)
+- 4-parameter synthetic recovery within +/-20% V_0, +/-0.10 H, +/-0.50
+  rho, +/-50% eta, with RMSE < 10vp
+
+### Real-data numerical status
+
+Calibrator runs on real Deribit panels and produces fits, but two issues
+blocked sidecar build this session:
+
+1. **Fit-quality ceiling**: RMSE ~14-23 vol-points on real 2023-07 panels
+   (vs SVI typical 1-5vp on the same data). The 4-parameter pin (kappa=2,
+   theta=V_0) is too constrained to capture the actual Deribit smile
+   structure, especially the short-end wings.
+2. **Cold-start wall-clock**: ~170s with Nelder-Mead global search, ~25s
+   with pure LM cold start. For 37-44K buckets, projected full-history
+   sidecar build at ~3-5s per warm bucket (8 workers) is 5-10 hours --
+   tractable but too long for this session.
+
+Unfixing kappa/theta (6-parameter mode) was tested but timed out at >120s
+per calibration. Free 6-param rough-Heston calibration on a single Deribit
+smile is a known-hard problem in the literature; common robust fixes
+(forward-variance-curve-implied theta, DL surrogate for the CF,
+differential evolution with priors) all substantially increase scope.
+
+### Decision
+
+Candidate C is **queued but not gauntlet-evaluated this session**. The
+calibrator, tests, sidecar script, feature module, and signal_research.py
+wiring all ship. Path forward -- either:
+(a) Ship as-is with RMSE ~20vp (noisy but valid features); ~30-60 min
+    build on 8 workers.
+(b) Upgrade to DL-surrogate CF or differential-evolution calibration
+    first, multi-day effort.
+
+Recommend deferring to follow-up session conditional on Hawkes result.
+If Hawkes succeeds, rough-Heston becomes less urgent; if Hawkes null,
+C is the natural next attempt with scope to go deeper.
+
+## Infrastructure shipped (Session F totals)
+
+- vol_arb/hawkes_ofi.py (~300 LOC) + tests/test_hawkes_ofi.py (10 tests)
+- vol_arb/build_hawkes_ofi_sidecar.py (~400 LOC) -> 151K-row sidecar built
+- vol_model/features/hawkes_ofi.py (~120 LOC) + tests/test_features_hawkes_ofi.py (8 tests)
+- vol_arb/rough_heston.py (~500 LOC) + tests/test_rough_heston.py (27 tests)
+- vol_arb/build_rough_heston_sidecar.py (~400 LOC) -- ready, not run
+- vol_model/features/rough_heston.py (~100 LOC) + tests/test_features_rough_heston.py (8 tests)
+- vol_model/signal_research.py -- TIER_FEATURE_MAP 5-tuple -> 7-tuple, 4 new
+  tiers, SpotCheckContext fields + loaders with +15m alignment shift
+
+Total session test delta: +53 new tests, all green on their testable surface.

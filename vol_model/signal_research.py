@@ -89,30 +89,56 @@ from vol_model.features.svi_surface import (  # noqa: E402
     compute_svi_surface_features,
 )
 
+# Session F Candidate B: Hawkes-OFI bivariate exp-kernel MLE features
+# (5 levels + 2 deltas). Sidecar at vol_arb/output/hawkes_ofi_features_15m.parquet
+# from `python -m vol_arb.build_hawkes_ofi_sidecar`.
+from vol_model.features.hawkes_ofi import (  # noqa: E402
+    HAWKES_OFI_FEATURES,
+    compute_hawkes_ofi_features,
+)
+
+# Session F Candidate C: rough-Heston SDE-calibrated latent-parameter features
+# (4 levels + 4 deltas). Sidecar at vol_arb/output/rough_heston_features_15m.parquet
+# from `python -m vol_arb.build_rough_heston_sidecar`.
+from vol_model.features.rough_heston import (  # noqa: E402
+    ROUGH_HESTON_FEATURES,
+    compute_rough_heston_features,
+)
+
 # Tier-to-feature-pool dispatch. Consumed by build_month_data_augmented.
-# Tuple: (eth_cols, rq_cols, svi_extra_cols, har_pd_cols, svi_surface_cols).
-# NOTE: As more Session E candidates land, consider refactoring this to a
-# list-of-pairs structure ``{tier: ((attr, cols), ...)}`` so each new
-# candidate adds a single entry instead of extending the tuple.
+# Tuple layout (7 slots):
+#   (eth_cols, rq_cols, svi_extra_cols, har_pd_cols,
+#    svi_surface_cols, hawkes_ofi_cols, rough_heston_cols).
+#
+# NOTE: As more candidates land, consider refactoring this to a dict
+# structure ``{tier: ((attr, cols), ...)}`` so each new candidate adds a
+# single entry instead of extending the tuple. Kept as 7-tuple for now
+# because Session F is a stable boundary.
 TIER_FEATURE_MAP: dict[
     str,
     tuple[
         tuple[str, ...], tuple[str, ...], tuple[str, ...],
-        tuple[str, ...], tuple[str, ...],
+        tuple[str, ...], tuple[str, ...], tuple[str, ...],
+        tuple[str, ...],
     ],
 ] = {
-    "control":                ((), (), (), (), ()),
-    "eth":                    (ETH_TSRV_FEATURES, (), (), (), ()),
-    "rq":                     ((), RQ_FEATURES, (), (), ()),
-    "eth_and_rq":             (ETH_TSRV_FEATURES, RQ_FEATURES, (), (), ()),
-    "svi_spot":               ((), (), SVI_SPOT_FEATURES, (), ()),
-    "har_pd":                 ((), (), (), HAR_PD_FEATURES, ()),
-    "svi_surface":            ((), (), (), (), SVI_SURFACE_FEATURES),
-    # Session E Candidate A eval: SVI surface STACKED on production (HAR-PD).
-    # This is the correct comparison baseline — production is har_pd, not
-    # pruned_svi_v1 — so the "delta vs production" reading comes from
-    # comparing har_pd_and_svi_surface vs har_pd in the same month.
-    "har_pd_and_svi_surface": ((), (), (), HAR_PD_FEATURES, SVI_SURFACE_FEATURES),
+    "control":                   ((), (), (), (), (), (), ()),
+    "eth":                       (ETH_TSRV_FEATURES, (), (), (), (), (), ()),
+    "rq":                        ((), RQ_FEATURES, (), (), (), (), ()),
+    "eth_and_rq":                (ETH_TSRV_FEATURES, RQ_FEATURES, (), (), (), (), ()),
+    "svi_spot":                  ((), (), SVI_SPOT_FEATURES, (), (), (), ()),
+    "har_pd":                    ((), (), (), HAR_PD_FEATURES, (), (), ()),
+    # Session E Candidate A (REJECTED at pre-screen):
+    "svi_surface":               ((), (), (), (), SVI_SURFACE_FEATURES, (), ()),
+    "har_pd_and_svi_surface":    ((), (), (), HAR_PD_FEATURES, SVI_SURFACE_FEATURES, (), ()),
+    # Session F Candidate B: Hawkes-OFI (bivariate exp-kernel MLE).
+    # The standalone tier measures raw information; the stacked tier is
+    # the decision metric (adds on top of current production).
+    "hawkes_ofi":                ((), (), (), (), (), HAWKES_OFI_FEATURES, ()),
+    "har_pd_and_hawkes_ofi":     ((), (), (), HAR_PD_FEATURES, (), HAWKES_OFI_FEATURES, ()),
+    # Session F Candidate C: rough-Heston SDE calibration.
+    "rough_heston":              ((), (), (), (), (), (), ROUGH_HESTON_FEATURES),
+    "har_pd_and_rough_heston":   ((), (), (), HAR_PD_FEATURES, (), (), ROUGH_HESTON_FEATURES),
 }
 
 
@@ -141,6 +167,10 @@ class SpotCheckContext:
     har_pd_features: pd.DataFrame = field(default_factory=pd.DataFrame)
     # Session E Candidate A: SVI surface (already +15m-aligned at load time).
     svi_surface_features: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Session F Candidate B: Hawkes-OFI (already +15m-aligned at load time).
+    hawkes_ofi_features: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Session F Candidate C: rough-Heston (already +15m-aligned at load time).
+    rough_heston_features: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -461,6 +491,54 @@ def load_spot_check_context(
             logger.warning("Could not compute SVI surface features: %s", exc)
             svi_surface_df = pd.DataFrame()
 
+    # Session F Candidate B: Hawkes-OFI sidecar (built by
+    # `python -m vol_arb.build_hawkes_ofi_sidecar`). Already 15m-cadence;
+    # apply +15m shift (same as SVI-surface) to align bucket-end stamp with
+    # label decision time.
+    hawkes_ofi_df = pd.DataFrame()
+    if include_extras:
+        try:
+            hawkes_path = Path("vol_arb/output/hawkes_ofi_features_15m.parquet")
+            if hawkes_path.exists():
+                hawkes_raw = pd.read_parquet(hawkes_path)
+                hawkes_ofi_df = compute_hawkes_ofi_features(hawkes_raw)
+                hawkes_ofi_df.index = hawkes_ofi_df.index + pd.Timedelta(minutes=15)
+                logger.info(
+                    "Loaded Hawkes-OFI features: %d rows x %d cols (+15m aligned)",
+                    len(hawkes_ofi_df), hawkes_ofi_df.shape[1],
+                )
+            else:
+                logger.warning(
+                    "Hawkes-OFI sidecar missing (%s); hawkes_ofi thread will be empty.",
+                    hawkes_path,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load Hawkes-OFI features: %s", exc)
+            hawkes_ofi_df = pd.DataFrame()
+
+    # Session F Candidate C: rough-Heston sidecar (built by
+    # `python -m vol_arb.build_rough_heston_sidecar`). Same alignment convention.
+    rough_heston_df = pd.DataFrame()
+    if include_extras:
+        try:
+            rh_path = Path("vol_arb/output/rough_heston_features_15m.parquet")
+            if rh_path.exists():
+                rh_raw = pd.read_parquet(rh_path)
+                rough_heston_df = compute_rough_heston_features(rh_raw)
+                rough_heston_df.index = rough_heston_df.index + pd.Timedelta(minutes=15)
+                logger.info(
+                    "Loaded rough-Heston features: %d rows x %d cols (+15m aligned)",
+                    len(rough_heston_df), rough_heston_df.shape[1],
+                )
+            else:
+                logger.warning(
+                    "Rough-Heston sidecar missing (%s); rough_heston thread will be empty.",
+                    rh_path,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load rough-Heston features: %s", exc)
+            rough_heston_df = pd.DataFrame()
+
     return SpotCheckContext(
         asset=asset,
         vol_config=vol_config,
@@ -478,6 +556,8 @@ def load_spot_check_context(
         svi_spot_features=svi_spot_only,
         har_pd_features=har_pd_df,
         svi_surface_features=svi_surface_df,
+        hawkes_ofi_features=hawkes_ofi_df,
+        rough_heston_features=rough_heston_df,
     )
 
 
@@ -686,6 +766,7 @@ def build_month_data_augmented(
         )
     (
         eth_cols, rq_cols, svi_extra_cols, har_pd_cols, svi_surface_cols,
+        hawkes_ofi_cols, rough_heston_cols,
     ) = TIER_FEATURE_MAP[thread]
 
     md = build_month_data(ctx, month_str)
@@ -728,6 +809,20 @@ def build_month_data_augmented(
             present = [c for c in svi_surface_cols if c in ctx.svi_surface_features.columns]
             if present:
                 extras.append(ctx.svi_surface_features[present].reindex(md.X_month.index))
+    if hawkes_ofi_cols:
+        if ctx.hawkes_ofi_features.empty:
+            logger.warning("%s: Hawkes-OFI unavailable; skipping hawkes_ofi", month_str)
+        else:
+            present = [c for c in hawkes_ofi_cols if c in ctx.hawkes_ofi_features.columns]
+            if present:
+                extras.append(ctx.hawkes_ofi_features[present].reindex(md.X_month.index))
+    if rough_heston_cols:
+        if ctx.rough_heston_features.empty:
+            logger.warning("%s: rough-Heston unavailable; skipping rough_heston", month_str)
+        else:
+            present = [c for c in rough_heston_cols if c in ctx.rough_heston_features.columns]
+            if present:
+                extras.append(ctx.rough_heston_features[present].reindex(md.X_month.index))
 
     if not extras:
         # Thread is effectively control — return as-is

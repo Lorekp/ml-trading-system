@@ -945,15 +945,15 @@ labeling surface.
 
 ---
 
-# Session F � 2026-04-18 (late evening)
+# Session F � 2026-04-18 (late evening)
 
 ## Scope
 
 Two candidates planned:
-- **Candidate B � Hawkes-OFI branching ratio** (Pham et al. 2024, arxiv:2408.03594).
+- **Candidate B � Hawkes-OFI branching ratio** (Pham et al. 2024, arxiv:2408.03594).
   7-feature family (5 levels + 2 deltas) from a bivariate exponential-kernel
   Hawkes process fit to BTCUSDT aggTrades over trailing 4h windows.
-- **Candidate C � Rough-Heston SDE calibration** (Abi-Jaber 2019, El Euch-Rosenbaum 2019).
+- **Candidate C � Rough-Heston SDE calibration** (Abi-Jaber 2019, El Euch-Rosenbaum 2019).
   8-feature family (4 levels + 4 deltas) from full rough-Heston calibration
   to the Deribit options panel.
 
@@ -961,7 +961,7 @@ Both candidates were implemented from scratch. Only Candidate B was
 gauntlet-evaluated; Candidate C calibrator shipped but sidecar build blocked
 on numerical fragility (see Candidate C status below).
 
-## Candidate B � Hawkes-OFI (IMPLEMENTATION SHIPPED, GAUNTLET PENDING)
+## Candidate B � Hawkes-OFI (IMPLEMENTATION SHIPPED, GAUNTLET PENDING)
 
 Binned-Poisson MLE of the bivariate exp-kernel Hawkes (Bacry-Mastromatteo-Muzy 2015):
 
@@ -988,14 +988,77 @@ feature, 99.2% per delta. All buckets converged. No pathological outliers.
   probe on synthetic data, coverage >= 88% on real sidecar, parameter-range
   sanity (branching ratios in [0, ~2]).
 
-**Gauntlet (running)**: 4 threads, 8 months, 80 trials / 25 patience.
-Threads: pruned_svi_control, har_pd, hawkes_ofi, har_pd_and_hawkes_ofi.
-Pre-screen gate: avg Delta QLIKE <= -1.5% AND >= 5/8 months improved,
-measured as har_pd_and_hawkes_ofi vs har_pd differential.
+### Gauntlet result (REJECTED at pre-screen)
 
-[RESULTS TO BE FILLED IN AFTER COMPLETION]
+**8-month gauntlet, 4 threads, 80 trials / 25 patience, ~1h52m wall-clock**.
 
-## Candidate C � Rough-Heston SDE (INFRASTRUCTURE SHIPPED, GAUNTLET DEFERRED)
+Per-thread averages (Δ QLIKE vs fresh control):
+
+| Thread | Avg Δ QLIKE | Wins (delta < 0) |
+|---|---|---|
+| `pruned_svi_control` | +1.60% | 4/8 (fresh-retrain variance; expected) |
+| `har_pd` | **−3.04%** | **7/8** (matches Session E exactly) |
+| `hawkes_ofi` | −1.86% | 6/8 (Hawkes alone is weaker than HAR-PD alone) |
+| `har_pd_and_hawkes_ofi` | **−3.75%** | **7/8** |
+
+**Per-month stacked-vs-HAR-PD differential** (decision metric for pre-screen):
+
+| Month | har_pd Δ% | har_pd_and_hawkes_ofi Δ% | Differential (pp) | DM p (stacked vs control) |
+|---|---|---|---|---|
+| 2022-11 (FTX) | −4.21% | −5.13% | **−0.92 (Hawkes helps)** | 0.0010 |
+| 2022-12 (FTX-2) | +0.55% | +1.99% | +1.44 (Hawkes hurts) | 0.0285 |
+| 2023-01 | −5.01% | −4.17% | +0.84 (Hawkes hurts) | 0.0027 |
+| 2023-07 | −2.27% | −4.08% | **−1.81 (Hawkes helps)** | 0.0640 |
+| 2023-08 | −3.90% | −7.85% | **−3.95 (Hawkes helps)** | 0.0022 |
+| 2023-10 | −1.68% | −3.12% | **−1.44 (Hawkes helps)** | 0.3573 |
+| 2024-11 (Trump) | −4.90% | −5.04% | **−0.13 (tied)** | 0.0000 |
+| 2024-12 | −2.92% | −2.62% | +0.29 (Hawkes hurts) | 0.0293 |
+
+**Avg differential: −0.71pp** (stacked beats HAR-PD alone by 0.71pp on average).
+**Wins: 5/8** (2022-11, 2023-07, 2023-08, 2023-10, 2024-11).
+
+**Pre-screen gate**: avg ΔQLIKE ≤ **−1.5pp** AND ≥ 5/8 wins.
+- Wins 5/8 → **PASS**
+- Avg −0.71pp → **FAIL** (less than half the required 1.5pp threshold)
+
+**Verdict: REJECTED at pre-screen gate.**
+
+### Interpretation
+
+Hawkes-OFI branching ratios have directional signal (5/8 months improved)
+but the effect magnitude (0.71pp avg) is below the 1.5pp threshold. The
+regime breakdown is revealing:
+
+- **Calm/mid-vol months (2023-07, 2023-08, 2023-10)**: Hawkes helps −1.4 to −4pp
+- **Crisis/vol-expansion months (2022-12 FTX, 2023-01 post-FTX, 2024-12)**:
+  Hawkes hurts by +0.3 to +1.4pp
+
+This is the OPPOSITE of what Pham et al. 2024 (arxiv:2408.03594) predict:
+branching ratios → 1 should correlate with vol spikes (self-reinforcing flow),
+so Hawkes should help MOST in crisis regimes. Here it helps LEAST. Two
+possible explanations:
+
+1. **HAR-PD already captures flow reflexivity**: HAR-PD's R1 signed-flow
+   kernel at α=0.05 (slow decay, half-life ~3h) is very close in spirit to
+   a Hawkes branching-ratio at similar timescale. When HAR-PD is in the
+   model, the marginal info from Hawkes collapses in the exact regimes
+   where reflexivity matters most.
+
+2. **4h window is wrong**: FTX-type crises have minute-scale reflexivity.
+   A 4h-window Hawkes fit averages across seconds-to-hours dynamics and
+   dilutes the crisis signal.
+
+Both explanations argue against a simple fix — a shorter window helps (2)
+but worsens (1). Addressing (1) would require a non-redundant Hawkes
+parameterization (e.g. per-side β, jump-arrival kernel, cross-asset
+Hawkes) which is next-cycle scope.
+
+**Decision**: do not advance Candidate B to Phase 2 full certification.
+Infrastructure (sidecar, tests, wiring) is preserved on disk — a future
+cycle with a different Hawkes parameterization could re-use most of it
+without re-running the aggTrades MLE.
+
+## Candidate C � Rough-Heston SDE (INFRASTRUCTURE SHIPPED, GAUNTLET DEFERRED)
 
 ### Implementation
 

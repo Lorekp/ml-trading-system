@@ -45,16 +45,23 @@ logger = logging.getLogger("compare_har_pd")
 
 
 def _qlike_per_row(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    """Per-row QLIKE loss (Patton 2011): QLIKE(σ², ŝ²) = σ²/ŝ² − log(σ²/ŝ²) − 1.
+    """Per-row QLIKE loss MATCHING the training implementation in
+    ``vol_model.model.qlike_metric``:
 
-    Here y_true and y_pred are log-variance (the model target), so we
-    exponentiate to get variance before computing the loss. Rows with
-    non-finite or non-positive variance are dropped by the caller.
+        diff = y_pred − y_true           (in log-volatility space)
+        qlike = exp(2·diff) − 2·diff − 1
+
+    Equivalent to QLIKE(r) = r − log(r) − 1 with r = σ²_pred / σ²_true.
+    This is the "overprediction-penalised" convention used throughout
+    the vol_model code (training loss + eval metric) and the Session C
+    gauntlet. Using this exact formulation ensures the certification
+    gate comparison is apples-to-apples with both the walk-forward
+    training summary and the Session C spot-check numbers — any
+    alternative convention (e.g., Patton 2011's r = σ²_true / σ²_pred)
+    would give different Δ values despite comparing the same models.
     """
-    var_true = np.exp(y_true)
-    var_pred = np.exp(y_pred)
-    r = var_true / var_pred
-    return r - np.log(r) - 1.0
+    diff = y_pred - y_true
+    return np.exp(np.clip(2.0 * diff, -20.0, 20.0)) - 2.0 * diff - 1.0
 
 
 def _diebold_mariano_pvalue(d: np.ndarray, lag: int = 4) -> tuple[float, float]:

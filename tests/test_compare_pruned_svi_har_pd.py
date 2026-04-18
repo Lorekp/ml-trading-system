@@ -37,17 +37,32 @@ def test_qlike_is_non_negative():
     assert (q >= -1e-12).all(), f"min QLIKE = {q.min()}"
 
 
-def test_qlike_penalizes_underprediction_more_than_overprediction():
-    """QLIKE is asymmetric: under-predicting variance costs more than over."""
-    # True variance = e^0 = 1.
-    y_true = np.array([0.0])
-    # Under-predict: pred=log(0.5) → variance ratio 2.0
-    q_under = _qlike_per_row(y_true, np.array([np.log(0.5)]))
-    # Over-predict: pred=log(2.0) → variance ratio 0.5
+def test_qlike_penalizes_overprediction_more_than_underprediction():
+    """The training QLIKE (code convention, vol_model.model.qlike_metric) has
+    r = σ²_pred / σ²_true, so r > 1 (OVER-prediction of variance) is
+    penalised more than r < 1. This is the opposite asymmetry of Patton
+    2011 but matches the production training loss.
+
+    If this test is flipped back to Patton convention, also update
+    _qlike_per_row to use r = σ²_true / σ²_pred — but that would break
+    apples-to-apples with Session C / summary.json.
+    """
+    # y_true = y_pred for σ = 1 (log(σ)=0, so log(var)=0 → var=1).
+    y_true = np.array([0.0])  # log-vol of 0 → vol=1 → var=1
+    # Over-predict vol: y_pred = log(2.0), so vol_pred=2 → var_pred=4
+    # r = 4/1 = 4, training qlike: diff = log(2); 2*diff = log(4);
+    # exp(2*diff) = 4 ; qlike = 4 - log(4) - 1 ≈ 1.614
     q_over = _qlike_per_row(y_true, np.array([np.log(2.0)]))
-    assert q_under[0] > q_over[0], (
-        f"Under-pred QLIKE {q_under[0]} should exceed over-pred QLIKE {q_over[0]}"
+    # Under-predict vol: y_pred = log(0.5), so vol_pred=0.5 → var_pred=0.25
+    # r = 0.25/1 = 0.25; qlike = 0.25 - log(0.25) - 1 = 0.25 + 1.386 - 1 = 0.636
+    q_under = _qlike_per_row(y_true, np.array([np.log(0.5)]))
+    assert q_over[0] > q_under[0], (
+        f"Training QLIKE: over-predict {q_over[0]:.3f} should exceed "
+        f"under-predict {q_under[0]:.3f} (opposite of Patton's asymmetry)."
     )
+    # Quantitative sanity against analytical values
+    assert abs(q_over[0] - (4.0 - np.log(4.0) - 1.0)) < 1e-10
+    assert abs(q_under[0] - (0.25 - np.log(0.25) - 1.0)) < 1e-10
 
 
 # ── 2. Diebold-Mariano ──────────────────────────────────────────────

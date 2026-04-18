@@ -21,11 +21,23 @@ Probes:
     C. Label alignment: label_timestamp > feature_timestamp on every row.
     D. Parquet END-stamp: any parquet written by this session's code uses
        ceiling-aligned timestamps (matches pipeline convention).
+    E. Causality by mutation: mutate raw data at timestamps AFTER T, regenerate
+       the feature end-to-end, assert feature[T] is BYTE-IDENTICAL. This is
+       the gold-standard probe -- unlike B, it doesn't rely on metadata; it
+       verifies the feature FUNCTION is causal. New in 2026-04 (Session E).
+    F. Current-bar dependence: mutate raw data AT T, regenerate the feature,
+       assert feature[T] DOES change. Complementary to E: catches wastefully
+       conservative features that are throwing away information they could
+       legally use. Not a leakage probe per se; a feature-quality sanity.
+    G. Walk-forward isolation: given a fold schedule, assert no row in any
+       fold's training window appears in its test window. Catches schedule
+       bugs without rerunning the training loop.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -316,6 +328,384 @@ def probe_parquet_end_stamped(
         name="parquet_end_stamp",
         passed=True,
         detail=f"{p.name}: all {len(idx)} rows END-stamped at {expected_freq}.",
+    )
+
+
+# ---------- Probe E: causality by mutation (gold standard) ----------
+
+def probe_causality_by_mutation(
+    feature_fn: Callable[[pd.DataFrame], pd.DataFrame],
+    raw_df: pd.DataFrame,
+    T: pd.Timestamp,
+    *,
+    mutation_cols: Sequence[str] | None = None,
+    mutation_mask: Callable[[pd.DatetimeIndex, pd.Timestamp], np.ndarray] | None = None,
+    sentinel: float = 999.0,
+    atol: float = 0.0,
+) -> ProbeResult:
+    """Mutation-based causality probe: asserts feature_fn(raw)[T] is byte-
+    identical to feature_fn(mutate_future(raw))[T].
+
+    This is the gold-standard leakage check. Unlike ``probe_future_bar_trace``
+    (which only checks timestamps), this probe actually verifies that the
+    feature FUNCTION does not read from rows newer than T by mutating them
+    and re-running end-to-end. A feature that passes this probe cannot be
+    leaky at index T, regardless of how its implementation looks.
+
+    This generalises the one-off ``test_no_lookahead_after_shift`` pattern
+    that was used to validate HAR-PD's -15m alignment shift. Every new
+    feature family in Session E onwards should include a test that calls
+    this probe.
+
+    Parameters
+    ----------
+    feature_fn
+        Callable ``(raw_df) -> feature_df``. Must be deterministic and
+        must include any alignment shifts the feature family applies
+        (e.g. for HAR-PD: ``feature_fn = lambda raw: _load_har_pd_from_raw(raw)``,
+        which internally does ``compute_har_pd_features(raw); index -= 15m``).
+    raw_df
+        Raw input DataFrame with DatetimeIndex. Must contain enough
+        history at timestamps < T for ``feature_fn`` to compute a value
+        at T.
+    T
+        Wall-clock decision time. The probe asserts feature_df.loc[T]
+        does not depend on any raw row whose timestamp the ``mutation_mask``
+        flags as "in the future".
+    mutation_cols
+        Columns of raw_df to mutate. If None, all numeric columns (int or
+        float dtype) are mutated. Object/string columns are skipped.
+    mutation_mask
+        Callable ``(raw_index, T) -> bool array`` selecting the "forbidden"
+        rows that the feature at T must not depend on. Default is
+        ``raw_index > T`` — correct for END-stamped feature families
+        where raw-index T means "bar ending at T" (i.e., the most recent
+        bar legally known at decision time T). Override for features with
+        unusual conventions; e.g., a feature whose raw input is START-
+        stamped would want ``raw_index >= T``.
+    sentinel
+        Value to inject into future rows. 999.0 is far from typical vol
+        feature magnitudes; any seepage would be trivially detectable.
+    atol
+        Absolute tolerance for byte-identity. Default 0.0 (strict).
+        Raise only if the feature has unavoidable float non-determinism
+        (e.g. numerical optimisers); 1e-12 is a reasonable relaxation.
+
+    Returns
+    -------
+    ProbeResult
+        ``passed=True`` with max-diff 0 on honest features. ``passed=False``
+        with the observed max-diff and the list of feature columns that
+        changed on mutation.
+    """
+    # Validate inputs
+    if not isinstance(raw_df.index, pd.DatetimeIndex):
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail="raw_df must have a DatetimeIndex",
+        )
+    if T not in raw_df.index and T > raw_df.index.max():
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=f"T={T} is beyond raw_df.index.max()={raw_df.index.max()}",
+        )
+
+    # Default mutation mask: rows strictly after T. Using np.asarray so the
+    # caller can return either a numpy array or a pandas Series.
+    if mutation_mask is None:
+        mask_fn = lambda idx, t: np.asarray(idx > t)  # noqa: E731
+    else:
+        mask_fn = mutation_mask
+
+    # Default mutation cols: all numeric
+    if mutation_cols is None:
+        mutation_cols = [
+            c for c in raw_df.columns
+            if pd.api.types.is_numeric_dtype(raw_df[c])
+        ]
+    if not mutation_cols:
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail="no numeric columns to mutate",
+        )
+
+    # Baseline feature
+    try:
+        feat_normal = feature_fn(raw_df)
+    except Exception as exc:  # noqa: BLE001
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=f"feature_fn raised on normal input: {type(exc).__name__}: {exc}",
+        )
+
+    if not isinstance(feat_normal.index, pd.DatetimeIndex):
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail="feature_fn output must have a DatetimeIndex",
+        )
+    if T not in feat_normal.index:
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=(
+                f"T={T} not in feature_fn output index "
+                f"(range {feat_normal.index.min()}..{feat_normal.index.max()}). "
+                "Pick a T with enough warmup history, or check the feature "
+                "function's alignment shift."
+            ),
+        )
+
+    # Mutated feature
+    raw_mut = raw_df.copy()
+    mask = mask_fn(raw_mut.index, T)
+    if isinstance(mask, pd.Series):
+        mask = mask.to_numpy()
+    n_mutated = int(np.asarray(mask, dtype=bool).sum())
+    if n_mutated == 0:
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=(
+                f"mutation_mask selected 0 rows at T={T}. "
+                "Pick an earlier T so there is future data to mutate."
+            ),
+        )
+    raw_mut.loc[mask, list(mutation_cols)] = sentinel
+
+    try:
+        feat_mut = feature_fn(raw_mut)
+    except Exception as exc:  # noqa: BLE001
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=f"feature_fn raised on mutated input: {type(exc).__name__}: {exc}",
+        )
+
+    if T not in feat_mut.index:
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=(
+                f"T={T} fell out of feature index after mutation -- "
+                "feature_fn is nondeterministic in its output alignment."
+            ),
+        )
+
+    # Compare row at T
+    row_normal = feat_normal.loc[T]
+    row_mut = feat_mut.loc[T]
+
+    # Align columns explicitly (feature fn might emit the same cols but
+    # we don't assume order).
+    common = [c for c in row_normal.index if c in row_mut.index]
+    if len(common) != len(row_normal.index):
+        missing = set(row_normal.index) - set(row_mut.index)
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=f"mutated feature lost columns: {sorted(missing)}",
+        )
+
+    v_normal = row_normal[common].to_numpy(dtype=float)
+    v_mut = row_mut[common].to_numpy(dtype=float)
+    # NaN handling: NaN == NaN counts as identical for causality purposes
+    nan_mask = np.isnan(v_normal) & np.isnan(v_mut)
+    diff = np.where(nan_mask, 0.0, np.abs(v_normal - v_mut))
+    max_diff = float(np.nanmax(diff)) if len(diff) else 0.0
+
+    if max_diff > atol:
+        changed = [c for c, d in zip(common, diff) if d > atol]
+        return ProbeResult(
+            name="causality_by_mutation",
+            passed=False,
+            detail=(
+                f"feature at T={T} changed by max {max_diff:.3e} "
+                f"when {n_mutated} future rows were mutated; "
+                f"changed cols: {changed[:8]}{'...' if len(changed) > 8 else ''}. "
+                "This indicates lookahead leakage."
+            ),
+            metric=max_diff,
+        )
+
+    return ProbeResult(
+        name="causality_by_mutation",
+        passed=True,
+        detail=(
+            f"feature at T={T} is byte-identical under mutation of "
+            f"{n_mutated} future rows across {len(mutation_cols)} cols."
+        ),
+        metric=max_diff,
+    )
+
+
+# ---------- Probe F: current-bar dependence (sanity) ----------
+
+def probe_current_bar_dependence(
+    feature_fn: Callable[[pd.DataFrame], pd.DataFrame],
+    raw_df: pd.DataFrame,
+    T: pd.Timestamp,
+    *,
+    mutation_cols: Sequence[str] | None = None,
+    sentinel: float = 999.0,
+) -> ProbeResult:
+    """Sanity check: the feature at T DOES depend on raw data at T.
+
+    Complementary to ``probe_causality_by_mutation``. If that probe passes
+    with ``mask = (idx > T)`` but this probe ALSO fails (feature at T
+    unchanged when raw at T is mutated), the feature is being wastefully
+    conservative — it's throwing away the most recent bar it could legally
+    use. This catches the "HAR-PD without the -15m shift" failure mode
+    that motivated adding the shift in Session D.
+
+    Not a leakage probe — a feature-quality sanity. Treat a failure as a
+    warning, not necessarily a reject.
+    """
+    if not isinstance(raw_df.index, pd.DatetimeIndex):
+        return ProbeResult(
+            name="current_bar_dependence",
+            passed=False,
+            detail="raw_df must have a DatetimeIndex",
+        )
+
+    if mutation_cols is None:
+        mutation_cols = [
+            c for c in raw_df.columns
+            if pd.api.types.is_numeric_dtype(raw_df[c])
+        ]
+
+    try:
+        feat_normal = feature_fn(raw_df)
+    except Exception as exc:  # noqa: BLE001
+        return ProbeResult(
+            name="current_bar_dependence",
+            passed=False,
+            detail=f"feature_fn raised: {type(exc).__name__}: {exc}",
+        )
+
+    if T not in feat_normal.index or T not in raw_df.index:
+        return ProbeResult(
+            name="current_bar_dependence",
+            passed=False,
+            detail=f"T={T} missing from feature or raw index",
+        )
+
+    raw_mut = raw_df.copy()
+    raw_mut.loc[T, list(mutation_cols)] = sentinel
+
+    try:
+        feat_mut = feature_fn(raw_mut)
+    except Exception as exc:  # noqa: BLE001
+        return ProbeResult(
+            name="current_bar_dependence",
+            passed=False,
+            detail=f"feature_fn raised on mutated input: {type(exc).__name__}: {exc}",
+        )
+
+    row_normal = feat_normal.loc[T]
+    row_mut = feat_mut.loc[T]
+    common = [c for c in row_normal.index if c in row_mut.index]
+    v_normal = row_normal[common].to_numpy(dtype=float)
+    v_mut = row_mut[common].to_numpy(dtype=float)
+    nan_mask = np.isnan(v_normal) & np.isnan(v_mut)
+    diff = np.where(nan_mask, 0.0, np.abs(v_normal - v_mut))
+    max_diff = float(np.nanmax(diff)) if len(diff) else 0.0
+
+    if max_diff == 0.0:
+        return ProbeResult(
+            name="current_bar_dependence",
+            passed=False,
+            detail=(
+                f"feature at T={T} is UNCHANGED when raw at T is mutated. "
+                "Feature is wasting the most recent bar it could legally use — "
+                "check alignment shifts (see HAR-PD -15m Session D writeup)."
+            ),
+            metric=max_diff,
+        )
+
+    return ProbeResult(
+        name="current_bar_dependence",
+        passed=True,
+        detail=f"feature at T={T} changes by {max_diff:.3e} when raw at T is mutated.",
+        metric=max_diff,
+    )
+
+
+# ---------- Probe G: walk-forward isolation ----------
+
+@dataclass
+class FoldSpec:
+    """A single walk-forward fold. All four timestamps are inclusive on
+    start, exclusive on end; ``calib`` is optional for simple train/test.
+
+    Canonical ordering: train_start <= train_end <= test_start < test_end,
+    with train_end <= test_start required (no overlap).
+    """
+    train_start: pd.Timestamp
+    train_end: pd.Timestamp
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    name: str = ""
+
+
+def probe_walkforward_isolation(folds: Sequence[FoldSpec]) -> ProbeResult:
+    """Assert no fold's training window overlaps its test window, and
+    that the sequence of test windows is monotonic (expanding window).
+
+    This is a schedule-level check; it does NOT verify that the actual
+    training code respects the schedule. Combine with the shuffle-label
+    probe for a full train/test-isolation guarantee.
+    """
+    if not folds:
+        return ProbeResult(
+            name="walkforward_isolation",
+            passed=False,
+            detail="no folds provided",
+        )
+
+    failures: list[str] = []
+    for i, f in enumerate(folds):
+        tag = f.name or f"fold_{i}"
+        # Per-fold ordering
+        if not (f.train_start <= f.train_end <= f.test_start < f.test_end):
+            failures.append(
+                f"{tag}: bad ordering "
+                f"(train [{f.train_start}, {f.train_end}] "
+                f"test [{f.test_start}, {f.test_end}))"
+            )
+            continue
+        # No overlap between train and test
+        if f.train_end > f.test_start:
+            failures.append(
+                f"{tag}: train_end {f.train_end} > test_start {f.test_start}"
+            )
+
+    # Monotonicity: expanding window means test_start[i+1] >= test_end[i]
+    # (otherwise one fold's test overlaps another's).
+    for i in range(len(folds) - 1):
+        if folds[i + 1].test_start < folds[i].test_end:
+            tag_i = folds[i].name or f"fold_{i}"
+            tag_j = folds[i + 1].name or f"fold_{i + 1}"
+            failures.append(
+                f"{tag_i}.test_end {folds[i].test_end} > "
+                f"{tag_j}.test_start {folds[i + 1].test_start} -- test overlap"
+            )
+
+    if failures:
+        return ProbeResult(
+            name="walkforward_isolation",
+            passed=False,
+            detail="; ".join(failures[:5]) + ("..." if len(failures) > 5 else ""),
+        )
+
+    return ProbeResult(
+        name="walkforward_isolation",
+        passed=True,
+        detail=f"{len(folds)} folds: no train/test overlap, monotonic expanding windows.",
     )
 
 

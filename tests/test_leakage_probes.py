@@ -7,11 +7,15 @@ import pandas as pd
 import pytest
 
 from vol_model.leakage_probes import (
+    FoldSpec,
     ProbeResult,
+    probe_causality_by_mutation,
+    probe_current_bar_dependence,
     probe_future_bar_trace,
     probe_label_alignment,
     probe_parquet_end_stamped,
     probe_shuffle_label,
+    probe_walkforward_isolation,
     run_probe_battery,
 )
 
@@ -171,6 +175,218 @@ def test_parquet_end_stamp_missing_file() -> None:
         "/does/not/exist.parquet",
         expected_freq=pd.Timedelta(minutes=15),
     )
+    assert not result.passed
+
+
+# ---- Probe E: causality by mutation (gold standard) ----
+
+
+def _make_synthetic_raw(n: int = 500, seed: int = 0) -> pd.DataFrame:
+    """Synthetic END-stamped raw dataframe mimicking TSRV structure."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01 00:15", periods=n, freq="15min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "rv_ann": np.abs(rng.standard_normal(n)) + 0.1,
+            "rs_up": np.abs(rng.standard_normal(n)) * 0.3,
+            "rs_down": np.abs(rng.standard_normal(n)) * 0.3,
+        },
+        index=idx,
+    )
+
+
+def test_causality_by_mutation_passes_on_honest_feature() -> None:
+    """A causal rolling feature (strictly uses data up to T) passes."""
+
+    def honest_rolling(raw: pd.DataFrame) -> pd.DataFrame:
+        # shift(1) removes the current-bar observation, rolling uses only
+        # lagged windows -- gold-standard causal.
+        return pd.DataFrame(
+            {"ma5": raw["rv_ann"].shift(1).rolling(5).mean()},
+            index=raw.index,
+        )
+
+    raw = _make_synthetic_raw(n=200)
+    T = raw.index[100]
+    result = probe_causality_by_mutation(honest_rolling, raw, T)
+    assert result.passed, result.detail
+    assert result.metric == 0.0
+
+
+def test_causality_by_mutation_catches_lookahead() -> None:
+    """A feature that uses a forward shift leaks — probe must reject."""
+
+    def leaky_forward_shift(raw: pd.DataFrame) -> pd.DataFrame:
+        # shift(-1) peeks at the NEXT bar -- classic leakage.
+        return pd.DataFrame({"peek": raw["rv_ann"].shift(-1)}, index=raw.index)
+
+    raw = _make_synthetic_raw(n=200)
+    T = raw.index[100]
+    result = probe_causality_by_mutation(leaky_forward_shift, raw, T)
+    assert not result.passed
+    assert "leakage" in result.detail.lower()
+    # max diff should be on the order of the sentinel (999)
+    assert result.metric is not None and result.metric > 100
+
+
+def test_causality_by_mutation_catches_centered_rolling() -> None:
+    """Centered rolling windows look ahead — probe must reject."""
+
+    def centered_rolling(raw: pd.DataFrame) -> pd.DataFrame:
+        # center=True on a rolling window uses future observations.
+        return pd.DataFrame(
+            {"cma": raw["rv_ann"].rolling(9, center=True).mean()},
+            index=raw.index,
+        )
+
+    raw = _make_synthetic_raw(n=300)
+    T = raw.index[150]
+    result = probe_causality_by_mutation(centered_rolling, raw, T)
+    assert not result.passed
+
+
+def test_causality_by_mutation_fails_when_T_absent() -> None:
+    """If T is missing from feature output, probe fails with clear message."""
+
+    def drop_half(raw: pd.DataFrame) -> pd.DataFrame:
+        # Feature only returns half the rows -- T may be absent.
+        return pd.DataFrame({"f": raw["rv_ann"].iloc[::2]}, index=raw.index[::2])
+
+    raw = _make_synthetic_raw(n=200)
+    # Pick a T that falls on the odd (dropped) grid
+    T = raw.index[101]
+    result = probe_causality_by_mutation(drop_half, raw, T)
+    assert not result.passed
+    assert "not in feature_fn output" in result.detail
+
+
+def test_causality_by_mutation_custom_mask() -> None:
+    """Custom mutation_mask lets callers probe post-shifted features
+    (the HAR-PD case: after -15m shift, 'future' means idx >= T+15m)."""
+
+    def honest_rolling(raw: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"ma5": raw["rv_ann"].shift(1).rolling(5).mean()},
+            index=raw.index,
+        )
+
+    raw = _make_synthetic_raw(n=200)
+    T = raw.index[100]
+    # Stricter mask: mutate rows at or after T. Feature at T should still
+    # be unchanged because shift(1).rolling(5) uses only rows < T.
+    strict_mask = lambda idx, t: np.asarray(idx >= t)  # noqa: E731
+    result = probe_causality_by_mutation(
+        honest_rolling, raw, T, mutation_mask=strict_mask,
+    )
+    assert result.passed
+
+
+def test_causality_by_mutation_rejects_non_datetime_index() -> None:
+    raw = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+    T = pd.Timestamp("2024-01-01", tz="UTC")
+    result = probe_causality_by_mutation(lambda r: r, raw, T)
+    assert not result.passed
+    assert "DatetimeIndex" in result.detail
+
+
+# ---- Probe F: current-bar dependence ----
+
+
+def test_current_bar_dependence_passes_on_useful_feature() -> None:
+    """A feature that uses raw[T] legitimately (rolling ending at T)
+    passes the sanity check."""
+
+    def uses_current(raw: pd.DataFrame) -> pd.DataFrame:
+        # rolling without shift: window ends at T, so raw[T] is included.
+        # Still causal (rolling is left-aligned by default in pandas).
+        return pd.DataFrame(
+            {"ma5": raw["rv_ann"].rolling(5).mean()},
+            index=raw.index,
+        )
+
+    raw = _make_synthetic_raw(n=200)
+    T = raw.index[100]
+    result = probe_current_bar_dependence(uses_current, raw, T)
+    assert result.passed, result.detail
+
+
+def test_current_bar_dependence_catches_wasteful_shift() -> None:
+    """A feature that discards raw[T] via an unneeded shift fails the sanity."""
+
+    def wasteful(raw: pd.DataFrame) -> pd.DataFrame:
+        # shift(2) drops TWO bars including the current one -- wasteful.
+        return pd.DataFrame(
+            {"ma5": raw["rv_ann"].shift(2).rolling(5).mean()},
+            index=raw.index,
+        )
+
+    raw = _make_synthetic_raw(n=200)
+    T = raw.index[100]
+    result = probe_current_bar_dependence(wasteful, raw, T)
+    assert not result.passed
+    assert "wasting" in result.detail.lower() or "unchanged" in result.detail.lower()
+
+
+# ---- Probe G: walk-forward isolation ----
+
+
+def _make_folds(n: int = 5, test_days: int = 30) -> list[FoldSpec]:
+    """Build a clean expanding-window fold schedule."""
+    folds = []
+    train_start = pd.Timestamp("2022-01-01", tz="UTC")
+    test_start = pd.Timestamp("2022-06-01", tz="UTC")
+    for i in range(n):
+        test_end = test_start + pd.Timedelta(days=test_days)
+        folds.append(
+            FoldSpec(
+                train_start=train_start,
+                train_end=test_start,
+                test_start=test_start,
+                test_end=test_end,
+                name=f"fold_{i}",
+            )
+        )
+        test_start = test_end
+    return folds
+
+
+def test_walkforward_isolation_passes_on_clean_schedule() -> None:
+    folds = _make_folds(n=5)
+    result = probe_walkforward_isolation(folds)
+    assert result.passed, result.detail
+
+
+def test_walkforward_isolation_catches_overlap() -> None:
+    folds = _make_folds(n=3)
+    # Corrupt: make fold 1's train_end extend into its test window.
+    folds[1] = FoldSpec(
+        train_start=folds[1].train_start,
+        train_end=folds[1].test_start + pd.Timedelta(days=5),  # overlap!
+        test_start=folds[1].test_start,
+        test_end=folds[1].test_end,
+        name="corrupted",
+    )
+    result = probe_walkforward_isolation(folds)
+    assert not result.passed
+    assert "corrupted" in result.detail
+
+
+def test_walkforward_isolation_catches_test_overlap() -> None:
+    folds = _make_folds(n=3)
+    # Corrupt: make fold 2's test_start precede fold 1's test_end.
+    folds[2] = FoldSpec(
+        train_start=folds[2].train_start,
+        train_end=folds[2].train_end,
+        test_start=folds[1].test_end - pd.Timedelta(days=10),  # overlap!
+        test_end=folds[2].test_end,
+        name="overlap_test",
+    )
+    result = probe_walkforward_isolation(folds)
+    assert not result.passed
+
+
+def test_walkforward_isolation_empty_fails() -> None:
+    result = probe_walkforward_isolation([])
     assert not result.passed
 
 

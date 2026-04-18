@@ -81,16 +81,38 @@ HAR_PD_FEATURES = (
     "har_pd_R1_a005", "har_pd_R1_a01", "har_pd_R1_a03",
     "har_pd_R2_b005", "har_pd_R2_b01", "har_pd_R2_b03",
 )
+# Session E Candidate A: full SVI surface (7 levels + 4 deltas). Levels live in
+# the existing SVI sidecar but are unused by production; deltas are 1h .diff.
+# See vol_model/features/svi_surface.py for the compute function.
+from vol_model.features.svi_surface import (  # noqa: E402
+    SVI_SURFACE_FEATURES,
+    compute_svi_surface_features,
+)
 
 # Tier-to-feature-pool dispatch. Consumed by build_month_data_augmented.
-# Tuple: (eth_cols, rq_cols, svi_extra_cols, har_pd_cols).
-TIER_FEATURE_MAP: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
-    "control":     ((), (), (), ()),
-    "eth":         (ETH_TSRV_FEATURES, (), (), ()),
-    "rq":          ((), RQ_FEATURES, (), ()),
-    "eth_and_rq":  (ETH_TSRV_FEATURES, RQ_FEATURES, (), ()),
-    "svi_spot":    ((), (), SVI_SPOT_FEATURES, ()),
-    "har_pd":      ((), (), (), HAR_PD_FEATURES),
+# Tuple: (eth_cols, rq_cols, svi_extra_cols, har_pd_cols, svi_surface_cols).
+# NOTE: As more Session E candidates land, consider refactoring this to a
+# list-of-pairs structure ``{tier: ((attr, cols), ...)}`` so each new
+# candidate adds a single entry instead of extending the tuple.
+TIER_FEATURE_MAP: dict[
+    str,
+    tuple[
+        tuple[str, ...], tuple[str, ...], tuple[str, ...],
+        tuple[str, ...], tuple[str, ...],
+    ],
+] = {
+    "control":                ((), (), (), (), ()),
+    "eth":                    (ETH_TSRV_FEATURES, (), (), (), ()),
+    "rq":                     ((), RQ_FEATURES, (), (), ()),
+    "eth_and_rq":             (ETH_TSRV_FEATURES, RQ_FEATURES, (), (), ()),
+    "svi_spot":               ((), (), SVI_SPOT_FEATURES, (), ()),
+    "har_pd":                 ((), (), (), HAR_PD_FEATURES, ()),
+    "svi_surface":            ((), (), (), (), SVI_SURFACE_FEATURES),
+    # Session E Candidate A eval: SVI surface STACKED on production (HAR-PD).
+    # This is the correct comparison baseline — production is har_pd, not
+    # pruned_svi_v1 — so the "delta vs production" reading comes from
+    # comparing har_pd_and_svi_surface vs har_pd in the same month.
+    "har_pd_and_svi_surface": ((), (), (), HAR_PD_FEATURES, SVI_SURFACE_FEATURES),
 }
 
 
@@ -117,6 +139,8 @@ class SpotCheckContext:
     rq_features: pd.DataFrame = field(default_factory=pd.DataFrame)
     svi_spot_features: pd.DataFrame = field(default_factory=pd.DataFrame)
     har_pd_features: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Session E Candidate A: SVI surface (already +15m-aligned at load time).
+    svi_surface_features: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -385,8 +409,16 @@ def load_spot_check_context(
         har_pd_path = Path("vol_model/output") / f"{asset}_features_har_pd_15m.parquet"
         if har_pd_path.exists():
             har_pd_df = pd.read_parquet(har_pd_path)
+            # Session E correctness fix: apply the same -15m shift that
+            # production's _load_har_pd (run_walkforward_pruned_svi_har_pd.py)
+            # applies. Without this, the gauntlet uses HAR-PD data with one
+            # fewer bar of context than production would see (the bar ending
+            # at T is discarded). Non-leaky either way — but the gauntlet
+            # pessimistically underestimates HAR-PD's information content.
+            # Aligns the gauntlet's HAR-PD evaluation with production.
+            har_pd_df.index = har_pd_df.index - pd.Timedelta(minutes=15)
             logger.info(
-                "Loaded HAR-PD sidecar: %d rows x %d cols from %s",
+                "Loaded HAR-PD sidecar: %d rows x %d cols (-15m aligned) from %s",
                 len(har_pd_df), har_pd_df.shape[1], har_pd_path,
             )
         else:
@@ -395,6 +427,39 @@ def load_spot_check_context(
                 "Run `python -m vol_model.features.har_pd --asset %s` first.",
                 har_pd_path, asset,
             )
+
+    # Session E Candidate A: SVI surface features (7 levels + 4 .diff(4) deltas).
+    # Computed directly from the existing SVI sidecar — no new parquet.
+    # Applies the SAME +15m alignment shift as svi_atm_1d so the gauntlet
+    # measures what production would see (not the 15-min-pessimistic alignment
+    # the HAR-PD gauntlet uses, which is a known limitation from Session C).
+    svi_surface_df = pd.DataFrame()
+    if include_extras:
+        try:
+            svi_raw_path = Path("vol_arb/output/svi_features_15m.parquet")
+            if svi_raw_path.exists():
+                svi_raw = pd.read_parquet(svi_raw_path)
+                if "timestamp" in svi_raw.columns and not isinstance(
+                    svi_raw.index, pd.DatetimeIndex,
+                ):
+                    svi_raw = svi_raw.set_index("timestamp")
+                svi_surface_df = compute_svi_surface_features(svi_raw)
+                # Apply the same +15m shift as _load_svi_atm_1d — aligns
+                # feature index with LABEL timestamp so the gauntlet
+                # measures production-equivalent feature availability.
+                svi_surface_df.index = svi_surface_df.index + pd.Timedelta(minutes=15)
+                logger.info(
+                    "Loaded SVI surface features: %d rows x %d cols (+15m aligned)",
+                    len(svi_surface_df), svi_surface_df.shape[1],
+                )
+            else:
+                logger.warning(
+                    "SVI raw sidecar missing (%s); svi_surface thread will be empty.",
+                    svi_raw_path,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not compute SVI surface features: %s", exc)
+            svi_surface_df = pd.DataFrame()
 
     return SpotCheckContext(
         asset=asset,
@@ -412,6 +477,7 @@ def load_spot_check_context(
         rq_features=rq_df,
         svi_spot_features=svi_spot_only,
         har_pd_features=har_pd_df,
+        svi_surface_features=svi_surface_df,
     )
 
 
@@ -618,7 +684,9 @@ def build_month_data_augmented(
         raise ValueError(
             f"unknown thread '{thread}'; expected one of {sorted(TIER_FEATURE_MAP)}"
         )
-    eth_cols, rq_cols, svi_extra_cols, har_pd_cols = TIER_FEATURE_MAP[thread]
+    (
+        eth_cols, rq_cols, svi_extra_cols, har_pd_cols, svi_surface_cols,
+    ) = TIER_FEATURE_MAP[thread]
 
     md = build_month_data(ctx, month_str)
     if md is None:
@@ -653,6 +721,13 @@ def build_month_data_augmented(
             present = [c for c in har_pd_cols if c in ctx.har_pd_features.columns]
             if present:
                 extras.append(ctx.har_pd_features[present].reindex(md.X_month.index))
+    if svi_surface_cols:
+        if ctx.svi_surface_features.empty:
+            logger.warning("%s: SVI-surface unavailable; skipping svi_surface", month_str)
+        else:
+            present = [c for c in svi_surface_cols if c in ctx.svi_surface_features.columns]
+            if present:
+                extras.append(ctx.svi_surface_features[present].reindex(md.X_month.index))
 
     if not extras:
         # Thread is effectively control — return as-is

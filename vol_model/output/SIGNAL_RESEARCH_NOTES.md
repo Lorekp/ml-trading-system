@@ -775,3 +775,169 @@ If all four hold, ship as `pruned_svi_har_pd_v1` and update the backtester's def
 - Backtester integration of HAR-PD — waits on certification.
 - Options OI / dealer-flow features for iv-change direct prediction — new data dependency (Deribit option-chain snapshots by strike, not on disk).
 - Tier 2 options microstructure (dealer gamma, 0DTE flow) — blocked on data.
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Session E (2026-04-18, post-HAR-PD ship)
+# ═══════════════════════════════════════════════════════════════════════
+
+## Context
+
+Session D shipped `pruned_svi_har_pd_v1` (avg ΔQLIKE −3.67% vs pruned_svi_v1,
+39/50 months improved, 29/50 DM-sig at p<0.01, NC Sharpe 9.58 → 9.69,
+PnL $14.51M → $15.04M). Signal-research thread reopens on a fresh baseline.
+
+User directive: focus on signal improvement, research 2024-2026 literature,
+evaluate separately from backtest, **zero data leakage** is the #1 risk.
+Professional ML-quant methodology.
+
+## Phase 0 — Leakage protocol formalization (SHIPPED)
+
+`vol_model/leakage_probes.py` extended with three new probes to complement
+the existing 4:
+
+- **Probe E — `probe_causality_by_mutation`** (gold standard):
+  mutates raw data at timestamps > T, regenerates the feature end-to-end,
+  asserts byte-identical feature[T]. Configurable `mutation_mask` for
+  unusual stamp conventions.
+- **Probe F — `probe_current_bar_dependence`**: sanity complement.
+  Catches features that are wastefully conservative (the "HAR-PD without
+  -15m shift" failure mode from Session D).
+- **Probe G — `probe_walkforward_isolation`** + `FoldSpec` dataclass:
+  schedule-level train/test isolation check.
+
+`tests/test_leakage_probes.py` extended with 14 new tests (27/27 green).
+Real-data validation: the new probe blesses HAR-PD with byte-identical
+feature values under mutation of 97,968 future TSRV rows × 18 cols.
+
+`vol_model/features/README.md` provides a new-feature checklist that every
+Session E candidate must satisfy before training.
+
+## Candidate shortlist (ranked, from 2024-2026 literature scan)
+
+Researcher-curated via web search. Citations verified; no fabricated refs.
+
+| Rank | Candidate | Citation | Effort | Status |
+|---|---|---|---|---|
+| A | Full SVI surface direct features | Cont & Da Fonseca 2002; Magadini 2024 (SSRN:4899357) | LOW | Gauntlet running |
+| B | Hawkes-OFI branching ratio | Pham 2024 (arxiv:2408.03594) | MED | Queued |
+| C | Rough-Heston spot vol | Fan 2026 (arxiv:2604.02743) | HIGH | Queued |
+| D | Multivariate fBm cross-Hurst | Bai 2025 (arxiv:2504.15985) | MED | Deprioritized |
+| E | BKM risk-neutral moments | Bakshi-Kapadia-Madan 2003 | MED | Deprioritized |
+
+## Thread A — Full SVI surface features (11 features)
+
+**Hypothesis**: production uses only `svi_atm_1d` from a 14-col SVI sidecar.
+The 7 other structural features (3 longer-tenor ATMs, 2 skews, 2 term slopes)
+exist at 95.3% coverage but are IGNORED by the LGBM stage. Adding them
++ 4 one-hour-change deltas (regime-transition info) should unlock
+term-structure, skew-dynamics, and butterfly/curvature channels that a
+single ATM scalar collapses.
+
+**Design decision**: direct features, **not PCA**. PCA introduces a
+train-only fitting step (rotation parameter) that needs walk-forward
+isolation; direct features don't. PCA saved as fallback.
+
+**Features** (`vol_model/features/svi_surface.py`):
+- Levels (7, copied verbatim from sidecar): svi_atm_1w, svi_atm_2w,
+  svi_atm_1m, svi_25d_skew_1w, svi_25d_skew_1m, svi_term_slope_1w_2w,
+  svi_term_slope_1w_1m
+- Deltas (4, `.diff(4)` = 1-hour change): svi_atm_1w_d1h,
+  svi_25d_skew_1m_d1h, svi_term_slope_1w_1m_d1h, svi_atm_spot_d1h
+
+**Leakage validation**: `tests/test_features_svi_surface.py` (10/10 green).
+- `probe_causality_by_mutation` passes on both synthetic fixture and
+  real BTC SVI sidecar (byte-identical under mutation of all future rows).
+- `probe_current_bar_dependence` passes (feature is not wastefully conservative).
+- Coverage test: every feature ≥ 88% non-NaN on real data (svi_atm_spot_d1h
+  the lowest at 89.3% due to `.diff(4)` losing extra bars around NaN gaps).
+
+**Alignment**: Applies the same +15m shift as the existing svi_atm_1d
+loader (`_load_svi_atm_1d` in `run_walkforward_pruned_svi.py`). Gauntlet
+evaluation therefore measures production-equivalent feature availability.
+
+**Correctness fix (by-product)**: the HAR-PD gauntlet loader was loading
+the sidecar unshifted. This made the gauntlet's HAR-PD evaluation 15-min
+pessimistic (one bar less of information than production). Fixed by
+applying the same -15m shift production uses. Non-leaky either way; just
+aligns gauntlet with production.
+
+## Thread A — Gauntlet spec
+
+- 8-month regime substrate: 2022-11, 2022-12, 2023-01, 2023-07, 2023-08,
+  2023-10, 2024-11, 2024-12 (`pick_regime_months` on production summary).
+- 4 threads: `pruned_svi_control`, `svi_surface`, `har_pd`, `har_pd_and_svi_surface`.
+  - Control = pruned_svi_v1 (44 features)
+  - svi_surface = 44 + 11 SVI surface (standalone)
+  - har_pd = 44 + 6 HAR-PD (matches production minus the Session D retrain)
+  - har_pd_and_svi_surface = 44 + 6 HAR-PD + 11 SVI surface (CANDIDATE)
+- Optuna: 80 trials / 25 patience per thread-month (matches Session C).
+- Pre-screen gate (from plan): avg ΔQLIKE ≤ −1.5% vs har_pd AND ≥5/8
+  months improved AND IS-vs-OOS Spearman gap < 30%.
+
+Results CSV: `vol_model/output/signal_research_spot_check_results.csv`
+Log: `vol_model/output/session_e_candidateA_gauntlet.log`
+
+## Thread A — Results (gauntlet completed 15:20 local, ~1h50m wall clock)
+
+Per-month QLIKE deltas vs fresh `pruned_svi_control` baseline (8 months, 80
+Optuna trials / 25 patience each). Primary comparison = svi_surface stacked
+on har_pd vs har_pd alone — the differential measures SVI-surface's
+contribution on top of the current production feature set.
+
+| Month | control QLIKE | svi_surface Δ% | har_pd Δ% | har_pd+svi_surface Δ% | differential (vs har_pd) |
+|---|---|---|---|---|---|
+| 2022-11 | 0.5753 | +0.56% | **−4.21%** | **−4.71%** | **−0.50** (better) |
+| 2022-12 | 0.9015 | +3.44% | +0.55% | +1.41% | +0.86 (worse) |
+| 2023-01 | 0.7721 | +3.60% | **−5.01%** | −2.92% | +2.09 (worse) |
+| 2023-07 | 0.6571 | −5.30% | −2.27% | **−5.17%** | **−2.90** (better) |
+| 2023-08 | 0.7252 | −4.02% | **−3.90%** | **−3.82%** | +0.08 (tied) |
+| 2023-10 | 0.6783 | +0.53% | −1.68% | −0.17% | +1.51 (worse) |
+| 2024-11 | 0.2714 | +0.18% | **−4.90%** | **−4.35%** | +0.55 (worse) |
+| 2024-12 | 0.2828 | −0.05% | −2.92% | **−3.25%** | **−0.33** (better) |
+| **Avg** | — | **−0.13%** | **−3.04%** | **−2.87%** | **+0.17** (worse) |
+| **Wins** | — | 3/8 | **7/8** | 7/8 | **3/8** |
+| **DM-sig p<0.01** | — | 1/8 | 2/8 | 2/8 | (DM not computed directly) |
+
+Bold DM-sig at p<0.01; bolded Δ% if < −3%.
+
+**Pre-screen gate (pre-registered)**: `avg ΔQLIKE ≤ −1.5%` AND `≥ 5/8 months improved` AND `IS-OOS Spearman gap < 30%`.
+
+**Actual**: avg +0.17pp WORSE, 3/8 wins. **BOTH gates FAIL.**
+
+**Sanity**: standalone `svi_surface` (on pruned_svi_v1) also fails (−0.13%, 3/8). The 11 SVI surface features carry no independent signal vs the 44-base — supporting the "redundant" interpretation over "needs more trials". Differential SD across months ≈ 1.5pp, so the +0.17 average is inside 1 SD of zero: effect is indistinguishable from noise.
+
+**Interpretation**: the 44-base + HAR-PD already capture whatever SVI-surface information matters for this 15-min horizon. The 7 longer-tenor ATMs, 2 skews, 2 term slopes, and 4 deltas do not add independent predictive content once HAR-PD's path-dependent signed-flow + realized-variance kernels are in the feature set. This is consistent with Session B's earlier finding that "more SVI info on the same 44-feature base" tends not to move QLIKE.
+
+**Decision: Candidate A REJECTED.** Documented. No full-50-month retrain. PCA variant queued as low-priority fallback only if Candidates B/C also fail — since the direct features themselves are null, a PCA rotation that compresses them is unlikely to rescue signal.
+
+**Bonus (Session E correctness fix validated)**: the -15m HAR-PD alignment fix in the gauntlet path shows up in the har_pd numbers — avg −3.04%, 7/8 wins. Session C's unshifted har_pd gauntlet was −2.86%, 4/5 partial months. The shift gives the gauntlet a more faithful read on HAR-PD, consistent with Session D's full certification result of −3.67% (better numbers expected on the full 50-month substrate with larger Optuna budget).
+
+## Threads B, C — Queued
+
+**Thread B (Hawkes-OFI)** — requires Binance aggTrades ingestion at scale
+and rolling MLE fitter. Multi-day build. Queued for next session unless
+Thread A rejects and capacity frees up. See `starry-rolling-rabin.md` for
+details.
+
+**Thread C (Rough-Heston)** — requires rough-Heston calibrator over the
+full Deribit options panel; Fan et al. use a deep-learning surrogate. First
+pass would be a simpler two-step iterative fit. Multi-day build. Queued.
+
+## Infrastructure shipped (Session E so far)
+
+- `vol_model/leakage_probes.py`: +3 probes (`probe_causality_by_mutation`,
+  `probe_current_bar_dependence`, `probe_walkforward_isolation`),
+  +`FoldSpec` dataclass (~230 LOC).
+- `tests/test_leakage_probes.py`: +14 tests (27/27 green).
+- `vol_model/features/svi_surface.py`: compute function + coverage
+  diagnostic (~130 LOC).
+- `tests/test_features_svi_surface.py`: 10 tests (10/10 green) including
+  real-data causality probe.
+- `vol_model/features/README.md`: new-feature checklist skeleton (~100 LOC).
+- `vol_model/signal_research.py`: TIER_FEATURE_MAP 4-tuple → 5-tuple,
+  new tiers `svi_surface` and `har_pd_and_svi_surface`, `svi_surface_features`
+  field on SpotCheckContext, HAR-PD -15m alignment correctness fix.
+
+Total session-to-date: 136/136 tests green across the leakage + feature +
+labeling surface.

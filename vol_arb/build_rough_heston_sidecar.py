@@ -135,8 +135,14 @@ def _load_day_options(date: str, options_dir: Path = OPTIONS_DIR) -> pd.DataFram
     df["iv"] = df["iv"].astype(float) / 100.0  # Deribit IV is in percent
     df["index_price"] = df["index_price"].astype(float)
     df = df[df["iv"] > 0.01]  # drop trades with absurd IV
+    # Keep expiry so the panel-builder can compute a BUCKET-uniform tau per
+    # expiry group. Without expiry, we would be forced to group by the
+    # continuous trade-level ``tau_days`` (which is unique per trade ->
+    # 50+ "unique taus" per bucket -> pricer runs ~50 char_fn solves per
+    # DE evaluation instead of one per discrete expiry).
     return df[
-        ["timestamp", "iv", "strike", "option_type", "tau_days", "index_price"]
+        ["timestamp", "iv", "strike", "option_type", "tau_days",
+         "index_price", "expiry"]
     ].reset_index(drop=True)
 
 
@@ -163,11 +169,30 @@ def _panel_for_bucket(
     F = float(window["index_price"].iloc[-1])
     if not (F > 0 and np.isfinite(F)):
         return None
-    # Aggregate by (tau_days rounded to nearest day, strike, option_type)
+    # Aggregate by DISCRETE EXPIRY (not by trade-level continuous tau).
+    # Each Deribit option has a canonical expiry timestamp (08:00 UTC on
+    # the expiry date); all trades within the bucket window that share an
+    # expiry share the same forward-looking tau from the bucket-end
+    # reference. Grouping by continuous ``tau_days`` instead would give
+    # one distinct tau per trade (~50-100 unique taus per bucket), forcing
+    # the calibrator's tau-loop to run ~50 char_fn solves per DE
+    # evaluation — catastrophic (~100× slowdown) on real data. Grouping
+    # by expiry collapses to ~4-8 unique taus (the 4-8 option series that
+    # traded during the bucket window), exactly what the pricer is
+    # optimized for.
     window = window.copy()
-    window["tau_year"] = window["tau_days"].values / 365.25
-    grp = window.groupby(["tau_year", "strike", "option_type"], sort=False)
+    grp = window.groupby(["expiry", "strike", "option_type"], sort=False)
     agg = grp["iv"].median().reset_index()
+
+    # Compute uniform tau per expiry using bucket_end as the reference timestamp.
+    agg["tau_year"] = (
+        (agg["expiry"] - bucket_end).dt.total_seconds() / (86400.0 * 365.25)
+    )
+    # Drop any expiries that are already past the bucket (shouldn't happen
+    # after the DTE filter in _load_day_options but belt-and-braces).
+    agg = agg[agg["tau_year"] > 0]
+    if len(agg) < 8:
+        return None
 
     # Filter by moneyness: keep options within ±40% of forward (Deribit-liquid region)
     agg["moneyness"] = np.log(agg["strike"].astype(float).values / F)
@@ -255,7 +280,9 @@ def _process_month(
     prev_fit: RoughHestonParams | None = None
     cold_count = 0
     warm_count = 0
-    for T in buckets:
+    rescue_count = 0
+    t_last_progress = time.time()
+    for bucket_idx, T in enumerate(buckets):
         res = _panel_for_bucket(trades, T, window_side_min=WINDOW_SIDE_MINUTES)
         row: dict = {"timestamp": T}
         if res is None:
@@ -289,10 +316,24 @@ def _process_month(
         except Exception:  # noqa: BLE001
             fit = RoughHestonParams(calibration_level=0)
 
-        if fit.calibration_level > 0 and fit.calibration_rmse < 0.15:
-            prev_fit = fit  # Good fit — warm-start next bucket
+        # Warm-start retention: keep prev_fit on ANY successful calibration.
+        # The calibrator's built-in `warm_rescue_threshold=0.10` already
+        # guarantees that successful fits have RMSE < 10vp (anything above
+        # triggers automatic cold-DE rescue inside calibrate_rough_heston).
+        # Previously this branch also rejected fits with RMSE >= 15vp, but
+        # that caused a pathological fail-loop: on crypto regime transitions
+        # warm LM sometimes lands at 10-15vp (inside the calibrator's rescue
+        # margin but above the sidecar's rejection margin), breaking the
+        # warm-start chain and forcing a 500-second cold DE on every
+        # subsequent bucket until one happened to converge below 15vp.
+        if fit.calibration_level > 0:
+            prev_fit = fit  # Warm-start next bucket from any successful fit
         else:
-            prev_fit = None  # Cold-start next bucket
+            prev_fit = None  # Cold-start next bucket on hard failure
+
+        # Sidecar-level rescue detection (for logging only): a "soft" rescue
+        # happened inside the calibrator if warm fit is near-floor RMSE but
+        # we used global search anyway. Tracked via cold/warm counts above.
 
         d = asdict(fit)
         for c in ("V_0", "H", "kappa", "theta", "eta", "rho"):
@@ -303,6 +344,19 @@ def _process_month(
         row["n_iter"] = d["n_iter"]
         row["calibration_level"] = d["calibration_level"]
         rows.append(row)
+
+        # Per-month progress heartbeat every 100 buckets, so operators can
+        # see the warm-start chain is alive without waiting for the full
+        # month's completion log. Silent workers over a 13-hour wall-clock
+        # was the Session G.4 debug pain-point.
+        if (bucket_idx + 1) % 100 == 0 or (bucket_idx + 1) == len(buckets):
+            now = time.time()
+            logger.info(
+                "month %s bucket %d/%d: cold=%d warm=%d (elapsed %.1fs, +%.1fs since last)",
+                month, bucket_idx + 1, len(buckets),
+                cold_count, warm_count, now - t0, now - t_last_progress,
+            )
+            t_last_progress = now
 
     out = pd.DataFrame(rows).set_index("timestamp")
     n_ok = int(out["calibration_level"].gt(0).sum())
@@ -359,6 +413,24 @@ def derive_15m_features(params_df: pd.DataFrame) -> pd.DataFrame:
 # ── Driver ───────────────────────────────────────────────────────────
 
 
+def _worker_logging_init() -> None:
+    """Initializer for ProcessPoolExecutor workers.
+
+    Python's ``logging`` configuration is process-local: subprocesses
+    spawned by ``multiprocessing`` / ``ProcessPoolExecutor`` do NOT inherit
+    the parent's ``basicConfig``. Without this function, every
+    ``logger.info(...)`` in ``_process_month`` goes to a handlerless root
+    logger and silently disappears. Installing a handler here, once per
+    worker at pool init, connects each worker's logs back to the inherited
+    stderr so they show up in the parent's ``tee`` and ``logger.info`` log.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [W-%(process)d] %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
+
+
 def build_sidecar(
     start_month: str,
     end_month: str,
@@ -387,7 +459,14 @@ def build_sidecar(
         for m in months:
             frames.append(_process_month(m, prev_of[m], options_dir=options_dir))
     else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        # The worker-logging initializer configures basicConfig inside each
+        # pool subprocess so its log-lines flow into the inherited stderr.
+        # Without this, worker `logger.info(...)` calls go to a
+        # default-handler-less root logger and vanish — the Session G.4
+        # 13-hour silent-build pain-point.
+        with ProcessPoolExecutor(
+            max_workers=workers, initializer=_worker_logging_init,
+        ) as pool:
             fut_to_month = {
                 pool.submit(_process_month, m, prev_of[m], options_dir): m
                 for m in months
@@ -396,6 +475,8 @@ def build_sidecar(
                 m = fut_to_month[fut]
                 try:
                     frames.append(fut.result())
+                    logger.info("-- month %s completed (%d/%d done)",
+                                m, len(frames), len(months))
                 except Exception:  # noqa: BLE001
                     logger.exception("month %s failed", m)
                     continue

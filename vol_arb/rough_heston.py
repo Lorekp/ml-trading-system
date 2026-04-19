@@ -781,7 +781,7 @@ def calibrate_rough_heston(
     de_n_fft: int = 512,
     de_M_riccati: int = 50,
     de_workers: int = 1,
-    warm_rescue_threshold: float = 0.30,
+    warm_rescue_threshold: float = 0.10,
 ) -> RoughHestonParams:
     """Fit rough-Heston to a panel of European calls.
 
@@ -867,9 +867,15 @@ def calibrate_rough_heston(
         ``de_workers=k`` remain deterministic.
     warm_rescue_threshold
         If ``use_global_search=False`` (warm-start path) and the LM fit
-        produces RMSE > this threshold (default 30 vol-points), re-run
+        produces RMSE > this threshold (default 10 vol-points), re-run
         calibration as a cold DE search. Prevents level-0 emissions when
-        warm-start LM diverges from a bad init.
+        warm-start LM diverges from a bad init. The 10vp default is
+        calibrated against the observed Session G DE+LM RMSE floor of
+        ~2-6vp on real Deribit panels: anything above 10vp is a clear
+        divergence signal. Raising to 20-30vp caused the sidecar build's
+        warm-start chain to break pathologically on crypto regime
+        transitions (warm LM lands at 15-25vp, sidecar flags as bad and
+        retriggers cold DE, 14-hour-total build time).
 
     Returns
     -------
@@ -1138,15 +1144,28 @@ def calibrate_rough_heston(
             )
         else:
             # Warm-start path: LM directly from the previous bucket's fit.
-            # If LM produces a blow-up (RMSE > warm_rescue_threshold), fall
-            # back to cold DE + LM polish — prevents silent NaN emissions
-            # when warm-start lands in a bad basin (e.g. after a regime
-            # break where the previous fit is far from current truth).
+            # Uses the coarse-grid residuals (n_fft=512) AND loose tolerances
+            # (1e-5) deliberately:
+            #   * Warm init is already inside the basin, so we only need
+            #     ~10-15 LM iters to polish — the 1e-8 tolerance was
+            #     forcing 50-65 iters per bucket (measured 8-11 s/bucket
+            #     on real data) which made the sidecar build impractical.
+            #   * At 1e-5, LM stops when the RMSE change falls below ~0.001
+            #     vol-points per iter, indistinguishable from the
+            #     discretization noise the n_fft=512 grid already
+            #     injects (~2.7 vp peak, averaged over vega-weighted
+            #     options to ~0.5 vp).
+            #   * Net: ~3× faster per warm, fit-quality loss < discretization
+            #     floor, both dominated by the market-vega-weighted
+            #     component that matters for downstream ML features.
+            # If warm-path RMSE exceeds ``warm_rescue_threshold``, we fall
+            # back to cold DE (below) at full resolution — that keeps the
+            # fidelity belt-and-braces.
             result = least_squares(
-                _residuals, x0,
+                _residuals_de, x0,
                 method="trf", bounds=(low, high),
                 max_nfev=max_iter * 20,
-                ftol=1e-8, xtol=1e-8, gtol=1e-8,
+                ftol=1e-5, xtol=1e-5, gtol=1e-5,
             )
             total_w_check = w.sum()
             rmse_check = math.sqrt(

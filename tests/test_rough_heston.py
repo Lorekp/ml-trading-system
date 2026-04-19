@@ -392,6 +392,56 @@ def test_global_method_unknown_raises() -> None:
         )
 
 
+@pytest.mark.parametrize("H", [0.05, 0.1, 0.3, 0.49])
+@pytest.mark.parametrize("tau_days", [1, 7, 30])
+@pytest.mark.parametrize("V_0", [0.01, 0.25, 1.0])
+def test_jit_fractional_riccati_matches_closure_version(
+    H: float, tau_days: int, V_0: float,
+) -> None:
+    """Session G.4d regression: the Numba-JIT'd Adams loop
+    (_fractional_riccati_solve_inlined -> _adams_kloop_jit) must produce
+    bit-identical output (rtol < 1e-12) vs the reference closure-based
+    ``fractional_riccati_solve``. Any drift above that threshold would
+    silently break the CF evaluation, which the BS-deterministic-variance
+    limit test detects — but this test localizes the problem to the Adams
+    loop so regressions are easy to triage.
+    """
+    from vol_arb.rough_heston import _fractional_riccati_solve_inlined
+    eta = 2.0
+    kappa = 2.0
+    rho = -0.6
+    tau = tau_days / 365.0
+    u_vec = np.linspace(0.1, 15.0, 64).astype(np.complex128)
+
+    # Reference: closure path via public fractional_riccati_solve
+    iu = 1j * u_vec
+    c0 = -0.5 * (u_vec ** 2 + iu)
+    c1 = iu * eta * rho - kappa
+    c2 = 0.5 * eta ** 2
+
+    def F_closure(y: np.ndarray) -> np.ndarray:
+        return c0 + c1 * y + c2 * (y * y)
+
+    F_ref, psi_ref = fractional_riccati_solve(F_closure, tau, H, u_vec, M=50)
+
+    # Candidate: inlined JIT path (same coefficients, different call site)
+    F_jit, psi_jit = _fractional_riccati_solve_inlined(
+        np.ascontiguousarray(c0), np.ascontiguousarray(c1), float(c2),
+        tau, H, u_vec.shape[0], M=50,
+    )
+
+    # Both integrals must match — they feed directly into log(phi), so any
+    # drift propagates to the CF value.
+    np.testing.assert_allclose(
+        F_jit, F_ref, rtol=1e-12, atol=1e-15,
+        err_msg=f"F_psi_integral drift at H={H}, tau_days={tau_days}, V_0={V_0}",
+    )
+    np.testing.assert_allclose(
+        psi_jit, psi_ref, rtol=1e-12, atol=1e-15,
+        err_msg=f"psi_integral drift at H={H}, tau_days={tau_days}, V_0={V_0}",
+    )
+
+
 def test_warm_start_rescue_triggers_on_bad_init() -> None:
     """Session G warm-start rescue: if use_global_search=False and the
     warm-init is so far from truth that LM alone can't converge below the

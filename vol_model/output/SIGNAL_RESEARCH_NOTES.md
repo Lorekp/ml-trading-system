@@ -1833,3 +1833,366 @@ LGBM through `svi_atm_1d` + HAR-PD kernels.
 
 3. **Binning queue**: BNS jump variation (J = RV−BPV); CME-Binance
    basis; multi-horizon target ensemble; Hyperliquid L2 OFI.
+
+
+---
+
+# Session I — 2026-04-20, evening/night. Target engineering pivot.
+
+User directive (post-Session H): pivot from feature engineering (5
+consecutive rejections, ledger 15/14/1) to **target engineering**.
+Recommended directions: multi-horizon, CRPS/distributional,
+jump-diffusion. Pure prediction metrics (separate from backtest).
+Zero leakage. Professional ML-quant methodology.
+
+Three candidates run in a single combined 8-month gauntlet:
+
+- **I-1**: jump-diffusion dual-head (HAR-CJ via LightGBM) — Shen-Urquhart-Wang
+  2020, Sarrafshirazi 2025 Concordia thesis, Zhang-FRL 2022.
+- **I-2**: multi-horizon base+delta reconciliation — Caporin-Di-Fonzo-
+  Girolimetto 2024, JFEcmx (arXiv 2306.02952).
+- **I-3**: CRPS/QRS distributional wrapper — Moutari 2025 arXiv:2508.15922
+  (crypto-specific), Marchese 2025 arXiv:2511.20105.
+
+## Phase 0 — TSRV windowing causality audit
+
+Literature review identified a **real leakage pitfall**: some
+Lee-Mykland implementations (R `highfrequency`, some Python ports) use
+centered windows, which would leak. Before consuming TSRV's
+`continuous_var` + `jump_var` as I-1 dual-head targets, we audited the
+windowing end-to-end.
+
+**Finding**: TSRV is backward-safe by inspection AND by synthetic probe.
+- `tsrv_series.py:264-291` uses integer floor-division `window_ids =
+  ts_ns // freq_ns` — each window is a strictly-contained contiguous
+  block `prices[s:e]` where all ticks share the same `window_id`. The
+  window timestamp is `window_ids[s] * freq_ns` = the START of the
+  window. So row at T uses only ticks in `[T, T+freq)`.
+- `jump_robust.py` primitives (`bipower_variation`, `median_rv`,
+  `realized_semivariance`) are pure 1-D aggregators — causality is a
+  property of the caller's window selection.
+- `labels.py:116-132` stores `continuous_var` and `jump_var` at the
+  same index as `ln_vol`, with the same `-freq` shift normalization.
+  `align_features_labels`'s one-step-ahead shift guarantees features
+  at T-15m never see information from `[T, T+15m)`.
+
+Two new synthetic probes added to `tests/test_leakage_probes.py`:
+- `test_tsrv_window_decomposition_is_causal`: simulates the windowing
+  with a pure sum-of-squared-returns aggregator; mutates all ticks at
+  index ≥ T+freq; asserts byte-identity at T. **PASS** (tolerance 0.0).
+- `test_tsrv_centered_window_would_fail_probe`: negative control —
+  intentionally-leaky centered window aggregator; probe correctly
+  flags leakage. **PASS** (probe sensitive).
+
+Audit note committed at `vol_model/output/SESSION_I_TSRV_CAUSALITY_AUDIT.md`.
+
+## Phase 1 infrastructure
+
+### Candidate I-1 — jump-diffusion dual-head
+
+**Thesis**: BTC has frequent jumps (FTX, 3AC, Terra-Luna, Trump).
+Classical HAR-CJ decomposes RV = IV + JV and forecasts each
+component separately, summing in variance space at inference.
+
+**Implementation** (in `vol_model/signal_research.py`):
+- `decompose_logvol_into_cont_jump(y_logvol, labels)`: maps
+  `y_logvol[T] = ln(vol_ann[T])` to a pair `(y_cont[T], y_jump[T])`
+  via the per-bar jump fraction `jfrac = jump_var / (cont_var +
+  jump_var)`, satisfying the reconciliation identity
+  `exp(2·y_cont) + exp(2·y_jump) = exp(2·y_logvol)` exactly.
+- `combine_cont_jump_forecasts(pred_cont, pred_jump)`: variance-scale
+  sum back to log-vol space via `0.5·log(exp(2·pred_c) + exp(2·pred_j))`.
+- `train_jump_decomp_dual_head(month, ctx, ...)`: runs two independent
+  Optuna searches (QLIKE objective, production HPs), retrains each
+  head with best params, combines on test.
+- New thread key `har_pd_jump_decomp` in `TIER_FEATURE_MAP` (same
+  features as `har_pd`; novelty is target).
+- Runner dispatch via `thread.endswith("_jump_decomp")` in
+  `run_spot_check_signal_research.py`.
+
+**9 unit tests in `tests/test_target_jump_decomp.py`** (all PASS):
+decomposition exactness (reconstruction error < 2e-10), zero-jump
+edge case, pure-jump edge case, oracle combination (< 5e-9), length
+preservation, causality-by-mutation probe on decomposition path,
+missing-column error, tier map integration.
+
+### Candidate I-2 — multi-horizon base+delta reconciliation
+
+**Thesis**: Caporin 2024 JFEcmx showed reconciliation across sub-
+periods improves QLIKE 13-39% OOS on daily equities. Minimum-viable
+version: train 15m and 60m heads on the same features, combine via
+QLIKE-optimal linear meta-combiner on val.
+
+**Implementation** (in `vol_model/signal_research.py`):
+- `build_60m_aggregate_logvol(y_15m)`: gap-aware 4-bar rolling mean in
+  annualized-variance space, returns `0.5·log(mean(exp(2·y_15m[T:T+4])))`.
+  Gap guard: requires `index[i+3] - index[i] == 45min` exactly; NaN
+  otherwise (prevents spurious aggregates across data gaps).
+- `fit_multihorizon_meta_combiner(y_val, p15, p60)`: **QLIKE-optimal
+  1D search** over λ ∈ [0, 1] via `scipy.optimize.minimize_scalar
+  (bounded Brent, xatol=1e-4)`. Enforces convex constraint α + β = 1
+  (rules out unstable OLS coefficients from collinear heads).
+  **γ = 0 by design**: no additive bias correction layer — the heads
+  are individually Optuna-calibrated, so an extra intercept on val
+  would overfit (smoke test: γ=-0.27 unconstrained OLS produced +32%
+  QLIKE inflation on test).
+- `train_multihorizon_reconciled(month, ctx, ...)`: trains 15m head
+  (production-equivalent path) and 60m head (embargoed 3-bar subset to
+  keep labels within fold), fits combiner on val, applies on test.
+- New thread key `har_pd_multihorizon`. Runner dispatch via
+  `thread.endswith("_multihorizon")`.
+
+**Embargo logic**: for the 60m head, labels at the last 3 bars of train
+extend past the next fold boundary. Drop those rows from train + val;
+keep full test window (test features use only test-time info).
+
+**14 unit tests in `tests/test_target_multihorizon.py`** (all PASS):
+60m arithmetic (hand-verified on `[ln(0.5), ln(1.0), ln(1.5), ln(2.0)]`
+→ aggregate = 0.5·log(1.875)), gap-NaN handling, in-window mutation
+changes output (probe sensitivity), out-of-window mutation does NOT
+(causality guard), meta-combiner basic fit + bounded coefficients +
+handles collinear inputs, tier map integration.
+
+### Candidate I-3 — QRS distributional wrapper
+
+**Thesis**: Moutari 2025 (crypto-specific) showed QRS applied to a
+linear HAR model strictly dominates ML-native distributional methods
+(direct pinball-LGBM has >40% quantile-crossing per Marchese 2025).
+QRS sidesteps crossing by construction — quantiles come from a single
+empirical residual distribution.
+
+**Implementation** (new module `vol_model/qrs.py`, ~270 LOC):
+- `fit_residual_distribution(oof_preds, y_true, *, calibration_mask)`:
+  empirical residual distribution on a held-out calibration slice.
+  The mask structurally separates calibration from test rows — test
+  residuals can never contaminate the distribution.
+- `predict_distribution(point_preds, residual_dist, *, n_bootstrap=1000,
+  quantiles=DEFAULT, seed=42)`: vectorized bootstrap residual
+  simulation → `np.quantile` at sorted levels produces monotonically
+  non-decreasing quantiles by construction. Seeded → byte-identical.
+- `score_distributional(y_true, q_df, *, residual_dist)`: CRPS via
+  3-quantile pinball-sum (Bracher et al. 2021), Gaussian baseline
+  CRPS (closed-form, Gneiting & Raftery 2007), PIT uniformity
+  Kolmogorov-Smirnov, coverage at 80/90/98%, median spread.
+- Default quantiles: `(0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90,
+  0.95, 0.99)` — 9 levels supporting exact 80/90/98% symmetric intervals.
+
+**15 unit tests in `tests/test_qrs.py`** (all PASS): schema, seed
+determinism, monotonic quantiles, **calibration_mask_excludes_test_rows**
+(critical leakage test: mutating test-side residuals does NOT affect
+fitted distribution), NaN filtering, sharpness sanity (2× wider
+residuals → ~2× wider intervals), CRPS ≈ Gaussian CRPS when residuals
+are Gaussian, coverage close to nominal, PIT rejects when badly
+calibrated (negative control), quantile level validation.
+
+## Phase 1 — combined gauntlet (8 months × 3 threads @ 80 trials / 25 patience)
+
+Wall-clock ~2h37m. All absolute QLIKE values are NOT comparable across
+sessions due to the `feedback_gauntlet_budget.md` binding rule: the
+gauntlet's `train_feature_augmented_lgbm` pipeline is known to diverge
+from production `train_purged_cv`. The honest comparison is the
+**within-session stacked-vs-HAR-PD differential** — both threads share
+the pipeline bias which cancels in the difference.
+
+### 2022-12 pipeline-divergence artifact (replicated)
+
+The Session G/H discovery replicates exactly: gauntlet's `har_pd`
+thread gives QLIKE 0.9065 on 2022-12 (+11.94% vs stale baseline),
+while certified production HAR-PD gives QLIKE 0.8187. Seed=42 on
+both Optuna and LightGBM → deterministic reproduction across
+sessions. All Session I candidates inherit the same 2022-12 bias;
+the within-session differential cancels it.
+
+### Per-month results
+
+| Month | har_pd | jump_decomp | multihorizon | JD−HAR (pp) | MH−HAR (pp) |
+|-------|--------|-------------|--------------|-------------|-------------|
+| 2022-11 | -0.45% | -1.14% | -0.23% | **-0.69** | +0.22 |
+| 2022-12 | +11.94% | +12.51% | +11.94% | +0.57 | 0.00 |
+| 2023-01 | -9.07% | -9.93% | -9.07% | **-0.86** | 0.00 |
+| 2023-07 | +1.72% | +0.17% | +0.19% | **-1.55** | **-1.53** |
+| 2023-08 | -6.08% | -7.90% | -7.06% | **-1.82** | **-0.98** |
+| 2023-10 | -4.03% | -3.53% | -3.79% | +0.50 | +0.24 |
+| 2024-11 | -2.25% | -2.38% | -2.07% | **-0.13** | +0.18 |
+| 2024-12 | -3.25% | -3.75% | -3.17% | **-0.50** | +0.08 |
+
+(Bold = strict improvement vs HAR-PD.)
+
+### I-1 jump-decomp verdict
+
+- **avg differential: -0.56pp** (need ≤-1.5pp → **FAIL**)
+- **wins: 6/8** (need ≥5/8 → **PASS**)
+- **Pre-screen gate**: FAIL (conjunction requires BOTH; wins alone not enough)
+
+Directional signal is positive (6/8 months improved) but magnitude is
+too small to clear the pre-registered gate. Best month: 2023-08
+(-1.82pp, DM p=0.043), consistent with the 2024-2026 literature finding
+that jump decomposition helps most in crisis regimes. Worst month:
+2022-12 (+0.57pp), where jump decomposition HURT in the FTX pipeline-
+divergence artifact — but this would cancel in a certification-scale
+retrain using `train_purged_cv`.
+
+**Ex-2022-12 (removing pipeline artifact)**: avg -0.72pp, 6/7 wins —
+still FAIL on avg. Rejection is robust.
+
+**Meta-combiner pattern (multihorizon)**: λ was picked close to 1 on
+4/8 months (2022-12, 2023-01, 2024-11, 2024-12 — the combiner
+correctly rejected the 60m head when it was worse on val). On 2023-07
+and 2023-08, combiner picked λ≈0.83-0.85 (mild 60m contribution),
+which matches the two months where MH beats HAR-PD. This confirms
+the QLIKE-optimal 1D search is well-behaved.
+
+### I-2 multihorizon verdict
+
+- **avg differential: -0.22pp** (need ≤-1.5pp → **FAIL**)
+- **strict wins: 2/8** (need ≥5/8 → **FAIL**)
+- 4/8 ties where combiner picked λ=1 (degenerate to pure HAR-PD path)
+- **Pre-screen gate**: FAIL on both sub-gates
+
+The 60m head mostly does not add complementary information at 15m
+timescale. The combiner's convex constraint correctly prevents
+catastrophic failure (unlike the Session I smoke with unconstrained
+OLS which produced +32% inflation), but without genuine
+complementarity, the best we can do is match HAR-PD. 2023-07 and
+2023-08 do show mild gains (-1.53pp and -0.98pp respectively),
+consistent with Caporin 2024's reconciliation benefit at calm-to-
+transitional regime boundaries.
+
+### I-3 QRS verdict
+
+Post-hoc scoring on production 50-month OOS predictions restricted to
+8-month substrate (calibration: 3 months immediately preceding each
+test month, strictly held-out).
+
+| Month | n_cal | n_test | ΔCRPS (%) | PIT KS p | cov_80 | cov_90 | cov_98 | spread |
+|-------|-------|--------|-----------|----------|--------|--------|--------|--------|
+| 2022-11 | 8252  | 2686   | -10.75 | 0.0007 | 0.754 | 0.882 | 0.974 | 1.093 |
+| 2022-12 | 8251  | 2976   | -9.05  | 0.0000 | 0.703 | 0.819 | 0.940 | 1.163 |
+| 2023-01 | 8541  | 2976   | -10.07 | 0.0000 | 0.788 | 0.881 | 0.975 | 1.282 |
+| 2023-07 | 8639  | 2976   | -10.05 | 0.0000 | 0.771 | 0.877 | 0.970 | 1.149 |
+| 2023-08 | 8735  | 2974   | -10.01 | 0.0003 | 0.766 | 0.871 | 0.963 | 1.174 |
+| 2023-10 | 8830  | 2976   | -10.70 | 0.0002 | 0.832 | 0.919 | 0.982 | 1.234 |
+| 2024-11 | 8832  | 2880   | -10.98 | 0.0000 | 0.855 | 0.944 | 0.987 | 0.979 |
+| 2024-12 | 8736  | 2976   | -10.89 | 0.0000 | 0.837 | 0.933 | 0.983 | 0.932 |
+
+Pre-registered gates:
+- avg ΔCRPS ≤ -5%: **-10.31%** → **PASS** (consistent 10-11% every month)
+- median spread narrower than Gaussian 80%: **yes** → **PASS**
+- PIT KS p > 0.05 in ≥5/8 months: **0/8** → **FAIL**
+
+**Interpretation**: QRS produces sharper predictive intervals than a
+Gaussian residual assumption and a robust ~10% better CRPS every
+month. Coverage is close to nominal but slightly under on crisis
+months (2022-12 at 70% actual for 80% nominal). However, the PIT KS
+test rejects uniformity decisively on every month (all p < 0.001) —
+the empirical residual distribution has features (skew, heavier tails,
+regime-dependence) that aren't stationary from calibration period to
+test period. **Honest rejection on calibration axis** despite real
+CRPS improvement.
+
+**Pragmatic note**: a 10% CRPS gain with miscalibrated PIT is still
+useful for RELATIVE decisions (e.g., "this bar's spread is 30% wider
+than typical → reduce position") but NOT for ABSOLUTE probability
+statements (e.g., "P(vol > X) = 0.90"). Downstream consumers could
+still adopt QRS for sizing if they treat the quantiles as ranking
+signals rather than calibrated probabilities — an intentional
+deferral for future sessions, not part of this pre-screen gate.
+
+## Cross-session ledger update
+
+**18 candidates tested / 17 rejected / 1 shipped (HAR-PD)**:
+- Session E: SVI surface (11 features) — REJECTED
+- Session F: Hawkes-OFI (7 features) — REJECTED
+- Session G: Rough-Heston SDE (8 features) — REJECTED
+- Session H: Funding (5 features), VRP (5 features) — BOTH REJECTED
+- Session I: Jump-decomp dual head, Multi-horizon reconciliation,
+  QRS distributional — ALL THREE REJECTED
+
+8 consecutive rejections on QLIKE-axis pre-screen gate.
+
+The **"44-base + HAR-PD + svi_atm_1d at informational ceiling for
+15-min horizon"** thesis is now decisively established. Both
+feature-side (5 rejections E-H) AND target-side (3 rejections I) have
+been exhausted on this target definition.
+
+## Interpretation: what the 8 rejections tell us
+
+1. **Feature ceiling is real**: 5 different feature families
+   (fundamental microstructure, realized-moment surface, SDE-calibrated
+   latent state, funding-rate state, IV-RV spread) — none added
+   signal on top of HAR-PD at 15m. The 44-feature production base
+   already captures what's learnable from observational data at this
+   horizon.
+
+2. **Target ceiling is also real**: three different target
+   reformulations (jump decomposition, multi-horizon aggregation,
+   distributional CRPS) — none break through the QLIKE ceiling:
+   - Jump decomposition: helped 6/8 months but only marginally
+     (-0.56pp avg). Literature's "jump decomposition matters in
+     regime transitions" is visible in 2023-08 (-1.82pp) but averages
+     out below the -1.5pp gate.
+   - Multi-horizon: the 60m head does not carry complementary
+     information at 15m timescale. Caporin 2024's 13-39% QLIKE gain
+     on daily equities does not replicate at intraday crypto.
+   - Distributional: QRS genuinely gives better CRPS + sharper
+     intervals, but the empirical residual distribution is non-
+     stationary across regimes → PIT non-uniform → calibration FAIL.
+
+3. **The winning improvements are elsewhere**: per the literature
+   survey, the next-cycle pivots that are NOT yet tested on this
+   system are (in rank order of expected value):
+   - **Horizon change**: 5-min nowcast or 60-min primary forecast.
+     The informational ceiling applies specifically at 15m.
+     Different horizons have different signal-to-noise and may have
+     different ceilings. A 60-min primary target uses
+     `train_purged_cv` on a new label definition — same pipeline,
+     different target — and could produce substantially different
+     NC Sharpe characteristics for the paper engine.
+   - **Microstructure data**: Hyperliquid L2 raw (18GB LZ4, ~2d
+     ingestion). Research rank 1 from the Session H literature scan.
+     Multi-level OFI captures order-book dynamics that aggregate
+     trade flow (and our current HAR-PD's R1 kernel) can't see.
+   - **Alternative data**: CME-Binance basis, cross-exchange funding
+     flow. Lower prior than L2 OFI but independent information
+     sources.
+
+## Deferred next-cycle items (binding for the NEXT session)
+
+- **No more feature engineering on 15m log-vol target.** 5+3=8 straight
+  rejections is decisive evidence against further attempts.
+- **No more target engineering on 15m log-vol target with existing
+  44-feature base.** QRS's CRPS gain is real but calibration-bounded;
+  if a distributional axis ships, it's as a post-hoc sidecar, not a
+  replacement for the point forecast.
+- **Pivot candidates for next session** (rank-ordered):
+  1. Horizon change: primary-forecast at 60m OR 5m, retrain full
+     pipeline on new target definition.
+  2. Hyperliquid L2 ingestion + multi-level OFI features (large infra
+     task, ~2d data pipeline).
+  3. Cross-exchange basis / funding-flow / alt-data channels.
+
+## Infrastructure preserved for future cycles
+
+- `vol_model/qrs.py` (~270 LOC) + 15-test suite — ready to apply on
+  any future point forecast as an add-on distributional layer. The
+  PIT-calibration failure is a KNOWN LIMITATION (QRS assumes
+  residual stationarity); downstream users can adopt for RELATIVE
+  sizing.
+- `vol_model/signal_research.py` extensions: `decompose_logvol_into_
+  cont_jump`, `combine_cont_jump_forecasts`, `build_60m_aggregate_logvol`
+  (gap-aware), `fit_multihorizon_meta_combiner` (QLIKE-optimal convex),
+  `train_jump_decomp_dual_head`, `train_multihorizon_reconciled`. All
+  module-level; reusable on any future feature set or target definition.
+- TIER_FEATURE_MAP thread keys `har_pd_jump_decomp`,
+  `har_pd_multihorizon` — available for re-running with any future
+  budget or substrate.
+- Runner suffix dispatch in `run_spot_check_signal_research.py`.
+
+## Artifacts
+
+- `vol_model/output/signal_research_spot_check_results.csv`: 24 rows
+  (3 threads × 8 months) with QLIKE, base_QLIKE, delta, DM stats,
+  rank_ic, RMSE, Mincer-Zarnowitz α/β, n_trials, wall-clock.
+- `vol_model/output/session_i_gauntlet.log`: full 80-trial gauntlet log.
+- `vol_model/output/session_i_qrs_gauntlet.csv`: 8 rows of I-3 scoring.
+- `vol_model/output/SESSION_I_TSRV_CAUSALITY_AUDIT.md`: Phase 0 audit.

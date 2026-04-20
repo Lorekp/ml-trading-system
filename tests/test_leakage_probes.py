@@ -409,3 +409,141 @@ def test_run_probe_battery_fails_if_any_fail() -> None:
     ]
     all_passed, _ = run_probe_battery("cand", probes)
     assert not all_passed
+
+
+# ---- Session I Phase 0: TSRV jump-decomposition causality probe ----
+
+def test_tsrv_window_decomposition_is_causal() -> None:
+    """Session I Phase 0: pins the TSRV bar-window semantics used by HAR-CJ.
+
+    ``TSRV/tsrv_series.py`` produces a per-bar row containing BPV/MedRV/
+    continuous_var/jump_var statistics. Each row at timestamp T is a
+    strictly-contained-window aggregate: it uses ONLY the ticks with
+    integer floor-division ``ts_ns // freq_ns == T // freq_ns`` (i.e.,
+    ticks in ``[T, T+freq)``). No ticks outside the window contribute to
+    row T. That's START-stamped semantics — and it's safe for LABELS
+    (forward-looking targets) when combined with the one-step-ahead
+    shift in ``align_features_labels``.
+
+    This test simulates the core windowing of ``_process_month_tsrv`` with
+    a pure aggregator (sum of squared returns) and probes causality via
+    future-row mutation. It pins the invariant: mutating any tick at
+    timestamp strictly after T+freq must NOT change the stat at T.
+
+    Acts as a regression guard against accidentally widening the window
+    (e.g., ``[T-freq/2, T+freq/2]`` centered, or ``[T, T+2*freq)``)
+    which would introduce forward leakage for Session I Candidate I-1.
+    """
+    from vol_model.leakage_probes import probe_causality_by_mutation
+
+    rng = np.random.default_rng(0)
+    # Simulate 500 tick-level price observations at 1-minute cadence (a
+    # fine-grained grid for the windowing logic to aggregate).
+    n_ticks = 500
+    tick_idx = pd.date_range(
+        "2024-01-01 00:00:00", periods=n_ticks, freq="1min", tz="UTC",
+    )
+    prices = 50_000.0 + rng.standard_normal(n_ticks).cumsum() * 10.0
+    raw = pd.DataFrame({"price": prices}, index=tick_idx)
+
+    freq = pd.Timedelta(minutes=15)
+    freq_ns = int(freq.value)
+
+    def aggregate_by_window(raw_df: pd.DataFrame) -> pd.DataFrame:
+        """Mimic TSRV windowing: for each 15-min window, return sum of
+        squared log-returns using ONLY ticks inside [T, T+freq).
+
+        This mirrors ``_process_month_tsrv``'s invariant that each window
+        is a strictly-contained block of ticks with matching window_id.
+        """
+        ts_ns = raw_df.index.values.astype("int64")
+        window_ids = ts_ns // freq_ns
+        log_p = np.log(raw_df["price"].to_numpy())
+        out_rows: list[dict] = []
+        # Contiguous-block splitting (same O(n) pattern as TSRV)
+        unique_wids, first_idx = np.unique(window_ids, return_index=True)
+        for i, wid in enumerate(unique_wids):
+            s = int(first_idx[i])
+            e = int(first_idx[i + 1]) if i + 1 < len(unique_wids) else len(raw_df)
+            if e - s < 2:
+                continue
+            rets = np.diff(log_p[s:e])
+            rv = float(np.sum(rets ** 2))
+            ts = pd.Timestamp(int(wid) * freq_ns, unit="ns", tz="UTC")
+            out_rows.append({"timestamp": ts, "rv": rv})
+        out = pd.DataFrame(out_rows).set_index("timestamp")
+        return out
+
+    # Build the baseline stats
+    baseline = aggregate_by_window(raw)
+    assert len(baseline) >= 5, "need multiple windows for the probe"
+
+    # Pick a T that is the START of a middle window — the stat at T must
+    # depend only on ticks in [T, T+freq), so any mutation at index >= T+freq
+    # must not change the output at T.
+    T = baseline.index[len(baseline) // 2]
+    # The mutation mask: future = strictly-after (T + freq) — i.e., rows
+    # outside the [T, T+freq) window AND after it. Within-window ticks
+    # are EXPECTED to be read (that's the correct START-stamped semantic).
+    next_window_start = T + freq
+
+    def future_mask(idx: pd.DatetimeIndex, t: pd.Timestamp) -> np.ndarray:
+        return np.asarray(idx >= next_window_start)
+
+    result = probe_causality_by_mutation(
+        aggregate_by_window, raw, T,
+        mutation_cols=["price"],
+        mutation_mask=future_mask,
+        atol=0.0,
+    )
+    assert result.passed, result.detail
+    assert result.metric == 0.0
+
+
+def test_tsrv_centered_window_would_fail_probe() -> None:
+    """Negative-control: a centered-window aggregator (which WOULD leak)
+    must be caught by the same probe. Lock the probe's sensitivity.
+    """
+    from vol_model.leakage_probes import probe_causality_by_mutation
+
+    rng = np.random.default_rng(1)
+    n_ticks = 500
+    tick_idx = pd.date_range(
+        "2024-01-01 00:00:00", periods=n_ticks, freq="1min", tz="UTC",
+    )
+    prices = 50_000.0 + rng.standard_normal(n_ticks).cumsum() * 10.0
+    raw = pd.DataFrame({"price": prices}, index=tick_idx)
+
+    freq = pd.Timedelta(minutes=15)
+    half = freq / 2
+
+    def centered_aggregator(raw_df: pd.DataFrame) -> pd.DataFrame:
+        """Deliberately-leaky: computes RV over [T-freq/2, T+freq/2]."""
+        out_rows: list[dict] = []
+        # Emit one stat per 15-minute grid point, using a centered window.
+        grid = pd.date_range(
+            raw_df.index[0] + half, raw_df.index[-1] - half, freq=freq,
+        )
+        for T in grid:
+            mask = (raw_df.index >= T - half) & (raw_df.index < T + half)
+            p = np.log(raw_df.loc[mask, "price"].to_numpy())
+            if len(p) < 2:
+                continue
+            out_rows.append({"timestamp": T, "rv": float(np.sum(np.diff(p) ** 2))})
+        return pd.DataFrame(out_rows).set_index("timestamp")
+
+    baseline = centered_aggregator(raw)
+    T = baseline.index[len(baseline) // 2]
+
+    result = probe_causality_by_mutation(
+        centered_aggregator, raw, T,
+        mutation_cols=["price"],
+        atol=0.0,
+    )
+    # A centered window at T READS rows in [T, T+half) as well as
+    # [T-half, T). Mutating raw at indices > T will change RV at T.
+    # So this MUST fail — confirming the probe's sensitivity.
+    assert not result.passed, (
+        "centered-window aggregator should fail causality probe; "
+        "if this test stops catching it, the probe is broken"
+    )

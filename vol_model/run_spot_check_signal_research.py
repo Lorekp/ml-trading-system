@@ -48,6 +48,8 @@ from vol_model.signal_research import (
     spread_abs_error_correlation,
     train_feature_augmented_lgbm,
     train_har_residual_lgbm,
+    train_jump_decomp_dual_head,
+    train_multihorizon_reconciled,
     train_pruned_svi_baseline,
     train_quantile_lgbm,
 )
@@ -321,7 +323,27 @@ def run_augmented_for_month(
             logger.exception("  [%s] failed to align fresh-control baseline; falling back to stale", thread)
 
     t0 = time.time()
-    preds, n_used = train_feature_augmented_lgbm(month, n_trials=n_trials, patience=patience)
+    if thread.endswith("_jump_decomp"):
+        # Session I Candidate I-1: dual-head HAR-CJ trainer. Same feature
+        # matrix as the corresponding baseline (e.g. ``har_pd``); novelty
+        # is in the target decomposition + variance-space combination.
+        # Wall-clock is ~2x because of two independent Optuna searches.
+        preds, n_used = train_jump_decomp_dual_head(
+            month, ctx, n_trials=n_trials, patience=patience,
+        )
+    elif thread.endswith("_multihorizon"):
+        # Session I Candidate I-2: multi-horizon base+delta reconciliation.
+        # Trains 15m and 60m heads (two Optuna searches), then fits a
+        # linear meta-combiner on the val slice to produce a reconciled
+        # 15m forecast. Wall-clock ~2.3x because of two searches + meta-
+        # combiner OLS fit.
+        preds, n_used = train_multihorizon_reconciled(
+            month, ctx, n_trials=n_trials, patience=patience,
+        )
+    else:
+        preds, n_used = train_feature_augmented_lgbm(
+            month, n_trials=n_trials, patience=patience,
+        )
     n_features = month.X_month.shape[1]
     return evaluate_candidate(
         preds, month,

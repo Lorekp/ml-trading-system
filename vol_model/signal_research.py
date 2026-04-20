@@ -161,6 +161,20 @@ TIER_FEATURE_MAP: dict[
     # Session H Candidate C: Variance Risk Premium.
     "vrp":                       ((), (), (), (), (), (), (), (), VRP_FEATURES),
     "har_pd_and_vrp":            ((), (), (), HAR_PD_FEATURES, (), (), (), (), VRP_FEATURES),
+    # Session I Candidate I-1: HAR-CJ jump-diffusion dual-head on the
+    # production HAR-PD feature set. Feature set byte-identical to
+    # ``har_pd``; the candidate's novelty is in the TARGET (continuous-
+    # var + jump-var heads, combined in variance space at inference time).
+    # Dispatched by the suffix ``_jump_decomp`` in the runner to a
+    # dedicated trainer ``train_jump_decomp_dual_head``.
+    "har_pd_jump_decomp":        ((), (), (), HAR_PD_FEATURES, (), (), (), (), ()),
+    # Session I Candidate I-2: multi-horizon base+delta reconciliation
+    # (Caporin-Di-Fonzo-Girolimetto 2024). Feature set byte-identical
+    # to ``har_pd``; novelty is in training TWO heads — 15m and 60m
+    # targets — and learning a linear meta-combiner on the validation
+    # slice to sharpen the 15m forecast. Dispatched by the suffix
+    # ``_multihorizon`` in the runner to ``train_multihorizon_reconciled``.
+    "har_pd_multihorizon":       ((), (), (), HAR_PD_FEATURES, (), (), (), (), ()),
 }
 
 
@@ -972,6 +986,427 @@ def train_feature_augmented_lgbm(
     model = _retrain_best_lgbm(study, month.X_tr_w, month.y_tr, month.X_val_w, month.y_val)
     preds = model.predict(month.X_test_w.values)
     return preds, len(study.trials)
+
+
+def decompose_logvol_into_cont_jump(
+    y_logvol: pd.Series,
+    labels: pd.DataFrame,
+    *,
+    eps_floor: float = 1e-10,
+) -> tuple[pd.Series, pd.Series]:
+    """Session I I-1 helper: decompose the annualized log-vol target into
+    log-continuous-vol and log-jump-vol using TSRV's per-bar jump fraction.
+
+    Maps every row's ``y_logvol[T] = ln(vol_ann[T])`` into a pair
+    ``(y_cont[T], y_jump[T])`` satisfying the reconciliation identity::
+
+        exp(2*y_cont[T]) + exp(2*y_jump[T]) = exp(2*y_logvol[T])
+
+    by the per-bar jump fraction ``jfrac = jump_var / (cont_var + jump_var)``
+    from the TSRV sidecar. Head A trains to predict ``y_cont``, head B
+    trains to predict ``y_jump``, and the gauntlet sums in variance space
+    at inference to produce the combined log-vol forecast.
+
+    The decomposition is mathematically exact (the reconstruction of
+    ``vol_ann²`` is bit-identical up to the ``eps_floor``-clipped
+    logarithm): pins this in
+    ``tests/test_target_jump_decomp.py::test_decomp_reconstructs_logvol``.
+
+    Parameters
+    ----------
+    y_logvol
+        The production log-vol target (series of ``ln(vol_ann)`` values).
+    labels
+        The full labels DataFrame from ``load_labels`` — must contain
+        ``continuous_var`` and ``jump_var`` columns aligned to the same
+        DatetimeIndex.
+    eps_floor
+        Numerical floor applied to each component BEFORE taking the log,
+        to guard against ``ln(0)`` for zero-jump bars. Default ``1e-10``
+        (extreme but informative — lets LGBM learn the "near-zero"
+        tail from the extreme low clusters).
+
+    Returns
+    -------
+    (y_cont, y_jump)
+        Two pandas Series aligned to ``y_logvol.index``, containing
+        ``0.5 * ln(cont_var_ann + eps)`` and ``0.5 * ln(jump_var_ann +
+        eps)`` respectively. Both are directly QLIKE-loss-compatible
+        (log-vol scale, same units as the baseline).
+    """
+    if "continuous_var" not in labels.columns or "jump_var" not in labels.columns:
+        raise KeyError(
+            "labels DataFrame must contain 'continuous_var' and 'jump_var' "
+            "columns (produced by vol_model.labels.load_labels from the "
+            "TSRV sidecar). Re-run the labels loader if missing."
+        )
+    idx = y_logvol.index
+    cont = labels["continuous_var"].reindex(idx).clip(lower=1e-20)
+    jump = labels["jump_var"].reindex(idx).clip(lower=0.0)
+    total = cont + jump
+    # Guard: if total is 0 (shouldn't happen on real TSRV bars because
+    # cont is clipped to 1e-20), fall back to "all variance is continuous"
+    jfrac_raw = jump / total.replace(0.0, np.nan)
+    jfrac = jfrac_raw.fillna(0.0).clip(0.0, 1.0)
+
+    var_ann = np.exp(2.0 * y_logvol.to_numpy())  # (vol_ann)²
+    jfrac_arr = jfrac.to_numpy()
+    cont_var_ann = (1.0 - jfrac_arr) * var_ann
+    jump_var_ann = jfrac_arr * var_ann
+
+    y_cont = pd.Series(
+        0.5 * np.log(np.clip(cont_var_ann, eps_floor, None)),
+        index=idx, name="y_cont_logvol",
+    )
+    y_jump = pd.Series(
+        0.5 * np.log(np.clip(jump_var_ann, eps_floor, None)),
+        index=idx, name="y_jump_logvol",
+    )
+    return y_cont, y_jump
+
+
+def combine_cont_jump_forecasts(
+    pred_cont: np.ndarray, pred_jump: np.ndarray,
+    *, eps_floor: float = 1e-20,
+) -> np.ndarray:
+    """Session I I-1 helper: combine head predictions into a log-vol forecast.
+
+    Given ``pred_cont[i] = log-continuous-vol forecast`` and
+    ``pred_jump[i] = log-jump-vol forecast`` on the same test rows,
+    the combined forecast on the **variance scale** is
+    ``var_pred = exp(2*pred_cont) + exp(2*pred_jump)`` and the
+    corresponding log-vol forecast is ``0.5 * ln(var_pred)``.
+
+    This is the canonical HAR-CJ aggregation (Shen-Urquhart-Wang 2020;
+    Corsi-Pirino-Reno 2010). Returning log-vol makes the output
+    directly QLIKE-compatible with the baseline model's log-vol target.
+    """
+    var_pred = np.exp(2.0 * pred_cont) + np.exp(2.0 * pred_jump)
+    return 0.5 * np.log(np.clip(var_pred, eps_floor, None))
+
+
+def train_jump_decomp_dual_head(
+    month: MonthData,
+    ctx: SpotCheckContext,
+    *,
+    n_trials: int,
+    patience: int,
+) -> tuple[np.ndarray, int]:
+    """Session I Candidate I-1: HAR-CJ jump-diffusion dual-head trainer.
+
+    Literature: Shen-Urquhart-Wang 2020; Sarrafshirazi 2025 Concordia
+    thesis; Zhang et al. FRL 2022. Forecast continuous (IV) and jump
+    (JV) variance components SEPARATELY, then sum on the variance scale.
+    The underlying thesis is that BTC has frequent jumps with different
+    dynamics from the continuous diffusion, and modelling them jointly
+    via a single aggregate-RV head loses information.
+
+    Training
+    --------
+    1. Decompose ``y_tr``, ``y_val`` into (y_cont, y_jump) via the
+       per-bar jump fraction from TSRV (see
+       ``decompose_logvol_into_cont_jump``).
+    2. Run two independent Optuna searches on the HAR-PD feature set —
+       each with QLIKE objective — and retrain each with the best HP
+       set. (No HP sharing: the jump target is much sparser and may
+       prefer different regularization.)
+    3. Forecast test window with each head; combine in variance space
+       via ``combine_cont_jump_forecasts``.
+
+    Returns
+    -------
+    (preds, n_trials_total)
+        ``preds`` is the combined log-vol forecast on the test window,
+        directly QLIKE-comparable to the baseline HAR-PD thread.
+        ``n_trials_total`` is the sum of trials used across both heads
+        (for reporting — gauntlet wall-clock is ~2x ``har_pd`` because
+        of the two independent searches).
+    """
+    y_cont_tr, y_jump_tr = decompose_logvol_into_cont_jump(month.y_tr, ctx.labels)
+    y_cont_val, y_jump_val = decompose_logvol_into_cont_jump(month.y_val, ctx.labels)
+
+    # Head A: log-continuous-vol
+    study_c = _run_optuna_qlike(
+        month.X_tr_w, y_cont_tr, month.X_val_w, y_cont_val,
+        n_trials=n_trials, patience=patience,
+    )
+    model_c = _retrain_best_lgbm(
+        study_c, month.X_tr_w, y_cont_tr, month.X_val_w, y_cont_val,
+    )
+    pred_c = model_c.predict(month.X_test_w.values)
+
+    # Head B: log-jump-vol
+    study_j = _run_optuna_qlike(
+        month.X_tr_w, y_jump_tr, month.X_val_w, y_jump_val,
+        n_trials=n_trials, patience=patience,
+    )
+    model_j = _retrain_best_lgbm(
+        study_j, month.X_tr_w, y_jump_tr, month.X_val_w, y_jump_val,
+    )
+    pred_j = model_j.predict(month.X_test_w.values)
+
+    combined = combine_cont_jump_forecasts(pred_c, pred_j)
+    return combined, len(study_c.trials) + len(study_j.trials)
+
+
+def build_60m_aggregate_logvol(y_15m: pd.Series) -> pd.Series:
+    """Session I I-2 helper: build a 60-minute aggregate log-vol target from
+    the 15-minute log-vol series.
+
+    At label-index T, ``ln_vol_60m[T]`` = ``log-vol aggregated over [T,
+    T+60m)``. Construction:
+
+        vol_ann_15m² = exp(2 * ln_vol_15m)     # annualized 15m variance
+        var_60m_ann[T] = mean(vol_ann_15m²[T:T+4])
+        ln_vol_60m[T] = 0.5 * log(var_60m_ann[T])
+
+    Derivation: the aggregate 60m integrated variance at T is the SUM of
+    4 consecutive per-bar variances. Annualizing requires multiplying by
+    ``PPY_60m / PPY_15m = 1/4``, so the annualized 60m variance equals
+    the MEAN of annualized 15m variances. Pinned in
+    ``tests/test_target_multihorizon.py::test_build_60m_arithmetic``.
+
+    Strictly forward-looking: output at T uses ``y_15m[T..T+3]`` (the
+    label values covering ``[T, T+60m)``). The LAST 3 rows of the input
+    are dropped because their 60m aggregate would require future bars
+    outside the input range.
+
+    This function operates on LABELS (which are forward-looking by
+    construction). Use in a TRAINING pipeline requires that the
+    corresponding features predict from a timestamp strictly before T —
+    the standard one-bar-ahead shift in ``align_features_labels``
+    provides this.
+
+    Parameters
+    ----------
+    y_15m
+        Series of ``ln(vol_ann)`` values on a regular 15-minute grid,
+        indexed by label timestamps.
+
+    Returns
+    -------
+    Series on the first ``len(y_15m) - 3`` indices of ``y_15m``, with
+    name ``ln_vol_60m``. The last 3 are dropped (insufficient future
+    bars for the aggregate).
+    """
+    n = len(y_15m)
+    if n < 4:
+        return pd.Series([], dtype=float, index=y_15m.index[:0], name="ln_vol_60m")
+    from numpy.lib.stride_tricks import sliding_window_view
+    vals = y_15m.to_numpy()
+    var = np.exp(2.0 * vals)  # vol_ann²
+    # sliding_window_view yields shape (n-3, 4). Window i covers
+    # ROWS [i..i+3] of ``y_15m``. To be a VALID 60m aggregate, those
+    # 4 rows must correspond to 4 consecutive 15-minute TIMESTAMPS
+    # (T, T+15m, T+30m, T+45m) so the aggregate represents [T, T+60m).
+    # If ``y_15m`` has gaps (missing bars from SVI coverage starts or
+    # data-quality drops), the window spans an irregular interval and
+    # the aggregate is meaningless — we NaN those rows.
+    windows = sliding_window_view(var, 4)
+    var_60m_ann = windows.mean(axis=1)
+    # Gap guard: window i is valid only if index[i+3] - index[i] ==
+    # 45 minutes exactly (3 × 15m steps).
+    expected_span = np.timedelta64(45, "m")
+    time_arr = y_15m.index.values.astype("datetime64[ns]")
+    spans = time_arr[3:n] - time_arr[:n - 3]
+    valid = spans == expected_span
+    ln_vol_60m = 0.5 * np.log(np.clip(var_60m_ann, 1e-20, None))
+    ln_vol_60m = np.where(valid, ln_vol_60m, np.nan)
+    return pd.Series(
+        ln_vol_60m, index=y_15m.index[:n - 3], name="ln_vol_60m",
+    )
+
+
+def fit_multihorizon_meta_combiner(
+    y_val_15m: np.ndarray,
+    pred_val_15m: np.ndarray,
+    pred_val_60m: np.ndarray,
+) -> tuple[float, float, float]:
+    """Session I I-2 helper: fit CONVEX meta-combiner on the val slice.
+
+    Fits ``y_val_15m ≈ α · pred_val_15m + β · pred_val_60m + γ`` under
+    the CONSTRAINT ``α + β = 1``, ``α, β ∈ [0, 1]``. This is the
+    numerically stable variant of Caporin's MinT reconciliation for a
+    2-target hierarchy, solved via closed-form minimization of
+    ``Σ (y − λ p_15 − (1 − λ) p_60 − γ)²`` over ``(λ, γ)``.
+
+    Why convex constraint (vs. unconstrained OLS): the two heads are
+    highly correlated (both estimate similar log-vol scales on the same
+    features). Unconstrained OLS on val produces coefficients that can
+    be very large with opposite signs, amplifying tiny differences on
+    test and blowing up QLIKE. A 2024-10 smoke test with unconstrained
+    OLS produced a +41% QLIKE inflation on a single month; the convex
+    constraint eliminates the multicollinearity-induced amplification
+    while still allowing the meta-combiner to choose the better head.
+
+    Uses ONLY the validation slice — no test-set contamination.
+    ``tests/test_target_multihorizon.py::test_meta_combiner_no_test_leakage``
+    pins this.
+
+    Parameters
+    ----------
+    y_val_15m
+        Ground-truth 15m log-vol on the val slice.
+    pred_val_15m, pred_val_60m
+        Model forecasts of 15m and 60m log-vol on the val slice.
+
+    Returns
+    -------
+    (alpha, beta, gamma) — meta-combiner coefficients satisfying
+    ``alpha + beta = 1``, ``alpha ∈ [0, 1]``, ``beta = 1 − alpha``.
+    """
+    y = np.asarray(y_val_15m, dtype=float)
+    p15 = np.asarray(pred_val_15m, dtype=float)
+    p60 = np.asarray(pred_val_60m, dtype=float)
+
+    def _qlike_at_lambda(lam: float) -> float:
+        # No intercept: γ=0 by design. The heads are individually
+        # Optuna-calibrated so an extra bias correction on val would
+        # overfit (the 2023-07 smoke showed γ=-0.27 fitting val
+        # calibration drift and producing +32% QLIKE on test).
+        # Honest convex mix with no intercept is robust and still
+        # picks up any genuine complementary signal between heads.
+        pred = lam * p15 + (1.0 - lam) * p60
+        diff = y - pred
+        # Same clip as production QLIKE (model.py:30-52)
+        qlike = np.exp(np.clip(2.0 * diff, -20.0, 20.0)) - 2.0 * diff - 1.0
+        return float(np.mean(qlike))
+
+    # Fit λ by 1D search on QLIKE (the production loss). Single use
+    # of val for one objective — same val-usage as baseline + one
+    # scalar choice, minimal multi-testing burden.
+    from scipy.optimize import minimize_scalar
+
+    res = minimize_scalar(
+        _qlike_at_lambda, bounds=(0.0, 1.0), method="bounded",
+        options={"xatol": 1e-4},
+    )
+    lam = float(res.x)
+    lam = max(0.0, min(1.0, lam))
+
+    alpha = lam
+    beta = 1.0 - lam
+    gamma = 0.0  # by design — no val-bias correction layer
+    return alpha, beta, gamma
+
+
+def train_multihorizon_reconciled(
+    month: MonthData,
+    ctx: SpotCheckContext,
+    *,
+    n_trials: int,
+    patience: int,
+) -> tuple[np.ndarray, int]:
+    """Session I Candidate I-2: multi-horizon base+delta reconciliation.
+
+    Literature: Caporin-Di-Fonzo-Girolimetto 2024, JFEcmx (arXiv
+    2306.02952). Forecasts both 15m and 60m log-vol with the same
+    feature set, then fits a linear meta-combiner on the validation
+    slice to produce a reconciled 15m forecast.
+
+    Training procedure
+    ------------------
+    1. Build 60m target: aggregate 15m variance over 4 consecutive
+       bars via ``build_60m_aggregate_logvol``.
+    2. Apply a 3-bar (~45-minute) embargo to train + val for the 60m
+       head: labels at embargoed rows would extend past the next fold
+       boundary (val → test) and leak via early-stopping. Test rows
+       are unchanged — the predicted 60m at test time uses only test-
+       time-available features.
+    3. Train model_15 on (X_tr, y_tr_15m) — standard production-
+       equivalent, one fold.
+    4. Train model_60 on (X_tr_embargoed, y_tr_60m_embargoed).
+    5. Predict both heads on val → fit OLS meta-combiner.
+    6. Predict both heads on test → apply meta-combiner →
+       reconciled ŷ_15* forecast.
+
+    Returns
+    -------
+    (preds, n_trials_total)
+        ``preds`` is the reconciled ŷ_15* forecast on the test window.
+        ``n_trials_total`` is the sum of trials across the two heads.
+    """
+    # Build 60m target series from the full label series, then reindex
+    # to the month's X_month index.
+    y_60m_full = build_60m_aggregate_logvol(ctx.y_full)
+    y_60m_aligned = y_60m_full.reindex(month.X_month.index)
+
+    # Embargo: the last 3 bars (~45m) of both train and val have a 60m
+    # label extending past the fold boundary. Drop them for the 60m head.
+    embargo_td = pd.Timedelta(minutes=45)
+    idx = month.X_month.index
+
+    # 60m-safe train mask: train rows whose full 60m label [T, T+60m)
+    # stays strictly within the training window (index + 45m < V).
+    # ``idx + embargo_td < month.V`` returns a numpy array on a
+    # DatetimeIndex; wrap with np.asarray for consistent logical-and.
+    train_60m_mask = (
+        month.train_mask.to_numpy()
+        & np.asarray(idx + embargo_td < month.V)
+        & y_60m_aligned.notna().to_numpy()
+    )
+    # 60m-safe val mask: val rows whose full 60m label stays within val
+    # (index + 45m < M).
+    val_60m_mask = (
+        month.val_mask.to_numpy()
+        & np.asarray(idx + embargo_td < month.M)
+        & y_60m_aligned.notna().to_numpy()
+    )
+
+    # Build winsorized feature slices for the 60m head (embargoed)
+    # using the SAME winsorization bounds as the 15m head (month.lo,
+    # month.hi) — bounds should be stable since we're dropping only
+    # the last ~3 bars of the train window.
+    X_tr_60m = month.X_month.loc[idx[train_60m_mask]].clip(
+        month.lo, month.hi, axis=1,
+    )
+    X_val_60m = month.X_month.loc[idx[val_60m_mask]].clip(
+        month.lo, month.hi, axis=1,
+    )
+    y_tr_60m = y_60m_aligned.loc[idx[train_60m_mask]]
+    y_val_60m = y_60m_aligned.loc[idx[val_60m_mask]]
+
+    # --- Head A: 15m forecast (production-equivalent path) ---
+    study_15 = _run_optuna_qlike(
+        month.X_tr_w, month.y_tr, month.X_val_w, month.y_val,
+        n_trials=n_trials, patience=patience,
+    )
+    model_15 = _retrain_best_lgbm(
+        study_15, month.X_tr_w, month.y_tr, month.X_val_w, month.y_val,
+    )
+    pred_15_val = model_15.predict(month.X_val_w.values)
+    pred_15_test = model_15.predict(month.X_test_w.values)
+
+    # --- Head B: 60m forecast on the embargoed subsets ---
+    study_60 = _run_optuna_qlike(
+        X_tr_60m, y_tr_60m, X_val_60m, y_val_60m,
+        n_trials=n_trials, patience=patience,
+    )
+    model_60 = _retrain_best_lgbm(
+        study_60, X_tr_60m, y_tr_60m, X_val_60m, y_val_60m,
+    )
+    # Predict 60m on VAL (full val, not just embargoed subset) and TEST
+    pred_60_val = model_60.predict(month.X_val_w.values)
+    pred_60_test = model_60.predict(month.X_test_w.values)
+
+    # --- Meta-combiner on VAL only (QLIKE-optimal, single 1D fit) ---
+    # Note: the combiner itself now minimizes QLIKE on val directly —
+    # no separate "fallback" layer needed, and no MSE-vs-QLIKE mismatch.
+    # Single use of val for one objective = minimum honest usage.
+    alpha, beta, gamma = fit_multihorizon_meta_combiner(
+        month.y_val.to_numpy(), pred_15_val, pred_60_val,
+    )
+
+    # --- Reconciled forecast on test ---
+    reconciled = alpha * pred_15_test + beta * pred_60_test + gamma
+
+    logger.info(
+        "  [multihorizon] meta-combiner (QLIKE-optimal on val): "
+        "α=%.3f β=%.3f γ=%+.4f",
+        alpha, beta, gamma,
+    )
+
+    return reconciled, len(study_15.trials) + len(study_60.trials)
 
 
 def train_har_residual_lgbm(

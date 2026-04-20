@@ -29,16 +29,19 @@ Data source
 Sidecar parquet at ``vol_arb/output/rough_heston_features_15m.parquet``,
 produced by ``python -m vol_arb.build_rough_heston_sidecar``. Full rough-
 Heston calibration (El Euch-Rosenbaum fractional Riccati via
-Diethelm-Ford-Freed Adams scheme, Carr-Madan FFT pricing, SLSQP with
-Nelder-Mead global search + SLSQP polish) to the Deribit BTC options
-trade panel in ±30-min window around each 1h bucket, warm-started across
-buckets for ~240 ms/bucket sustained throughput.
+Diethelm-Ford-Freed Adams scheme, Heston Pi_1/Pi_2 pricing, SLSQP + LM
+polish with differential-evolution cold-start) to the Deribit BTC options
+trade panel in a **backward-only 30-minute window** ``[T - 30min, T)`` at
+each 1h bucket, warm-started across buckets.
 
 Leakage safety
 --------------
-Each calibration at bucket T uses ONLY option trades in [T-30min, T).
-The forward-fill propagates values from past buckets. The ``.diff(4)``
-delta uses only past values.
+Each calibration at bucket T uses ONLY option trades in ``[T-30min, T)``
+(strictly past). The 15m forward-fill propagates values from past buckets
+up to 45 minutes forward. The ``.diff(4)`` delta uses only past values.
+The loader applies a ``+15m`` index shift, identical to SVI-ATM / SVI
+surface / Hawkes-OFI convention; ensures strict causality with an
+additional 15-minute safety margin.
 
 ``compute_rough_heston_features`` is a pure projection of the sidecar —
 it must pass ``probe_causality_by_mutation``. See

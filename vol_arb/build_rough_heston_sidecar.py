@@ -3,7 +3,9 @@
 For each 1-hour bucket timestamp T in the target window (default 2021-12 →
 2026-03), calibrate the 4-parameter rough-Heston model (V_0, H, eta, rho,
 with kappa + theta pinned per Bayer-Friz-Gatheral 2016 convention) to the
-trade-by-trade Deribit BTC options panel in the ±1h window around T.
+trade-by-trade Deribit BTC options panel in a STRICTLY PAST, 30-minute
+window ``[T - 30min, T)``. A centered window around T would LEAK future
+information; a backward-only window is the correct causal form.
 
 Runtime on 4 workers: ~30-45 min (warm-started calibration ~240ms/bucket,
 44K buckets total).
@@ -62,7 +64,19 @@ FEATURES_1H_PATH = OUTPUT_DIR / "rough_heston_features_1h.parquet"
 FEATURES_15M_PATH = OUTPUT_DIR / "rough_heston_features_15m.parquet"
 
 BUCKET_FREQ = "1h"
-WINDOW_SIDE_MINUTES = 30   # ±30min around bucket → 1h window width
+# Backward-only 30-minute window: bucket T uses trades in ``[T - 30min, T)``
+# (see ``_panel_for_bucket``). The variable is named ``SIDE`` for historical
+# reasons — it is NOT a half-width of a centered window. A centered ±30min
+# window around T would include trades at timestamps > T and would LEAK.
+#
+# DEFERRED (tracked in the Session G memory entry, not this cycle): widening
+# the window to ``[T - 1h, T)`` would use all trades in the preceding hour
+# instead of half of them (trades in ``[T - 60min, T - 30min)`` are
+# currently discarded by the sidecar but are strictly past relative to T,
+# so the widening is leak-free). Estimated +~30% panel density, potentially
+# better RMSE at thin-trading buckets. Keep the 30-minute form here so the
+# Session G gauntlet evaluates the same panel definition G.1 diagnosed on.
+WINDOW_SIDE_MINUTES = 30
 DTE_MIN_DAYS = 0.5
 DTE_MAX_DAYS = 90.0
 

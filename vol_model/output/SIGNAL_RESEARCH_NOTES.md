@@ -1340,5 +1340,316 @@ Outputs:
   (rh_v0, rh_hurst, rh_eta, rh_rho) forward-filled to 15m grid + 4
   one-hour deltas via .diff(4).
 
-[STATUS: building. Update on completion.]
+Actual build (2026-04-19 → 2026-04-20): the initial attempt hung silently
+for 13 hours with no bucket output. Divide-and-conquer profiling
+surfaced two compounding bugs (both fixed in commit `823c6b7`, **Session
+G.4a-c**):
 
+1. **tau-groupby bug** (~100× slowdown). `_panel_for_bucket` grouped
+   options by per-trade continuous `tau_year`, so a single panel held
+   ~50-100 unique taus (one per trade timestamp) instead of ~4-8 discrete
+   Deribit expiries. The calibrator's per-tau CF loop ran ~50× more
+   evaluations per DE step than intended. Fix: group by `expiry`
+   (discrete) and compute `tau_year` uniformly per-expiry from a single
+   `bucket_end` reference.
+2. **Warm-chain breaking on regime transitions**. Calibrator's internal
+   `warm_rescue_threshold=0.10` (10vp) and the sidecar's "discard warm
+   fit if RMSE > 15vp" used different thresholds. Warm fits landing at
+   10–15vp (above rescue margin, below sidecar rejection margin) were
+   accepted internally but then the sidecar dropped `prev_fit`, forcing
+   cold DE on every subsequent bucket. Fix: retain `prev_fit` on any
+   `calibration_level > 0`; lower sidecar rescue threshold to 0.10 for
+   alignment.
+3. **Silent workers on Windows multiprocessing**. `logger.info` calls in
+   `_process_month` never emitted because `multiprocessing` workers do
+   not inherit the parent's `basicConfig`. Fix: added a
+   `_worker_logging_init` `ProcessPoolExecutor` initializer that
+   re-installs `basicConfig` in each worker at pool-launch time. Also
+   added a per-100-bucket heartbeat + per-month completion log so silent
+   hangs are immediately visible.
+
+After the G.4a-c fix, the build ran at ~2h wall-clock per month on 1
+worker (smoke test), projecting ~8-10h at 12 workers. **User flagged
+still-slow** → **Session G.4d (Numba JIT)** on the Adams predictor-
+corrector inner loop. Compile-once `@njit(cache=True, fastmath=False)`
+with buffer reuse and inlined `F(ψ)`; 36-parametrization regression test
+`test_jit_fractional_riccati_matches_closure_version` verifies
+bit-identical output vs the pure-numpy closure path at `rtol=1e-12,
+atol=1e-15`. 67/67 rough-Heston tests green. Cold DE 432s→26s on real
+panels; warm LM 8–18s→1–2s. Committed as `21647ab`.
+
+**Final rebuild at 12 workers (2026-04-19 19:33 → 2026-04-20 02:07)**:
+- Wall-clock: 23,670 s (**6.58 h**) for 52 months
+- Rows: 37,916 hourly buckets (1h cadence, 2021-12 → 2026-03)
+- Buckets with `calibration_level > 0`: **37,430 (98.7 %)**
+- Per-month success rates: 99.7–100% (all months >= 99.5%)
+- Cold starts: 1 per month (first bucket); rest warm-chain (98%+
+  warm-retention, confirms the G.4a-c fix)
+- Avg cold-DE wall-clock per bucket: ~500–1000 s (depends on panel size)
+- Avg warm-LM wall-clock per bucket: ~1–3 s
+
+15m sidecar derivation:
+- `vol_arb/output/rough_heston_features_15m.parquet` — 151,868 rows
+- Coverage per column (gated at ≥75% by
+  `tests/test_features_rough_heston.py::test_coverage_on_real_sidecar`):
+  - `rh_v0` / `rh_hurst` / `rh_eta` / `rh_rho` (levels): **96.6%**
+  - `*_d1h` (deltas): **94.3%** (lower due to warmup of `.diff(4)`)
+
+Parameter-range sanity (on real sidecar, 37,430 fitted buckets):
+- V_0 > 0 ∀ rows. p99 < 25.0 (no bound-cluster).
+- H ∈ (0, 0.5] ∀ rows. Median within crypto-empirical range [0.03, 0.40].
+- η > 0 ∀ rows.
+- ρ ∈ (−1, 1) ∀ rows. Median < 0.3 (consistent with leverage effect).
+
+All feature tests pass including the canonical **real-data
+`probe_causality_by_mutation`** at `T=2023-06-15 12:00 UTC`: mutating all
+sidecar rows at index > T with a random sentinel leaves
+`compute_rough_heston_features(sidecar).loc[T]` byte-identical. **Zero
+leakage.**
+
+---
+
+## G.5: Feature tests on real sidecar — PASS
+
+`pytest tests/test_features_rough_heston.py -v` — 8/8 green:
+- Schema: 8 cols (4 levels + 4 deltas), float64, DatetimeIndex.
+- Byte-identity: level features are exact copies of sidecar columns.
+- `probe_causality_by_mutation` on synthetic sidecar — PASS.
+- `probe_causality_by_mutation` on real sidecar at T=2023-06-15 — PASS.
+- Coverage ≥ 75% per column — actual 96.6% / 94.3% (huge margin).
+- Parameter-range sanity — all pass.
+
+---
+
+## G.6: Gauntlet — REJECTED at pre-screen gate
+
+Pre-registered gate (from plan, Phase 1C-bis G.6): on the stacked-vs-
+HAR-PD differential (`har_pd_and_rough_heston` vs `har_pd`):
+- avg ΔQLIKE ≤ **−1.5pp** AND
+- ≥ **5/8** months improved AND
+- IS-vs-OOS Spearman gap < 30% relative
+
+### First-run aborted by scrap threshold — diagnosis
+
+The gauntlet's default asymmetric `--scrap-threshold-pct 5.0` kicked in
+on 2022-12: **`har_pd` itself** (current production, certified at
+ΔQLIKE −3.67% on 50 months) produced +11.94% on the 2022-12 FTX month,
+triggering the scrap cascade on all three candidate threads at month 2
+of 8. `rough_heston` standalone +13.57%, `har_pd_and_rough_heston`
++18.23% — also scrapped.
+
+The scrapped artifacts are preserved at:
+- `vol_model/output/signal_research_spot_check_results.scrapped_run.csv`
+- `vol_model/output/signal_research_session_g_gauntlet.scrapped_run.log`
+
+Given that `har_pd`-on-2022-12 was +0.55% in Session F (same feature
+pipeline, byte-identical code, Optuna+LightGBM both seeded at 42) and
+is +11.94% here — reproducibly across both runs — there is a
+cross-session state difference we haven't fully traced (TransVol
+embeddings are from Apr 9; HAR-PD sidecar from Apr 17; baseline
+predictions from Apr 11; no git diff in `vol_model/signal_research.py`
+or `vol_model/features/har_pd.py` since Session F). Most parsimonious
+remaining hypothesis: the repo state includes a silently regenerated
+feature cache (e.g. `BTCUSDT_features_engineered.parquet` or similar)
+that was overwritten between sessions. Left for a future data-state
+audit. This does not affect the Session G decision because the
+**within-session** stacked-vs-HAR-PD differential is the honest
+comparison and remains well-defined.
+
+### Full 8-month rerun (scrap disabled)
+
+Command: `python -m vol_model.run_spot_check_signal_research
+--thread control,har_pd,rough_heston,har_pd_and_rough_heston
+--n-trials 80 --patience 25 --scrap-threshold-pct 100`
+
+Wall-clock: 1h22m. CSV saved to
+`vol_model/output/signal_research_spot_check_results.csv`.
+
+**Per-thread averages vs stale baseline (production pruned_svi_v1)**:
+
+| Thread | Avg ΔQLIKE | Wins (Δ<0) |
+|---|---|---|
+| `har_pd` | −1.43% | 6/8 |
+| `har_pd_and_rough_heston` | −0.43% | 5/8 |
+| `rough_heston` (standalone) | +1.35% | 3/8 |
+
+**Per-month stacked-vs-HAR-PD differential** (the decision metric):
+
+| Month | `har_pd` Δ% | `har_pd_and_rough_heston` Δ% | Differential (pp) |
+|---|---|---|---|
+| 2022-11 (FTX-1) | −0.45% | +0.34% | **+0.79** (rH hurts) |
+| 2022-12 (FTX-2) | +11.94% | +18.23% | **+6.29** (rH hurts) |
+| 2023-01 (post-FTX) | −9.07% | −9.87% | −0.80 (rH helps) |
+| 2023-07 (calm) | +1.72% | −1.36% | **−3.08** (rH helps) |
+| 2023-08 (calm) | −6.08% | −5.55% | +0.53 (rH hurts) |
+| 2023-10 | −4.03% | −1.76% | **+2.27** (rH hurts) |
+| 2024-11 (Trump) | −2.25% | +0.02% | **+2.27** (rH hurts) |
+| 2024-12 | −3.25% | −3.44% | −0.19 (rH helps) |
+
+**Avg differential: +1.01 pp** (rough-Heston HURTS HAR-PD on average)
+**Wins: 3/8** (2023-01, 2023-07, 2024-12)
+
+**Pre-screen gate verdict**:
+- Avg +1.01pp → **FAIL** (required ≤ −1.5pp)
+- Wins 3/8 → **FAIL** (required ≥ 5/8)
+
+**Candidate C (rough-Heston SDE calibration) REJECTED at pre-screen.**
+Phase 2 (full 50-month certification retrain) is **skipped** per
+binding rule #3 (one candidate at a time advances to Phase 2, only if
+it passes the pre-screen gate).
+
+### Interpretation
+
+The 4 fitted rough-Heston parameters (V_0, H, η, ρ) are **redundant on
+top of HAR-PD's path-dependent features and production's SVI-ATM
+scalar** for the 15-min forecasting target. Specifically:
+
+- **V_0** (spot variance) overlaps substantially with HAR-PD's R1/R2
+  realized-variance kernels at α∈{0.05, 0.1, 0.3} and with the existing
+  `svi_atm_1d` feature in production's 44-base.
+- **H** (Hurst roughness) is a slow-moving parameter (changes on
+  regime-transition timescales of days to weeks); at a 15-min target
+  horizon the `rh_hurst_d1h` delta carries information in principle, but
+  empirically the 8-month gauntlet shows no marginal QLIKE gain.
+- **η** (vol-of-vol) and **ρ** (leverage correlation) are structurally
+  orthogonal to HAR-PD in principle but carry limited independent signal
+  at the 15-min horizon on the 8-month substrate.
+
+The regime breakdown shows rough-Heston HELPS in some calm months
+(2023-07 −3.08pp, 2023-01 −0.80pp, 2024-12 −0.19pp) but HURTS severely
+during regime transitions (2022-11 FTX-1 +0.79pp, 2022-12 FTX-2 +6.29pp)
+and in several non-crisis months too (2023-10 +2.27pp, 2024-11 Trump
++2.27pp). This is broadly consistent with the **most-likely scenario
+pre-registered in the plan** (~45% probability): DE fixes cold-start,
+but feature redundancy defeats the candidate at pre-screen.
+
+### Cross-session ledger update
+
+**13 candidates tested across Sessions A + B + C + D + E + F + G
+(signal-research only, 2026-04-17 onwards):**
+- **Rejected (12)**: HAR-residual, Quantile LGBM, PatchTST, ETH cross-
+  asset, HARQ (RQ), ETH+HARQ combined, HQR conformal wrapper, SVI-spot,
+  IV-change direct, SVI surface (11 features), Hawkes-OFI branching
+  ratio, **Rough-Heston SDE (Session G)**.
+- **Shipped (1)**: HAR-PD path-dependent features (Session D,
+  `pruned_svi_har_pd_v1`, certified −3.67%/50 months).
+- **Thesis**: base-44 + HAR-PD + `svi_atm_1d` is at the informational
+  ceiling for 15-min BTC volatility forecasting given the current target
+  definition. The next cycle should pivot away from feature engineering
+  on this target toward either (a) target engineering (multi-horizon
+  ensemble, distributional / quantile forecasting), (b) structurally
+  different microstructure data (L2 order-book, funding-flow, cross-
+  exchange basis), or (c) a different horizon (5-min nowcast vs 60-min
+  forecast, where the feature-information saturation may differ).
+
+---
+
+## Audit findings (pre-commit, uncommitted at G.7 start)
+
+While the sidecar was building, a full leakage + formula audit of
+`vol_arb/rough_heston.py`, `vol_arb/build_rough_heston_sidecar.py`, and
+`vol_model/features/rough_heston.py` was performed. Findings:
+
+### Leakage: clean (no issues)
+
+Traced the full data pipeline end-to-end:
+1. Bucket windowing at `[T − 30min, T)` (half-open) — strictly past.
+2. Forward F from `window["index_price"].iloc[-1]` — last pre-T tick.
+3. Tau computed uniformly per-expiry from `bucket_end` reference (the
+   G.4a-c fix).
+4. 15m derivation: `reindex(grid_15m).ffill(limit=3)` + `.diff(4)` —
+   both strictly past-only.
+5. Loader applies `+15m` shift (consistent with SVI-ATM, SVI surface,
+   Hawkes-OFI conventions) → feature at training decision time T+15m
+   uses info ≤ T, conservatively 15m-stale.
+6. Warm-start chain: `init=prev_fit` where prev_fit was fitted at T−1h
+   (strictly causal).
+7. Real-data `probe_causality_by_mutation` PASS at T=2023-06-15.
+
+### Formula: correct (with one missing regression guard — FIXED)
+
+All 11 formula choices verified against spec:
+- F(u, y) = −½(u²+iu) + (iuηρ−κ)y + ½η²y²  ✓
+- Fractional integral order α = H + ½  ✓  (was Session F `1−H` bug)
+- `log φ = iu(r−q)τ + κθ·∫ψds + V_0·∫F(ψ)ds`  ✓  (was Session F
+  `V_0·ψ(τ)` bug)
+- Diethelm-Ford-Freed Adams corrector + predictor weights  ✓
+- Weight normalization `1/Γ(α+2)`, `1/Γ(α+1)`  ✓
+- Heston-93 Π_1 / Π_2 inversion with `phi(v−i)/phi(−i)` renormalization  ✓
+- `Re[z/iv] = Im[z]/v` trick for integrand  ✓
+- Vega-weight first-order Taylor `resid = √w/vega·Δp`  ✓
+- JIT ⇔ pure-numpy bit-identity at rtol=1e-12  ✓
+
+**Test-suite gap — FIXED**: despite the Session F memory note claiming a
+"Black-Scholes deterministic-variance limit match to machine precision"
+as the canonical gate test, no such test was actually committed.
+`test_rough_heston.py` referenced it in another test's docstring but it
+didn't exist. Added in G.7 commit:
+- `test_cf_reduces_to_bs_in_deterministic_limit` (12 parametrizations at
+  rtol=1e-10, atol=1e-12) — pins the formula.
+- `test_call_prices_match_bs_in_deterministic_limit` (9 parametrizations
+  at rtol=1e-2, atol=1e-3) — end-to-end including Pi_1/Pi_2 inversion.
+
+At η=0, θ=V_0, F(ψ) = c0 + c1·ψ (linear in ψ), so trapezoidal
+∫F(ψ) = c0·τ + c1·∫ψ cancels the κ·∫ψ term analytically (since c1 = −κ
+when η=0). The cancellation is INDEPENDENT of the Adams-scheme
+accuracy — it pins the formula by construction. Any formula bug breaks
+it immediately. Test suite: 67 → 88 passing rough-Heston tests.
+
+### Docstring drift — FIXED
+
+Three places described the bucket window as "±30min" or "±1h" when the
+code is `[T − 30min, T)`. A centered ±30min window would leak (uses
+T+30min trades); the backward-only form is correct. Fixed in the G.7
+commit:
+- `vol_arb/build_rough_heston_sidecar.py` module docstring.
+- `vol_arb/build_rough_heston_sidecar.py:65` inline comment (previously
+  "±30min around bucket → 1h window width"; now a 10-line block
+  explaining that `SIDE` naming is historical and the window is
+  backward-only).
+- `vol_model/features/rough_heston.py` module docstring.
+
+### Deferred improvement (tracked in code + here, out of Session G scope)
+
+The current `[T − 30min, T)` window discards ~50% of each hour's option
+trades (trades in `[T − 60min, T − 30min)` are strictly past and would
+be leak-free additions). Widening to `[T − 1h, T)` could improve panel
+density and RMSE at thin-trading buckets. Out of scope for Session G
+since re-calibrating would invalidate the G.6 gauntlet result and
+require a full 6.58h rebuild. Documented in the
+`build_rough_heston_sidecar.py:65` block and tracked for a potential
+future revisit cycle.
+
+---
+
+## G.7: Writeup + commits
+
+Session G produces four atomic commits total:
+1. **`b912cd5`** — Session G.2 DE calibrator + G.1/G.3 diagnostic.
+   (landed 2026-04-19)
+2. **`823c6b7`** — G.4a-c two-bug fix + worker logging init.
+   (landed 2026-04-19)
+3. **`21647ab`** — G.4d Numba JIT on Adams loop.
+   (landed 2026-04-19)
+4. **(this commit)** — G.7 sidecar + gauntlet + audit fixes + this
+   writeup + memory updates.
+
+---
+
+## Session G TL;DR
+
+- **Candidate C (rough-Heston full SDE calibration) REJECTED at pre-
+  screen.** Avg stacked-vs-HAR-PD differential +1.01pp (required ≤
+  −1.5pp); wins 3/8 (required ≥ 5/8). Phase 2 skipped.
+- **Sidecar shipped**: 37,916 hourly buckets, 98.7% calibration success,
+  96.6% / 94.3% feature coverage. Causality probe passes on real data.
+  Zero leakage.
+- **Calibrator improvements shipped**: DE cold-start (Session F NM was
+  stuck at 14-23vp RMSE local minima → DE fixes to 2-5vp real-data
+  RMSE), 100× speedup on sidecar build (tau-groupby fix), 2-3× further
+  speedup via Numba JIT on Adams loop. 67 → 88 passing tests including
+  new canonical BS-limit regression guard.
+- **Cross-session ledger**: **13 candidates tested, 12 rejected, 1
+  shipped** (HAR-PD). The "feature-engineering ceiling on 44-base +
+  HAR-PD" thesis is strengthened further. Next cycle should pivot to
+  target engineering or microstructure data.

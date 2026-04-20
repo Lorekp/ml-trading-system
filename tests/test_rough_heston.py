@@ -180,6 +180,128 @@ def test_cf_at_h_near_half_is_smooth() -> None:
     )
 
 
+# ── 5b. Black-Scholes deterministic-variance limit (GATE) ────────────
+#
+# When eta=0 (no vol-of-vol) AND theta=V_0 (drift target at the initial
+# variance), the rough-Heston variance process is deterministic:
+# V_t = V_0 for all t (V_0 is a fixed point of the mean-reversion drift).
+# The log-price is therefore a Brownian motion with variance V_0*t, i.e.
+# log(S_tau/S_0) ~ Normal((r-q-V_0/2)*tau, V_0*tau), and the CF reduces
+# EXACTLY to the Black-Scholes CF with sigma^2 = V_0:
+#
+#     log phi(u, tau) = iu(r-q)*tau - 0.5 * V_0 * tau * (u^2 + iu)
+#
+# The cancellation inside rough_heston_char_fn is ANALYTIC:
+#
+#   log_phi = iu(r-q)tau + kappa*theta*int_psi + V_0*int_F
+#
+#   With theta=V_0 and F(psi) = c0 + c1*psi where c1 = (iu*eta*rho - kappa):
+#     int_F = c0*tau + c1*int_psi  (F is linear in psi when eta=0, so
+#                                   trapezoidal of F(psi) is exactly c0*tau
+#                                   + c1*trap(psi), regardless of the Adams
+#                                   trajectory for psi)
+#     log_phi = iu(r-q)tau + V_0*[kappa*int_psi + c0*tau + c1*int_psi]
+#             = iu(r-q)tau + V_0*[(kappa + c1)*int_psi + c0*tau]
+#
+#   With eta=0: c1 = -kappa, so (kappa + c1) = 0 and the int_psi term
+#   drops out entirely. Then:
+#     log_phi = iu(r-q)tau + V_0*c0*tau = iu(r-q)tau - 0.5*V_0*tau*(u^2+iu)
+#
+# This cancellation is INDEPENDENT of the Adams-scheme discretization
+# (the psi trajectory can be arbitrarily wrong and the test still holds
+# to floating-point roundoff). It pins four orthogonal formula choices:
+#   1. Fractional integral order alpha = H + 1/2 (not 1-H, etc).
+#   2. log_phi uses V_0 * int_F(psi), NOT V_0 * psi(tau) directly.
+#   3. F coefficients c0 = -0.5*(u^2+iu), c1 = (iu*eta*rho - kappa),
+#      c2 = 0.5*eta^2 with the correct signs.
+#   4. The kappa*theta term uses int_psi (classical integral), not
+#      theta*psi(tau) or a fractional integral.
+#
+# Any regression in any of these four points breaks this test. This is
+# the canonical gate that surfaced the Session F formula bugs during
+# development. Tight 1e-10 tolerance — the test does NOT go through FFT
+# pricing (which has ~1e-6 numerical noise); it compares CFs directly.
+
+
+@pytest.mark.parametrize("H", [0.05, 0.1, 0.3, 0.49])
+@pytest.mark.parametrize("tau_days", [7, 30, 90])
+def test_cf_reduces_to_bs_in_deterministic_limit(H: float, tau_days: int) -> None:
+    """Pin on the rough-Heston CF formula: at eta=0, theta=V_0, the CF
+    must equal the Black-Scholes CF EXACTLY. See the section header above
+    for the analytical derivation. This is the canonical formula-correctness
+    gate: any refactor of log_phi, the Adams scheme, or the F coefficients
+    must preserve this cancellation to ~1e-10.
+    """
+    V_0 = 0.25  # 50% vol squared
+    kappa = 2.0
+    tau = tau_days / 365.0
+    u_vec = np.linspace(-3.0, 3.0, 7).astype(np.complex128)
+
+    phi_rh = rough_heston_char_fn(
+        u_vec, tau=tau,
+        V_0=V_0, H=H, kappa=kappa, theta=V_0,
+        eta=0.0,
+        rho=-0.5,  # irrelevant when eta=0 (appears only as eta*rho in c1)
+    )
+
+    # Exact Black-Scholes CF at r=q=0
+    log_phi_bs = -0.5 * V_0 * tau * (u_vec ** 2 + 1j * u_vec)
+    phi_bs = np.exp(log_phi_bs)
+
+    np.testing.assert_allclose(
+        phi_rh, phi_bs, rtol=1e-10, atol=1e-12,
+        err_msg=(
+            f"BS-limit CF mismatch at H={H}, tau_days={tau_days}: "
+            f"max abs diff = {float(np.max(np.abs(phi_rh - phi_bs)))}"
+        ),
+    )
+
+
+@pytest.mark.parametrize("H", [0.05, 0.1, 0.3])
+@pytest.mark.parametrize("tau_days", [7, 30, 90])
+def test_call_prices_match_bs_in_deterministic_limit(H: float, tau_days: int) -> None:
+    """End-to-end pin: Carr-Madan prices at eta=0, theta=V_0 must match
+    exact Black-76 prices. Complements
+    ``test_cf_reduces_to_bs_in_deterministic_limit`` by also covering the
+    Heston Pi_1/Pi_2 inversion and quadrature.
+
+    Tolerance rationale: the Pi_j integrands are midpoint-sampled on a
+    v-grid that misses ``[0, dv/2]`` and ``[v_max - dv/2, v_max]``, giving
+    a known absolute bias of order ``dv/(2*pi) * |k + 0.5 V_0 tau|`` on
+    Pi_j. At n_fft=1024 and the operationally relevant strike range
+    (±0.2 log-moneyness for the test, ±0.4 for the sidecar), this is
+    ≤ 1e-3 absolute — far below any formula-bug signature (which would
+    produce ≥ 1e-2 errors at minimum). Tightening the bias requires a
+    non-uniform v-grid or a Romberg extrapolation, which is out of scope
+    for this test. The formula itself is pinned to 1e-10 by
+    ``test_cf_reduces_to_bs_in_deterministic_limit`` above.
+    """
+    V_0 = 0.25
+    sigma_bs = math.sqrt(V_0)
+    tau = tau_days / 365.0
+    F = 1.0
+    log_k = np.linspace(-0.2, 0.2, 9)
+
+    rh_prices = carr_madan_call_prices(
+        tau=tau,
+        V_0=V_0, H=H, kappa=2.0, theta=V_0,
+        eta=0.0, rho=-0.5,
+        log_strikes=log_k, F=F, r=0.0,
+    )
+
+    bs_prices = np.array([
+        _bs_call_price(F, F * math.exp(k), tau, sigma_bs) for k in log_k
+    ])
+
+    np.testing.assert_allclose(
+        rh_prices, bs_prices, rtol=1e-2, atol=1e-3,
+        err_msg=(
+            f"BS-limit call-price mismatch at H={H}, tau_days={tau_days}: "
+            f"max abs diff = {float(np.max(np.abs(rh_prices - bs_prices)))}"
+        ),
+    )
+
+
 # ── 6. Calibration recovery (the GATE) ───────────────────────────────
 
 

@@ -122,6 +122,22 @@ def main():
                              "+ util=0.15 + holding=30m + kelly sizing "
                              "+ skip_long_if_term_slope_gt=0.0. "
                              "Normally combined with --realistic.")
+    parser.add_argument("--dfl-scores-path", type=str, default="",
+                        help="Enable DFL head filter. Path to walk-forward "
+                             "P(win) scores parquet (produced by "
+                             "vol_arb.dfl_head.compute_walkforward_scores). "
+                             "Bars with P(win) < train-year quantile are muted.")
+    parser.add_argument("--dfl-filter-quantile", type=float, default=0.25,
+                        help="Quantile threshold for DFL filter (default 0.25 "
+                             "= drop bottom 25%% of P(win) based on prior-year "
+                             "empirical distribution). Only applied if "
+                             "--dfl-scores-path is also set.")
+    parser.add_argument("--kelly-mult-path", type=str, default="",
+                        help="Enable long-side Kelly-shrinkage sizing boost. "
+                             "Path to walk-forward per-bar size_mult parquet "
+                             "(produced by scripts/generate_kelly_sidecar.py). "
+                             "Multiplier >= 1.0 (upside only) applies AFTER "
+                             "profit_scaling and BEFORE dynamic_btc_cap clip.")
     args = parser.parse_args()
 
     config_kwargs = dict(
@@ -151,6 +167,11 @@ def main():
         config_kwargs["vol_arb_path"] = args.vol_arb_path
     if args.predictions_path:
         config_kwargs["predictions_path"] = args.predictions_path
+    if args.dfl_scores_path:
+        config_kwargs["dfl_scores_path"] = args.dfl_scores_path
+        config_kwargs["dfl_filter_quantile"] = args.dfl_filter_quantile
+    if args.kelly_mult_path:
+        config_kwargs["kelly_mult_path"] = args.kelly_mult_path
     if args.use_drl_hedging:
         config_kwargs["use_drl_hedging"] = True
     if args.drl_policy:

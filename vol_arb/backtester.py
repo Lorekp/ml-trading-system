@@ -27,15 +27,23 @@ class BacktestConfig(BaseModel):
     #   - vol_arb/output/SVI_BACKTEST_NOTE.md (parquet switch)
     #   - project_t2_1_retrain.md in memory (T2.1 pruned+SVI retrain result)
     vol_arb_path: str = "vol_arb/output/BTC_vol_arb_svi.parquet"
-    # pruned_svi_har_pd_v1: pruned_svi_v1 + 6 HAR-PD path-dependent features
-    # (Xiao 2025, arxiv:2503.00851). Certified 2026-04-18 over the full 50-month
-    # walk-forward with −3.67% avg ΔQLIKE, 39/50 months improved, 29/50 DM-sig
-    # at p<0.01 (all three Session-C gates pass). V2 backtest with this
-    # predictor: NC Sharpe 9.58→9.69, Compound PnL $14.5M→$15.0M (+3.7%),
-    # profitable months 94%→96%. The previous pruned_svi_v1 parquet is still
-    # on disk; override via --predictions-path if you need to reproduce
-    # pre-HAR-PD results.
-    predictions_path: str = "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions.parquet"
+    # pruned_svi_har_pd_v1 + walk-forward QLIKE-optimal scalar bias alignment.
+    # The underlying predictor is pruned_svi_v1 + 6 HAR-PD path-dependent
+    # features (Xiao 2025, arxiv:2503.00851), certified 2026-04-18 with
+    # -3.67% avg ΔQLIKE across 50 months. The "aligned_bias" parquet
+    # additionally applies a per-month scalar shift β* = 0.5·log(mean(
+    # exp(2·residual))) fit on trailing 3-month OOS residuals, strictly
+    # non-leaking. β median +0.047 (model systematically under-predicts
+    # log-vol by ~5% OOS); row-weighted QLIKE -0.78%. V2 backtest impact:
+    # Compound PnL +6.4% ($14.92M → $15.87M), NC PnL +3.7% ($815K → $845K),
+    # Compound Sharpe +0.07 (5.27 → 5.35), Compound MDD -0.28pp better.
+    # NC Sharpe -0.42 on the non-compounding view — concentration shift
+    # toward long straddles — but the compound axis (what matters for real
+    # capital deployment) is neutral-to-positive on Sharpe with meaningful
+    # PnL gain. Adopted as production default 2026-04-20. See
+    # memory/project_prediction_aligner_2026_04_20.md. Override via
+    # --predictions-path to reproduce pre-aligner results.
+    predictions_path: str = "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"
 
     # Dynamic spread model
     base_spread_iv: float = 1.5   # base IV bid-ask spread (vol points)
@@ -190,6 +198,32 @@ class BacktestConfig(BaseModel):
     # is the 0.0 contango/backwardation sign flip; no tuning needed.
     # None disables (default — reproduces legacy behavior).
     skip_long_if_term_slope_gt: float | None = None
+
+    # ── DFL (Decision-Focused Learning) head filter ─────────────
+    # When ``dfl_scores_path`` is set, load walk-forward P(win) scores
+    # (per trade-fired bar) and MUTE bars whose P(win) falls below
+    # ``dfl_filter_quantile`` of prior-year scores. Year-by-year
+    # walk-forward threshold; bars in the first scored year always
+    # pass through (no prior score history). See
+    # ``vol_arb/dfl_head.py`` and
+    # ``vol_model/output/DFL_HEAD_PHASE3_DECISION.md``. Defaults
+    # preserve legacy behavior when ``dfl_scores_path is None``.
+    dfl_scores_path: str | None = None
+    dfl_filter_quantile: float = 0.25
+
+    # ── Kelly-shrinkage sizing boost (Phase 2 from 2026-04-21) ───
+    # When ``kelly_mult_path`` is set, load per-bar size multipliers
+    # (parquet with a ``size_mult`` column indexed by bar timestamp;
+    # always >= 1.0 — upside-only asymmetric boost on long-side high
+    # |pred_edge| bars). Multiplier applies to ``N[i]`` AFTER
+    # profit_scaling and BEFORE the dynamic_btc_cap clip so Kelly can
+    # never breach the margin envelope. Walk-forward multipliers are
+    # generated offline by ``scripts/generate_kelly_sidecar.py``
+    # (wrapping phase1 math: Rising-Wyner shrinkage on |pred_edge|/sigma^2
+    # with trailing-12m median normalization). Defaults to None ->
+    # pass-through (byte-identical V2). See plan:
+    # C:/Users/laure/.claude/plans/starry-rolling-rabin.md
+    kelly_mult_path: str | None = None
 
     # ── DRL delta-hedging (experimental) ─────────────────────────
     # When True, ``compute_pnl`` routes the delta-hedge simulation through
@@ -472,8 +506,24 @@ class BacktestConfig(BaseModel):
             target_margin_utilization=0.15,
             holding_minutes=15,
             # sizing_model stays "composite_v2" (the v1 default) —
-            # Kelly tested but broke compound-mode path.
+            # native Kelly strategy tested but broke compound-mode
+            # path. The Kelly-shrinkage sidecar below is a different
+            # mechanism: a per-bar UPSIDE-ONLY multiplier (>=1.0)
+            # applied AFTER profit_scaling and BEFORE dynamic_btc_cap
+            # clip. Walk-forward, leakage-tested.
             skip_long_if_term_slope_gt=0.0,
+            # Kelly-shrinkage long-side boost adopted 2026-04-21 as
+            # an accepted Sharpe-for-PnL tradeoff. Phase 2 backtest:
+            # NC PnL +$114K (+13.5%) and Compound PnL +$2.84M (+17.9%)
+            # at NC Sharpe -0.94 and Compound Sharpe -0.20 (Compound
+            # MDD actually improved 0.62pp). $/Sharpe ratio is 1.7x
+            # better than the aligner-adoption template the user
+            # accepted on 2026-04-20. See
+            # vol_arb/output/KELLY_SHRINKAGE_PHASE2_REPORT.md and
+            # memory/project_kelly_sizing_2026_04_21.md.
+            kelly_mult_path=(
+                "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+            ),
         ))
 
 
@@ -853,6 +903,51 @@ class VolArbBacktester:
                     "'svi_term_slope_1w_2w' column absent — skipping",
                     float(self.cfg.skip_long_if_term_slope_gt),
                 )
+
+        # DFL head filter — walk-forward per-year quantile threshold.
+        # Mutes both longs and shorts whose P(win) falls below the
+        # prior-year empirical quantile. Bars in the first scored
+        # year pass through (no prior history). No lookahead: the
+        # scores parquet is a product of walk-forward training per
+        # ``vol_arb/dfl_head.compute_walkforward_scores``.
+        if self.cfg.dfl_scores_path is not None:
+            scores_path = Path(self.cfg.dfl_scores_path)
+            if not scores_path.exists():
+                logger.warning(
+                    "dfl_scores_path=%s does not exist — skipping DFL filter",
+                    scores_path,
+                )
+            else:
+                dfl = pd.read_parquet(scores_path)
+                # Normalize: single-column 'p_win' or one-column frame
+                if "p_win" in dfl.columns:
+                    p_win = dfl["p_win"]
+                else:
+                    p_win = dfl.iloc[:, 0]
+                # Align to df.index
+                p_aligned = p_win.reindex(df.index)
+                q = float(self.cfg.dfl_filter_quantile)
+                years = sorted(set(df.index.year))
+                muted_mask = np.zeros(len(df), dtype=bool)
+                for y in years:
+                    train_mask = p_aligned.index.year < y
+                    train_scores = p_aligned.loc[train_mask].dropna()
+                    if len(train_scores) < 100:
+                        continue  # pass through first scored year
+                    thr_q = float(train_scores.quantile(q))
+                    year_mask = np.asarray(p_aligned.index.year == y)
+                    year_scores = p_aligned.to_numpy()
+                    below = (year_scores < thr_q) & year_mask & ~np.isnan(year_scores)
+                    muted_mask |= below
+                dfl_mute = muted_mask & (signal != 0)
+                n_muted = int(dfl_mute.sum())
+                if n_muted > 0:
+                    signal = np.where(dfl_mute, np.int8(0), signal).astype(np.int8)
+                    logger.info(
+                        "Entry filter (DFL head): muted %d bars "
+                        "(P(win) < train_q%d, scores from %s)",
+                        n_muted, int(q * 100), scores_path.name,
+                    )
 
         return signal
 
@@ -1639,6 +1734,38 @@ class VolArbBacktester:
             or cfg.use_profit_scaling or cfg.use_liquidity_regime_filter
         )
 
+        # ── Kelly-shrinkage multiplier sidecar (Phase 2 2026-04-21) ──
+        # Loaded once, aligned to df.index. Defaults None -> no-op.
+        _kelly_mult_arr: np.ndarray | None = None
+        _kelly_applied_arr = np.ones(n_bars)
+        if cfg.kelly_mult_path is not None:
+            kpath = Path(cfg.kelly_mult_path)
+            if not kpath.exists():
+                logger.warning(
+                    "kelly_mult_path=%s does not exist -- skipping Kelly boost",
+                    kpath,
+                )
+            else:
+                km_df = pd.read_parquet(kpath)
+                if "size_mult" in km_df.columns:
+                    km_ser = km_df["size_mult"]
+                else:
+                    km_ser = km_df.iloc[:, 0]
+                km_aligned = km_ser.reindex(df.index)
+                arr = km_aligned.to_numpy(dtype=float)
+                # Safety: floor at 1.0 (upside-only), cap at 2.0 (hard
+                # risk bound), and pass-through NaN -> 1.0.
+                arr = np.where(np.isnan(arr), 1.0, arr)
+                arr = np.clip(arr, 1.0, 2.0)
+                _kelly_mult_arr = arr
+                n_boost = int((arr > 1.0 + 1e-9).sum())
+                logger.info(
+                    "Kelly sidecar loaded (%s): %d bars with mult>1.0, "
+                    "mean mult=%.4f, max mult=%.4f",
+                    kpath.name, n_boost,
+                    float(arr.mean()), float(arr.max()),
+                )
+
         for i in range(n_bars):
             if signal[i] == 0 or eq <= 0.0:
                 N[i] = 0.0
@@ -1791,6 +1918,18 @@ class VolArbBacktester:
                         profit_scale_arr[i] = ps
                         N[i] *= ps
                         N[i] = min(N[i], dynamic_btc_cap[i])
+
+                # ── Kelly-shrinkage boost (Phase 2, 2026-04-21) ──
+                # Apply precomputed per-bar multiplier AFTER profit_scaling
+                # AND AFTER the dynamic_btc_cap clip above, then re-clip so
+                # Kelly can never breach the margin envelope. Floor 1.0 is
+                # already enforced at load time (upside-only asymmetric).
+                if _kelly_mult_arr is not None and not skip_trade and N[i] > 0:
+                    km = _kelly_mult_arr[i]
+                    if km > 1.0 + 1e-12:
+                        N[i] *= km
+                        N[i] = min(N[i], dynamic_btc_cap[i])
+                        _kelly_applied_arr[i] = km
 
                 if skip_trade:
                     N[i] = 0.0
@@ -1969,6 +2108,16 @@ class VolArbBacktester:
                 N_nc = np.where(any_filtered, 0.0, N_nc)
             if cfg.use_profit_scaling:
                 N_nc = N_nc * profit_scale_arr
+                N_nc = np.minimum(N_nc, dynamic_btc_cap)
+                N_nc = np.where(signal == 0, 0.0, N_nc)
+
+            # ── Kelly-shrinkage boost on NC path ──
+            # Mirror the compound-loop application: multiply N_nc by the
+            # same per-bar Kelly multiplier that was applied to N. Without
+            # this, NC PnL would not reflect the Kelly upsizing and the
+            # compound-vs-NC comparison would be misleading.
+            if _kelly_mult_arr is not None:
+                N_nc = N_nc * _kelly_applied_arr
                 N_nc = np.minimum(N_nc, dynamic_btc_cap)
                 N_nc = np.where(signal == 0, 0.0, N_nc)
 

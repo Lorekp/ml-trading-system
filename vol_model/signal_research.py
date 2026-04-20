@@ -105,40 +105,62 @@ from vol_model.features.rough_heston import (  # noqa: E402
     compute_rough_heston_features,
 )
 
+# Session H Candidate B: perp funding-rate state vector (5 features).
+# Sidecar at vol_arb/output/funding_features_15m.parquet from
+# `python -m vol_arb.build_funding_sidecar`.
+from vol_model.features.funding import (  # noqa: E402
+    FUNDING_FEATURES,
+    compute_funding_features,
+)
+
+# Session H Candidate C: Variance Risk Premium (IV² − RV²) state vector
+# (5 features). Sidecar at vol_arb/output/vrp_features_15m.parquet from
+# `python -m vol_arb.build_vrp_sidecar`.
+from vol_model.features.vrp import (  # noqa: E402
+    VRP_FEATURES,
+    compute_vrp_features,
+)
+
 # Tier-to-feature-pool dispatch. Consumed by build_month_data_augmented.
-# Tuple layout (7 slots):
+# Tuple layout (9 slots):
 #   (eth_cols, rq_cols, svi_extra_cols, har_pd_cols,
-#    svi_surface_cols, hawkes_ofi_cols, rough_heston_cols).
+#    svi_surface_cols, hawkes_ofi_cols, rough_heston_cols,
+#    funding_cols, vrp_cols).
 #
-# NOTE: As more candidates land, consider refactoring this to a dict
-# structure ``{tier: ((attr, cols), ...)}`` so each new candidate adds a
-# single entry instead of extending the tuple. Kept as 7-tuple for now
-# because Session F is a stable boundary.
+# NOTE: As more candidates land, this tuple is getting long; refactoring
+# to a dict structure {tier: {attr: cols}} is an ongoing follow-up — kept
+# as a 9-tuple for now so Session H doesn't land alongside a refactor.
 TIER_FEATURE_MAP: dict[
     str,
     tuple[
         tuple[str, ...], tuple[str, ...], tuple[str, ...],
         tuple[str, ...], tuple[str, ...], tuple[str, ...],
-        tuple[str, ...],
+        tuple[str, ...], tuple[str, ...], tuple[str, ...],
     ],
 ] = {
-    "control":                   ((), (), (), (), (), (), ()),
-    "eth":                       (ETH_TSRV_FEATURES, (), (), (), (), (), ()),
-    "rq":                        ((), RQ_FEATURES, (), (), (), (), ()),
-    "eth_and_rq":                (ETH_TSRV_FEATURES, RQ_FEATURES, (), (), (), (), ()),
-    "svi_spot":                  ((), (), SVI_SPOT_FEATURES, (), (), (), ()),
-    "har_pd":                    ((), (), (), HAR_PD_FEATURES, (), (), ()),
+    "control":                   ((), (), (), (), (), (), (), (), ()),
+    "eth":                       (ETH_TSRV_FEATURES, (), (), (), (), (), (), (), ()),
+    "rq":                        ((), RQ_FEATURES, (), (), (), (), (), (), ()),
+    "eth_and_rq":                (ETH_TSRV_FEATURES, RQ_FEATURES, (), (), (), (), (), (), ()),
+    "svi_spot":                  ((), (), SVI_SPOT_FEATURES, (), (), (), (), (), ()),
+    "har_pd":                    ((), (), (), HAR_PD_FEATURES, (), (), (), (), ()),
     # Session E Candidate A (REJECTED at pre-screen):
-    "svi_surface":               ((), (), (), (), SVI_SURFACE_FEATURES, (), ()),
-    "har_pd_and_svi_surface":    ((), (), (), HAR_PD_FEATURES, SVI_SURFACE_FEATURES, (), ()),
-    # Session F Candidate B: Hawkes-OFI (bivariate exp-kernel MLE).
+    "svi_surface":               ((), (), (), (), SVI_SURFACE_FEATURES, (), (), (), ()),
+    "har_pd_and_svi_surface":    ((), (), (), HAR_PD_FEATURES, SVI_SURFACE_FEATURES, (), (), (), ()),
+    # Session F Candidate B (REJECTED): Hawkes-OFI.
+    "hawkes_ofi":                ((), (), (), (), (), HAWKES_OFI_FEATURES, (), (), ()),
+    "har_pd_and_hawkes_ofi":     ((), (), (), HAR_PD_FEATURES, (), HAWKES_OFI_FEATURES, (), (), ()),
+    # Session F/G Candidate C (REJECTED): rough-Heston SDE calibration.
+    "rough_heston":              ((), (), (), (), (), (), ROUGH_HESTON_FEATURES, (), ()),
+    "har_pd_and_rough_heston":   ((), (), (), HAR_PD_FEATURES, (), (), ROUGH_HESTON_FEATURES, (), ()),
+    # Session H Candidate B: perp funding-rate state vector.
     # The standalone tier measures raw information; the stacked tier is
     # the decision metric (adds on top of current production).
-    "hawkes_ofi":                ((), (), (), (), (), HAWKES_OFI_FEATURES, ()),
-    "har_pd_and_hawkes_ofi":     ((), (), (), HAR_PD_FEATURES, (), HAWKES_OFI_FEATURES, ()),
-    # Session F Candidate C: rough-Heston SDE calibration.
-    "rough_heston":              ((), (), (), (), (), (), ROUGH_HESTON_FEATURES),
-    "har_pd_and_rough_heston":   ((), (), (), HAR_PD_FEATURES, (), (), ROUGH_HESTON_FEATURES),
+    "funding":                   ((), (), (), (), (), (), (), FUNDING_FEATURES, ()),
+    "har_pd_and_funding":        ((), (), (), HAR_PD_FEATURES, (), (), (), FUNDING_FEATURES, ()),
+    # Session H Candidate C: Variance Risk Premium.
+    "vrp":                       ((), (), (), (), (), (), (), (), VRP_FEATURES),
+    "har_pd_and_vrp":            ((), (), (), HAR_PD_FEATURES, (), (), (), (), VRP_FEATURES),
 }
 
 
@@ -171,6 +193,10 @@ class SpotCheckContext:
     hawkes_ofi_features: pd.DataFrame = field(default_factory=pd.DataFrame)
     # Session F Candidate C: rough-Heston (already +15m-aligned at load time).
     rough_heston_features: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Session H Candidate B: perp funding rate (already +15m-aligned at load time).
+    funding_features: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Session H Candidate C: VRP = IV² − RV² (already +15m-aligned at load time).
+    vrp_features: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -539,6 +565,54 @@ def load_spot_check_context(
             logger.warning("Could not load rough-Heston features: %s", exc)
             rough_heston_df = pd.DataFrame()
 
+    # Session H Candidate B: perp funding-rate sidecar (built by
+    # `python -m vol_arb.build_funding_sidecar`). Same +15m alignment
+    # convention as the options sidecars above — at training decision
+    # time T+15m the feature uses info ≤ T (conservatively causal).
+    funding_df = pd.DataFrame()
+    if include_extras:
+        try:
+            fund_path = Path("vol_arb/output/funding_features_15m.parquet")
+            if fund_path.exists():
+                fund_raw = pd.read_parquet(fund_path)
+                funding_df = compute_funding_features(fund_raw)
+                funding_df.index = funding_df.index + pd.Timedelta(minutes=15)
+                logger.info(
+                    "Loaded funding features: %d rows x %d cols (+15m aligned)",
+                    len(funding_df), funding_df.shape[1],
+                )
+            else:
+                logger.warning(
+                    "Funding sidecar missing (%s); funding thread will be empty.",
+                    fund_path,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load funding features: %s", exc)
+            funding_df = pd.DataFrame()
+
+    # Session H Candidate C: Variance Risk Premium sidecar (built by
+    # `python -m vol_arb.build_vrp_sidecar`).
+    vrp_df = pd.DataFrame()
+    if include_extras:
+        try:
+            vrp_path = Path("vol_arb/output/vrp_features_15m.parquet")
+            if vrp_path.exists():
+                vrp_raw = pd.read_parquet(vrp_path)
+                vrp_df = compute_vrp_features(vrp_raw)
+                vrp_df.index = vrp_df.index + pd.Timedelta(minutes=15)
+                logger.info(
+                    "Loaded VRP features: %d rows x %d cols (+15m aligned)",
+                    len(vrp_df), vrp_df.shape[1],
+                )
+            else:
+                logger.warning(
+                    "VRP sidecar missing (%s); vrp thread will be empty.",
+                    vrp_path,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load VRP features: %s", exc)
+            vrp_df = pd.DataFrame()
+
     return SpotCheckContext(
         asset=asset,
         vol_config=vol_config,
@@ -558,6 +632,8 @@ def load_spot_check_context(
         svi_surface_features=svi_surface_df,
         hawkes_ofi_features=hawkes_ofi_df,
         rough_heston_features=rough_heston_df,
+        funding_features=funding_df,
+        vrp_features=vrp_df,
     )
 
 
@@ -766,7 +842,7 @@ def build_month_data_augmented(
         )
     (
         eth_cols, rq_cols, svi_extra_cols, har_pd_cols, svi_surface_cols,
-        hawkes_ofi_cols, rough_heston_cols,
+        hawkes_ofi_cols, rough_heston_cols, funding_cols, vrp_cols,
     ) = TIER_FEATURE_MAP[thread]
 
     md = build_month_data(ctx, month_str)
@@ -823,6 +899,20 @@ def build_month_data_augmented(
             present = [c for c in rough_heston_cols if c in ctx.rough_heston_features.columns]
             if present:
                 extras.append(ctx.rough_heston_features[present].reindex(md.X_month.index))
+    if funding_cols:
+        if ctx.funding_features.empty:
+            logger.warning("%s: funding unavailable; skipping funding", month_str)
+        else:
+            present = [c for c in funding_cols if c in ctx.funding_features.columns]
+            if present:
+                extras.append(ctx.funding_features[present].reindex(md.X_month.index))
+    if vrp_cols:
+        if ctx.vrp_features.empty:
+            logger.warning("%s: VRP unavailable; skipping vrp", month_str)
+        else:
+            present = [c for c in vrp_cols if c in ctx.vrp_features.columns]
+            if present:
+                extras.append(ctx.vrp_features[present].reindex(md.X_month.index))
 
     if not extras:
         # Thread is effectively control — return as-is

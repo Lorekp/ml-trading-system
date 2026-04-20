@@ -1653,3 +1653,183 @@ Session G produces four atomic commits total:
   shipped** (HAR-PD). The "feature-engineering ceiling on 44-base +
   HAR-PD" thesis is strengthened further. Next cycle should pivot to
   target engineering or microstructure data.
+
+
+---
+
+# Session H — 2026-04-20 afternoon (funding + VRP, NEW cycle)
+
+## Context
+
+After Session G (rough-Heston rejected), user directive was: "focus on
+improving the underlying signal. research newest methodologies... test
+and evaluate separately from the backtest. make sure you don't
+introduce data-leakage, the single biggest danger that might invalidate
+any finding. behave like a professional quant specializing in machine
+learning. implement candidate B and C."
+
+The original ABC candidates (SVI surface / Hawkes / rough-Heston) are
+exhausted (all rejected Session E/F/G). "Candidate B and C" is a NEW
+cycle under Session H.
+
+## Candidate selection
+
+Researcher-agent shortlist + local data-inventory intersection:
+
+| # | Candidate | Conf | Data | Effort | Picked? |
+|---|---|---|---|---|---|
+| 1 | LOB queue-imbalance OFI | HIGH | HL L2 raw 18GB LZ4, 3/8 substrate mo | 2-3d | NO (coverage + ingestion) |
+| 2 | Perp funding-rate state | MED-HIGH | `data/funding-rates/BTCUSDT_funding.parquet`, full coverage | 1-2d | **B** |
+| 3 | VRP = IV² − RV² | MED | SVI + TSRV on disk, zero new data | 1d | **C** |
+| 4 | BNS jump (J = RV−BPV) | MED | aggTrades on disk | 1-2d | queued |
+
+**B: Perp funding-rate state vector (5 features)** — BIS WP 1087
+"Crypto Carry" (Bernardi-Koudijs-Ranaldo 2024). 8h funding rate is a
+derivatives-market state variable, Sharpe 6.45 on dedicated carry
+strategy, structurally orthogonal to realized-variance kernels.
+
+**C: Variance Risk Premium (5 features)** — Almeida-Grith-Miftachov
+2024 (arXiv:2410.15195). BTC VRP sign-flips across 2021-2024 make it a
+regime-state variable.
+
+Both have full 8-month substrate coverage, clear causality stories,
+leak-free by construction.
+
+## Infrastructure shipped
+
+### Candidate B: funding sidecar
+
+- `vol_arb/build_funding_sidecar.py` (~190 LOC). Reads 8h funding parquet,
+  computes 5 features (`fr_level`, `fr_abs`, `fr_ema_1d`, `fr_ema_7d`,
+  `fr_zscore_30d`) on native 8h cadence, then
+  `merge_asof(direction="backward")` onto 15m grid. Strictly causal.
+- `vol_model/features/funding.py`; `tests/test_features_funding.py` 9/9
+  pass including real-data `probe_causality_by_mutation`.
+- Sidecar: 183,936 rows, **100% coverage**, built in ~2 seconds.
+
+### Candidate C: VRP sidecar
+
+- `vol_arb/build_vrp_sidecar.py` (~220 LOC). Inputs: `svi_atm_1m` (percent
+  to decimal to squared = annualized variance); `tsrv` (per-15m
+  variance, rolling(30d).mean() × 96 × 365.25 = annualized). VRP =
+  IV² − RV². 5 features including `vrp_30d_z30d` (30d rolling z-score)
+  and `vrp_30d_d1d` (.diff(96) = 24h change).
+- `vol_model/features/vrp.py`; `tests/test_features_vrp.py` 9/9 pass
+  including arithmetic-consistency test (vrp_30d == iv_var_1m −
+  rv_var_30d at rtol=1e-10).
+- Sidecar: 183,065 rows, **94.8-99.6% coverage**.
+
+### Gauntlet wiring
+
+- `TIER_FEATURE_MAP` 7-tuple to 9-tuple (+`funding_cols`, `vrp_cols`).
+- `SpotCheckContext` fields + loaders with +15m shift (same convention
+  as SVI surface / Hawkes-OFI / rough-Heston).
+- 4 new tier keys: `funding`, `har_pd_and_funding`, `vrp`,
+  `har_pd_and_vrp`.
+- 44/44 feature tests green across all 5 sidecar families.
+
+## The 2022-12 pipeline-divergence artifact
+
+First gauntlet run (80/25, 6 threads, 8-month substrate): `har_pd` thread
+on 2022-12 produced QLIKE=0.9065 (delta +11.94% vs baseline 0.8098),
+identical across 3 reruns. Session F writeup reported +0.55% on the
+same month with byte-identical code + data.
+
+Investigation:
+- Formula check: manual QLIKE on (y_true, y_pred) at 2022-12 = 0.8098,
+  matches gauntlet's reported baseline exactly.
+- Data check: all parquet mtimes predate Session F.
+- **Production HAR-PD (pruned_svi_har_pd_v1, certified 200/50) gives
+  QLIKE 0.8187 on 2022-12 = +1.10%**. Correct delta is +1.10%; fresh
+  gauntlet HAR-PD lands 10.8 pp worse.
+
+Initial hypothesis: Optuna budget (gauntlet 80/25 vs production 200/50).
+Recorded binding rule, launched 200/50 rerun. **Got QLIKE=0.9065
+IDENTICAL to 80/25** — with seed=42 on TPE+LightGBM, the 200-trial
+trajectory passes through the same optimum as 80 trials by trial ~30.
+Budget was NOT the bottleneck. Killed the 200/50 run (wasted compute).
+
+**Real cause**: gauntlet's `train_feature_augmented_lgbm` +
+`_run_optuna_qlike` in `signal_research.py` diverges from the
+production `run_walkforward_pruned_svi_har_pd.py` via
+`train_purged_cv` in `model.py` on: winsorization, train/val splits,
+search-space bounds, or early-stop callbacks. Same data + same budget +
+different pipeline equals different optimum.
+
+**Safety valve**: the stacked-vs-HAR-PD DIFFERENTIAL is still honest
+because both candidate and HAR-PD threads share the same pipeline
+bias. The differential IS the pre-screen decision metric; absolute
+QLIKE inflation on 2022-12 cancels in subtraction.
+
+Binding rule recorded at `feedback_gauntlet_budget.md` (BINDING:
+gauntlet pipeline must match production pipeline end-to-end, NOT just
+budget). MEMORY.md index updated.
+
+## Pre-screen gate verdict
+
+**Candidate B (funding) vs HAR-PD**:
+- Avg differential: **−0.23 pp** (gate: ≤ −1.5 pp) -> **FAIL**
+- Wins: **5/8** (gate: ≥ 5/8) -> PASS
+- Overall: **FAIL** (avg must pass)
+- Ex-2022-12: avg −0.17 pp, wins 4/7 -> still FAIL
+
+**Candidate C (VRP) vs HAR-PD**:
+- Avg differential: **−0.20 pp** -> **FAIL**
+- Wins: **4/8** -> **FAIL**
+- Overall: **FAIL** on both
+- Ex-2022-12: avg −0.20 pp, wins 3/7 -> still FAIL
+
+**Verdict: both candidates REJECTED at pre-screen. Phase 2 skipped.**
+
+## Interpretation
+
+Both candidates add SOME signal on crisis months with large |Δ|
+(B: −2.15 pp on 2023-08; C: −2.81 pp on 2023-08) but HURT in calm
+months where HAR-PD alone is already excellent (2023-10, 2024-11). Net
+effect cancels to tiny magnitudes far from the −1.5 pp gate.
+
+Funding: 8h cadence is too SLOW for a 15-min forecast horizon. Captures
+multi-day regimes (Trump 2024-11/12; FTX 2022-11/12) but marginal info
+within the 15-min window is negligible.
+
+VRP: the SPREAD form is a real regime signal (sign-flips confirmed in
+sidecar) but redundant with individual IV + RV inputs already seen by
+LGBM through `svi_atm_1d` + HAR-PD kernels.
+
+## Cross-session ledger
+
+**15 candidates tested, 14 rejected, 1 shipped (HAR-PD).**
+
+| Session | Candidates | Verdict |
+|---|---|---|
+| A | HAR-residual, Quantile LGBM, PatchTST | REJECT (x3) |
+| B | ETH, RQ, ETH+RQ, HQR wrapper | REJECT (x4) |
+| C | SVI-spot, IV-change direct | REJECT (x2) |
+| C/D | **HAR-PD** | **SHIPPED** |
+| E | SVI surface | REJECT |
+| F | Hawkes-OFI | REJECT |
+| G | Rough-Heston SDE | REJECT |
+| **H** | **Funding-rate state**, **VRP = IV²−RV²** | **REJECT x2** |
+
+5 consecutive feature-engineering rejection cycles on the 15-min target
+(E, F, G, H x 2). The ceiling thesis is now decisively strong.
+
+## Open work items after Session H
+
+1. **Pipeline alignment** (low priority): fix `train_feature_augmented_lgbm`
+   vs `train_purged_cv` 10+pp divergence on hard months. Or add a Phase 2
+   walk-forward mode for "precise-QLIKE" re-evaluation of marginal
+   candidates. Not blocking: no candidate has been close to the gate.
+
+2. **Real pivot**: after 5 consecutive feature-engineering rejections,
+   the decision-useful next move is NOT another feature. Viable pivots:
+   - **Target engineering**: multi-horizon ensemble, distributional
+     forecasting (CRPS / pinball loss), jump-diffusion target.
+   - **Microstructure data**: Hyperliquid L2 raw (18GB LZ4 ingestion)
+     -> multi-level OFI. Research rank 1 from the Session H shortlist.
+     Deferred this cycle on ingestion cost; remains highest-prior new
+     data source.
+   - **Horizon change**: 5-min nowcast or 60-min forecast.
+
+3. **Binning queue**: BNS jump variation (J = RV−BPV); CME-Binance
+   basis; multi-horizon target ensemble; Hyperliquid L2 OFI.

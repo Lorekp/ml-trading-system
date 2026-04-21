@@ -47,8 +47,16 @@ def compute_option_vpin_15m(
     *,
     bucket_volume_btc: float = 50.0,
     rolling_window: int = 50,
+    tf_str: str = "15min",
 ) -> pd.Series:
-    """Compute VPIN from option trade flow, resampled to the 15-min grid.
+    """Compute VPIN from option trade flow, resampled to the ``tf_str`` grid.
+
+    The "15m" suffix in the function name is legacy — the implementation
+    is horizon-aware via ``tf_str`` (default ``"15min"`` preserves legacy
+    byte-identical output). Pass ``tf_str="5min"``/``"30min"``/``"60min"``
+    for other horizons. See horizon SSOT in
+    ``vol_model.config.VolModelConfig.tf_str`` and plan
+    ``starry-rolling-rabin.md`` Phase 2h5.0b.
 
     Parameters
     ----------
@@ -62,14 +70,17 @@ def compute_option_vpin_15m(
     rolling_window : int, default 50
         Number of buckets to average over.  50 is the canonical choice
         from the Easley/López de Prado paper.
+    tf_str : str, default ``"15min"``
+        pandas-compatible resample frequency. Default preserves legacy
+        behaviour. At h=5 pass ``"5min"``; at h=60 ``"60min"``.
 
     Returns
     -------
     pd.Series
-        Indexed by 15-min UTC timestamps (end-of-bucket convention, matching
-        the rest of the vol-arb pipeline).  Values are in ``[0, 1]``, where
-        0 = perfectly balanced flow and 1 = maximally directional flow.
-        NaN for bars before the rolling window fills.
+        Indexed by ``tf_str``-cadence UTC timestamps (end-of-bucket
+        convention, matching the rest of the vol-arb pipeline). Values in
+        ``[0, 1]``, where 0 = perfectly balanced flow and 1 = maximally
+        directional. NaN for bars before the rolling window fills.
     """
     if option_trades.empty:
         return pd.Series(dtype=np.float64, name="vpin")
@@ -98,12 +109,12 @@ def compute_option_vpin_15m(
     vpin_per_bucket.index = agg["t_last"]
     vpin_per_bucket.index.name = "timestamp"
 
-    # Resample to 15-min: take the last VPIN observed in each 15-min window
-    # (not a mean, because VPIN is already a smoothed quantity and we want
-    # the most recent observation at each bar).
+    # Resample to the bar cadence: take the last VPIN observed in each
+    # window (not a mean, because VPIN is already a smoothed quantity and
+    # we want the most recent observation at each bar).
     vpin_15m = (
         vpin_per_bucket.sort_index()
-        .resample("15min", label="right", closed="right")
+        .resample(tf_str, label="right", closed="right")
         .last()
     )
 

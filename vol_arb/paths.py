@@ -49,25 +49,59 @@ def vol_arb_path(currency: str = "BTC", svi: bool = True) -> Path:
     return Path(f"vol_arb/output/{stem}.parquet")
 
 
-def svi_features_path(currency: str = "BTC") -> Path:
-    """SVI surface calibration output, 15m bucketed features (e.g. svi_atm_1d)."""
+def svi_features_path(currency: str = "BTC", horizon_minutes: int = 15) -> Path:
+    """SVI surface calibration output, bucketed features (e.g. svi_atm_1d).
+
+    h=15 returns the legacy unsuffixed path (byte-identical to pre-Phase 2h5
+    call sites). h!=15 lands at ``<currency>_svi_features_h{N}m.parquet``
+    so the h=5m regen does not overwrite the production h=15 file.
+    """
+    if horizon_minutes == 15:
+        if currency == "BTC":
+            return Path("vol_arb/output/svi_features_15m.parquet")  # legacy
+        return Path(f"vol_arb/output/{currency}_svi_features_15m.parquet")
+    # h!=15: always per-currency-suffixed (no legacy path exists for h!=15)
     if currency == "BTC":
-        return Path("vol_arb/output/svi_features_15m.parquet")  # legacy
-    return Path(f"vol_arb/output/{currency}_svi_features_15m.parquet")
+        return Path(f"vol_arb/output/svi_features_h{horizon_minutes}m.parquet")
+    return Path(
+        f"vol_arb/output/{currency}_svi_features_h{horizon_minutes}m.parquet"
+    )
 
 
 def svi_surface_params_path(currency: str = "BTC", freq: str = "1h") -> Path:
-    """Per-bucket SVI (a, b, rho, m, sigma) parameters for reconstruction."""
+    """Per-bucket SVI (a, b, rho, m, sigma) parameters for reconstruction.
+
+    The ``freq`` argument is the bucket cadence the SVI calibration ran at
+    (e.g. ``"1h"`` for production, ``"5min"`` for the h=5m regen). Distinct
+    from the downstream bar-grid horizon (``horizon_minutes`` elsewhere),
+    because SVI params can be calibrated at one cadence and interpolated
+    onto a finer bar grid.
+    """
     if currency == "BTC":
         return Path(f"vol_arb/output/svi_surface_params_{freq}.parquet")
     return Path(f"vol_arb/output/{currency}_svi_surface_params_{freq}.parquet")
 
 
-def bar_exec_quality_path(currency: str = "BTC") -> Path:
-    """Per-bar realistic-taker slippage surface (from trade tape)."""
+def bar_exec_quality_path(
+    currency: str = "BTC", horizon_minutes: int = 15,
+) -> Path:
+    """Per-bar realistic-taker slippage surface (from trade tape).
+
+    h=15 returns legacy unsuffixed path; h!=15 suffixed with ``_h{N}m`` so
+    per-horizon slippage surfaces do not collide.
+    """
+    if horizon_minutes == 15:
+        if currency == "BTC":
+            return Path("vol_arb/output/bar_execution_quality.parquet")
+        return Path(f"vol_arb/output/{currency}_bar_execution_quality.parquet")
+    # h!=15: always per-currency-suffixed
     if currency == "BTC":
-        return Path("vol_arb/output/bar_execution_quality.parquet")
-    return Path(f"vol_arb/output/{currency}_bar_execution_quality.parquet")
+        return Path(
+            f"vol_arb/output/bar_execution_quality_h{horizon_minutes}m.parquet"
+        )
+    return Path(
+        f"vol_arb/output/{currency}_bar_execution_quality_h{horizon_minutes}m.parquet"
+    )
 
 
 def minute_atm_iv_path(currency: str = "BTC") -> Path:

@@ -545,11 +545,19 @@ def build_vol_arb_dataset(config: VolArbConfig) -> pd.DataFrame:
                         100 * (svi_features["svi_calibration_level"] == 0).mean(),
                         len(svi_params))
             # Persist to per-currency paths so downstream pruned+SVI training
-            # and DRL hedging can load the correct surface. BTC writes to the
-            # legacy unsuffixed filename (preserving byte-compat); ETH and
-            # future currencies get a {currency}_ prefix via the resolver.
-            feat_out = svi_features_path(config.currency)
-            params_out = svi_surface_params_path(config.currency)
+            # and DRL hedging can load the correct surface. BTC at h=15 writes
+            # to the legacy unsuffixed filename (byte-compat); ETH and other
+            # currencies get a {currency}_ prefix via the resolver; h!=15 gets
+            # a `_h{N}m` suffix so h=5 regen does not clobber h=15 production.
+            _svi_bar_minutes = int(
+                round(pd.Timedelta(config.bucket_freq).total_seconds() / 60.0)
+            )
+            feat_out = svi_features_path(
+                config.currency, horizon_minutes=_svi_bar_minutes,
+            )
+            params_out = svi_surface_params_path(
+                config.currency, freq=config.svi_bucket_freq,
+            )
             feat_out.parent.mkdir(parents=True, exist_ok=True)
             svi_features.to_parquet(feat_out)
             svi_params.to_parquet(params_out)
@@ -592,12 +600,27 @@ def build_vol_arb_dataset(config: VolArbConfig) -> pd.DataFrame:
         vol_edges=config.slippage_vol_edges,
     )
 
-    # 4c. Trailing 1h ATM volume (lookahead-free)
-    vol_15m = atm.set_index("timestamp").resample("15min")["amount"].sum()
-    trailing_vol = vol_15m.rolling(4, min_periods=1).sum().rename("trailing_1h_volume")
+    # 4c. Trailing 1h ATM volume (lookahead-free).
+    # Resample target + rolling window are derived from config.bucket_freq
+    # so the 1h lookback stays 1h at any bar cadence. At bucket_freq="15min"
+    # this reproduces the legacy resample("15min").rolling(4) exactly
+    # (bars_per_hour=4). At h=5 (bucket_freq="5min") it becomes
+    # resample("5min").rolling(12). Horizon SSOT in vol_arb.config.VolArbConfig.
+    bar_td = pd.Timedelta(config.bucket_freq)
+    bars_per_hour = int(round(pd.Timedelta(hours=1) / bar_td))
+    if bars_per_hour < 1:
+        raise ValueError(
+            f"bucket_freq={config.bucket_freq!r} yields <1 bar/hour; "
+            f"trailing 1h volume would be ill-defined. Use a sub-hour cadence."
+        )
+    vol_bars = atm.set_index("timestamp").resample(config.bucket_freq)["amount"].sum()
+    trailing_vol = (
+        vol_bars.rolling(bars_per_hour, min_periods=1).sum().rename("trailing_1h_volume")
+    )
     trailing_vol_df = trailing_vol.reset_index()
-    logger.info("Trailing 1h ATM volume: median=%.1f BTC, mean=%.1f BTC (%d buckets)",
-                trailing_vol.median(), trailing_vol.mean(), len(trailing_vol))
+    logger.info("Trailing 1h ATM volume: median=%.1f BTC, mean=%.1f BTC (%d buckets at %s)",
+                trailing_vol.median(), trailing_vol.mean(), len(trailing_vol),
+                config.bucket_freq)
 
     # 5. Build composite instruments (ATM straddle + bear/bull strangles)
     logger.info("Building composite instruments (straddle + strangles)...")

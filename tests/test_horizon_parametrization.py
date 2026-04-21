@@ -35,8 +35,8 @@ import pytest
 
 from vol_arb.backtester import BacktestConfig
 from vol_arb.paths import (
-    har_pd_features_path, har_pd_predictions_path, kelly_sidecar_path,
-    trade_log_path,
+    bar_exec_quality_path, har_pd_features_path, har_pd_predictions_path,
+    kelly_sidecar_path, svi_features_path, trade_log_path,
 )
 from vol_model.config import VolModelConfig
 
@@ -153,6 +153,48 @@ def test_kelly_sidecar_path_h15_legacy():
 def test_kelly_sidecar_path_other_horizons_have_h_suffix(h, variant):
     p = kelly_sidecar_path("BTC", h, variant=variant)
     assert p.stem == f"BTC_v2_kelly_mult_{variant}_h{h}m"
+
+
+# ── Phase 2h5.0c: SVI features + bar_exec_quality horizon-aware paths ──
+
+def test_svi_features_path_h15_legacy():
+    """h=15 preserves the literal legacy BTC SVI features path."""
+    p = svi_features_path("BTC", horizon_minutes=15)
+    assert p == Path("vol_arb/output/svi_features_15m.parquet")
+
+
+def test_svi_features_path_h15_eth_legacy():
+    """h=15 non-BTC uses the pre-horizon per-currency layout."""
+    p = svi_features_path("ETH", horizon_minutes=15)
+    assert p == Path("vol_arb/output/ETH_svi_features_15m.parquet")
+
+
+@pytest.mark.parametrize("h", [5, 30, 60])
+def test_svi_features_path_other_horizons_have_h_suffix(h):
+    p = svi_features_path("BTC", horizon_minutes=h)
+    assert p.stem == f"svi_features_h{h}m", p
+
+
+def test_bar_exec_quality_path_h15_legacy():
+    """h=15 preserves the literal legacy BTC bar-exec-quality path."""
+    p = bar_exec_quality_path("BTC", horizon_minutes=15)
+    assert p == Path("vol_arb/output/bar_execution_quality.parquet")
+
+
+@pytest.mark.parametrize("h", [5, 30, 60])
+def test_bar_exec_quality_path_other_horizons_have_h_suffix(h):
+    p = bar_exec_quality_path("BTC", horizon_minutes=h)
+    assert p.stem == f"bar_execution_quality_h{h}m", p
+
+
+def test_svi_features_path_default_kwarg_is_h15():
+    """Calling the helper WITHOUT horizon_minutes must still return the
+    legacy h=15 path — byte-identity guarantee for pre-Phase-2h5 callers.
+    """
+    assert svi_features_path("BTC") == svi_features_path("BTC", horizon_minutes=15)
+    assert bar_exec_quality_path("BTC") == bar_exec_quality_path(
+        "BTC", horizon_minutes=15,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -301,15 +343,21 @@ _HARDCODED_RESAMPLE_15MIN = re.compile(r"""\.resample\(\s*['"]15min['"]""")
 
 @pytest.mark.parametrize("path", [
     "vol_model/features/derivatives.py",
+    # Phase 2h5.0a/b lint: trailing-volume + VPIN resample must derive
+    # cadence from config / kwarg, not a hardcoded "15min" literal.
+    "vol_arb/pipeline.py",
+    "vol_arb/drl_hedging/vpin.py",
 ])
 def test_no_hardcoded_resample_15min(path):
-    """Resampling targets must come from ``config.tf_str`` — not a
-    hardcoded ``"15min"`` literal.
+    """Resampling targets must come from a cadence parameter — never a
+    hardcoded ``"15min"`` literal — in modules that feed the per-horizon
+    pipeline. Catches Phase 2h5.0 regressions.
     """
     repo_root = Path(__file__).resolve().parents[1]
     text = (repo_root / path).read_text(encoding="utf-8")
     matches = _HARDCODED_RESAMPLE_15MIN.findall(text)
     assert not matches, (
-        f"{path}: found hardcoded `.resample(\"15min\")` — use "
-        f"`.resample(config.tf_str)` instead."
+        f"{path}: found hardcoded `.resample(\"15min\")` — derive "
+        f"cadence from `config.bucket_freq` / `config.tf_str` / "
+        f"`tf_str` kwarg instead."
     )

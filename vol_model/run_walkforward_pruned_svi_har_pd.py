@@ -199,19 +199,20 @@ def _load_har_pd(asset: str, horizon_minutes: int = 15) -> pd.DataFrame:
 def _load_svi_atm_1d(currency: str, horizon_minutes: int = 15) -> pd.DataFrame:
     """Load svi_atm_1d from the per-currency SVI features parquet with leakage shift.
 
-    The underlying SVI features parquet is built at 15-min resolution
-    (a function of the option-chain snapshot cadence); samples at
-    coarser horizons (30m, 60m) are taken on-grid (every 4th / 2nd
-    sample). Finer horizons (5m) are not supported until a 5-min SVI
-    feature regen is run separately. The shift below scales with
-    horizon so the +1-bar alignment is always exactly one production
-    bar wide.
+    The SVI features parquet at h=15 is the legacy unsuffixed file
+    (15-min resolution, built at 1h SVI calibration bucketed into 15m
+    bars). For h ∈ {30m, 60m} the 15m SVI is on-grid and gets subsampled
+    (every 2nd / 4th row). For h=5m a separate regen at
+    ``--svi-bucket-freq 5min`` produces ``svi_features_h5m.parquet``
+    which this loader picks up via the horizon-aware path helper. The
+    alignment shift always equals one production bar (horizon_minutes).
     """
-    svi_path = svi_features_path(currency)
+    svi_path = svi_features_path(currency, horizon_minutes=horizon_minutes)
     if not svi_path.exists():
         raise FileNotFoundError(
             f"SVI features not found at {svi_path} — "
-            f"rebuild via `python -m vol_arb.run_pipeline --currency {currency} --svi`"
+            f"rebuild via `python -m vol_arb.run_pipeline --currency {currency} "
+            f"--svi --svi-bucket-freq {horizon_minutes}min`"
         )
     svi = pd.read_parquet(svi_path)
     # Ensure DatetimeIndex (ETH parquet may have timestamp as a column, not the index)

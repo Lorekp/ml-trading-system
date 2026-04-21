@@ -568,7 +568,9 @@ class BacktestConfig(BaseModel):
 
         See plan starry-rolling-rabin.md Phase 1f.
         """
-        from vol_arb.paths import har_pd_predictions_path, kelly_sidecar_path
+        from vol_arb.paths import (
+            bar_exec_quality_path, har_pd_predictions_path, kelly_sidecar_path,
+        )
 
         if 1440 % horizon_minutes != 0:
             raise ValueError(
@@ -581,6 +583,11 @@ class BacktestConfig(BaseModel):
         # keeps stored paths cross-platform identical (Windows would
         # otherwise stringify Path objects with backslashes and silently
         # diverge from the literal "vol_model/output/..." defaults).
+        #
+        # VPIN: NOT threaded here because the backtester computes VPIN
+        # on-the-fly from returns (see compute_vpin_proxy_from_returns
+        # call at L1501). VPIN parquets at per-horizon paths exist only
+        # for DRL *training*, not for backtest-time inference.
         return base.model_copy(update=dict(
             **cls._v2_horizon_invariants(),
             # holding_minutes already set by for_timeframe(); do NOT override.
@@ -589,6 +596,9 @@ class BacktestConfig(BaseModel):
             ).as_posix(),
             kelly_mult_path=kelly_sidecar_path(
                 "BTC", horizon_minutes, variant="K1",
+            ).as_posix(),
+            bar_exec_quality_path=bar_exec_quality_path(
+                "BTC", horizon_minutes=horizon_minutes,
             ).as_posix(),
         ))
 

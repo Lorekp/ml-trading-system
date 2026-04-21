@@ -570,6 +570,7 @@ class BacktestConfig(BaseModel):
         """
         from vol_arb.paths import (
             bar_exec_quality_path, har_pd_predictions_path, kelly_sidecar_path,
+            vol_arb_path,
         )
 
         if 1440 % horizon_minutes != 0:
@@ -599,6 +600,9 @@ class BacktestConfig(BaseModel):
             ).as_posix(),
             bar_exec_quality_path=bar_exec_quality_path(
                 "BTC", horizon_minutes=horizon_minutes,
+            ).as_posix(),
+            vol_arb_path=vol_arb_path(
+                "BTC", svi=True, horizon_minutes=horizon_minutes,
             ).as_posix(),
         ))
 

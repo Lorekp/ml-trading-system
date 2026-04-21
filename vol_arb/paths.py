@@ -43,9 +43,17 @@ def _asset(asset: str | None = None, currency: str | None = None) -> str:
 
 # ── Vol-arb shared-surface artifacts (per currency) ─────────────────────
 
-def vol_arb_path(currency: str = "BTC", svi: bool = True) -> Path:
-    """Merged vol-arb dataset (option IV × TSRV × DVOL + optional SVI)."""
+def vol_arb_path(
+    currency: str = "BTC", svi: bool = True, horizon_minutes: int = 15,
+) -> Path:
+    """Merged vol-arb dataset (option IV × TSRV × DVOL + optional SVI).
+
+    h=15 returns the legacy unsuffixed path (byte-identical); h!=15
+    suffixed with ``_h{N}m`` so per-horizon SVI regens do not clobber
+    the h=15 production dataset.
+    """
     stem = f"{currency}_vol_arb_svi" if svi else f"{currency}_vol_arb"
+    stem = _suffix_horizon(stem, horizon_minutes)
     return Path(f"vol_arb/output/{stem}.parquet")
 
 

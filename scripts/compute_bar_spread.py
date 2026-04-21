@@ -30,8 +30,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("bar_spread")
 
 
-def process_day(day_path: Path) -> list[dict]:
-    """Compute per-bar execution metrics for one day."""
+def process_day(day_path: Path, bar_minutes: int = 15) -> list[dict]:
+    """Compute per-bar execution metrics for one day.
+
+    ``bar_minutes`` controls both the bar-grouping window and the
+    trailing metric definition (trailing "previous bar" is always
+    previous ``bar_minutes``-width window). Default 15 preserves legacy
+    output exactly.
+    """
     df = pd.read_parquet(day_path)
     if len(df) < 10:
         return []
@@ -59,8 +65,8 @@ def process_day(day_path: Path) -> list[dict]:
     # Per-trade slippage
     df["slip_usd"] = (df["price"] - df["mark_price"]).abs() * df["index_price"]
 
-    # Group by 15-min bar
-    bar_freq_ms = 900_000
+    # Group by bar_minutes-width bar (900_000 ms at h=15; 300_000 at h=5; etc.)
+    bar_freq_ms = int(bar_minutes) * 60_000
     df["bar_ms"] = (df["timestamp"] // bar_freq_ms) * bar_freq_ms
 
     rows = []
@@ -105,18 +111,32 @@ def process_day(day_path: Path) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Per-bar execution quality from Deribit trade tape")
     parser.add_argument("--asset", default="BTCUSDT", help="BTCUSDT or ETHUSDT")
+    parser.add_argument("--bar-minutes", type=int, default=15,
+                        help="Bar size in minutes (default 15). Drives both "
+                             "the bar-grouping and the output path suffix via "
+                             "vol_arb.paths.bar_exec_quality_path. At h=5 pass 5.")
     args = parser.parse_args()
+    if 1440 % args.bar_minutes != 0:
+        parser.error(
+            f"--bar-minutes={args.bar_minutes} must divide 1440; "
+            f"choose 5, 15, 30, 60, etc."
+        )
 
     currency = CURRENCY_FOR_ASSET[args.asset]
     trade_dir = option_trade_dir(currency)
-    output_path = bar_exec_quality_path(currency)
+    output_path = bar_exec_quality_path(
+        currency, horizon_minutes=args.bar_minutes,
+    )
 
     files = sorted(trade_dir.glob("*.parquet"))
-    logger.info("[%s] Processing %d daily files from %s", currency, len(files), trade_dir)
+    logger.info(
+        "[%s @ h=%dm] Processing %d daily files from %s -> %s",
+        currency, args.bar_minutes, len(files), trade_dir, output_path,
+    )
 
     all_rows = []
     for i, f in enumerate(files):
-        rows = process_day(f)
+        rows = process_day(f, bar_minutes=args.bar_minutes)
         all_rows.extend(rows)
         if (i + 1) % 200 == 0:
             logger.info("  [%d/%d] %d bars", i + 1, len(files), len(all_rows))

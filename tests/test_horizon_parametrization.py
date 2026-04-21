@@ -36,7 +36,7 @@ import pytest
 from vol_arb.backtester import BacktestConfig
 from vol_arb.paths import (
     bar_exec_quality_path, har_pd_features_path, har_pd_predictions_path,
-    kelly_sidecar_path, svi_features_path, trade_log_path,
+    kelly_sidecar_path, svi_features_path, trade_log_path, vol_arb_path,
 )
 from vol_model.config import VolModelConfig
 
@@ -194,6 +194,31 @@ def test_svi_features_path_default_kwarg_is_h15():
     assert svi_features_path("BTC") == svi_features_path("BTC", horizon_minutes=15)
     assert bar_exec_quality_path("BTC") == bar_exec_quality_path(
         "BTC", horizon_minutes=15,
+    )
+
+
+def test_vol_arb_path_h15_legacy():
+    """h=15 returns the literal legacy BTC merged dataset path."""
+    assert vol_arb_path("BTC", svi=True, horizon_minutes=15) == Path(
+        "vol_arb/output/BTC_vol_arb_svi.parquet"
+    )
+    assert vol_arb_path("BTC", svi=False, horizon_minutes=15) == Path(
+        "vol_arb/output/BTC_vol_arb.parquet"
+    )
+
+
+@pytest.mark.parametrize("h", [5, 30, 60])
+def test_vol_arb_path_other_horizons_have_h_suffix(h):
+    p = vol_arb_path("BTC", svi=True, horizon_minutes=h)
+    assert p.stem == f"BTC_vol_arb_svi_h{h}m", p
+
+
+def test_vol_arb_path_default_kwarg_is_h15():
+    """Bare `vol_arb_path("BTC", svi=True)` must equal the h=15 helper
+    result — byte-identity guarantee for pre-Phase-2h5 callers.
+    """
+    assert vol_arb_path("BTC", svi=True) == vol_arb_path(
+        "BTC", svi=True, horizon_minutes=15,
     )
 
 

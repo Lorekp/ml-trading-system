@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 
 import math
+import pandas as pd
 
 from vol_arb.config import VolArbConfig
 from vol_arb.paths import (
@@ -65,7 +66,19 @@ def main():
                              "('1h'). Set to '15min' to match a 15m holding "
                              "strategy — the resulting svi_features cadence "
                              "matches the TSRV 15m grid.")
+    parser.add_argument("--bar-minutes", type=int, default=15,
+                        help="Target bar cadence for the WHOLE pipeline: TSRV "
+                             "input parquet, SVI calibration buckets, composite-"
+                             "straddle bucketing, and output filenames. Default "
+                             "15 (legacy BTC production). At h=5 pass 5; at h=60 "
+                             "pass 60. Must divide 1440. See plan "
+                             "starry-rolling-rabin.md Phase 2h5.2a.")
     args = parser.parse_args()
+    if 1440 % args.bar_minutes != 0:
+        parser.error(
+            f"--bar-minutes={args.bar_minutes} must divide 1440; "
+            f"choose 5, 15, 30, 60, etc."
+        )
 
     ccy = args.currency.upper()
     asset = f"{ccy}USDT"
@@ -74,11 +87,16 @@ def main():
         raise ValueError(f"Unsupported currency {ccy!r}; add to _SLIPPAGE_EDGES first.")
     edges = _SLIPPAGE_EDGES[ccy]
 
+    # Unified cadence: --bar-minutes drives TSRV / SVI-bucket / composite-
+    # straddle bucketing. --svi-bucket-freq can still override SVI alone
+    # (for studies where SVI runs at a DIFFERENT cadence than the bar grid),
+    # but the default is "match bar_minutes" so the pipeline is coherent.
+    bar_freq_str = f"{args.bar_minutes}min"
     cfg_kwargs = dict(
         currency=ccy,
         option_trade_dir=str(option_trade_dir(ccy)),
         dvol_path=str(dvol_path(ccy)),
-        tsrv_path=str(tsrv_path(asset)),
+        tsrv_path=str(tsrv_path(asset, tf_min=args.bar_minutes)),
         moneyness_lo=args.moneyness_lo,
         moneyness_hi=args.moneyness_hi,
         dte_min_days=args.dte_min,
@@ -87,9 +105,14 @@ def main():
         svi_enabled=args.svi,
         slippage_size_edges=edges["size_edges"],
         slippage_vol_edges=edges["vol_edges"],
+        bucket_freq=bar_freq_str,
     )
+    # Default SVI calibration cadence = bar cadence (coherent); user can
+    # override explicitly to decouple.
     if args.svi_bucket_freq is not None:
         cfg_kwargs["svi_bucket_freq"] = args.svi_bucket_freq
+    else:
+        cfg_kwargs["svi_bucket_freq"] = bar_freq_str
     config = VolArbConfig(**cfg_kwargs)
 
     if args.include_features:
@@ -102,11 +125,18 @@ def main():
     # Verify
     verify_alignment(merged)
 
-    # Save vol-arb dataset via resolver (BTC keeps legacy unsuffixed filename).
+    # Save vol-arb dataset via resolver. BTC @ h=15 keeps legacy unsuffixed
+    # filename for byte-identity; other horizons get _h{N}m suffix so h=5 SVI
+    # regen does not clobber the h=15 production file.
     if args.output:
         out_path = Path(args.output)
     else:
-        out_path = vol_arb_path(ccy, svi=args.svi)
+        _merged_bar_minutes = int(
+            round(pd.Timedelta(config.bucket_freq).total_seconds() / 60.0)
+        )
+        out_path = vol_arb_path(
+            ccy, svi=args.svi, horizon_minutes=_merged_bar_minutes,
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(out_path)
     logger.info("Saved %d rows x %d cols to %s", len(merged), merged.shape[1], out_path)

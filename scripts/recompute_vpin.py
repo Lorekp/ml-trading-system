@@ -295,8 +295,14 @@ def main() -> None:
     # Resolve paths via vol_arb.paths so layout stays consistent
     from vol_arb.paths import vol_arb_path as _vol_arb_path, vpin_path as _vpin_path, CURRENCY_FOR_ASSET
     ccy = CURRENCY_FOR_ASSET[args.asset]
+    # Horizon-aware vol_arb index source: reindex VPIN onto the BAR grid
+    # matching the active horizon, not the default h=15 file. Missing h=5
+    # vol_arb_svi parquet -> surface as FileNotFoundError (don't silently
+    # fall back to h=15, which would mis-align the output).
     if not args.vol_arb_path:
-        args.vol_arb_path = str(_vol_arb_path(ccy, svi=True))
+        args.vol_arb_path = str(_vol_arb_path(
+            ccy, svi=True, horizon_minutes=args.bar_minutes,
+        ))
     if not args.output:
         args.output = str(_vpin_path(ccy, bar_minutes=args.bar_minutes))
     aggtrades_root = Path(f"data/binance-aggTrades-parquet/{args.asset}")

@@ -19,7 +19,7 @@ from vol_model.config import VolModelConfig
 logger = logging.getLogger(__name__)
 
 
-def _load_iv_at_decision_time(asset: str, index: pd.Index) -> pd.Series:
+def _load_iv_at_decision_time(asset: str, index: pd.Index, freq_s: int) -> pd.Series:
     """Load iv_used at the *decision* time for each label bar.
 
     At label bar ``t_i`` the model's decision is made at ``t_{i-1}`` (the
@@ -31,6 +31,11 @@ def _load_iv_at_decision_time(asset: str, index: pd.Index) -> pd.Series:
     Uses the same fallback chain the backtester applies:
     ``svi_iv_matched.fillna(iv).fillna(dvol_close)`` so training and
     inference see the same IV definition.
+
+    ``freq_s`` is the bar size in seconds (= ``config.freq_s``); the shift
+    must equal the label horizon, so callers MUST pass the same freq_s the
+    rest of the label pipeline uses. See horizon SSOT in
+    ``VolModelConfig.horizon_minutes`` (plan: starry-rolling-rabin.md).
     """
     ccy = CURRENCY_FOR_ASSET[asset]
     path = _vol_arb_path(ccy, svi=True)
@@ -44,11 +49,9 @@ def _load_iv_at_decision_time(asset: str, index: pd.Index) -> pd.Series:
         va["svi_iv_matched"].fillna(va["iv"]).fillna(va["dvol_close"])
     ) / 100.0  # pct -> decimal
     # Shift +1 freq so that at label index t_i, the aligned value is the
-    # iv_used observed at the decision time t_{i-1}.
-    freq = index.freq if index.freq is not None else None
-    # We don't rely on a DataFrame-level freq (TSRV bars may have gaps); use
-    # the config-implied 15m step directly via index arithmetic:
-    iv_used.index = iv_used.index + pd.Timedelta(minutes=15)
+    # iv_used observed at the decision time t_{i-1}. Horizon-derived from
+    # freq_s — at h=15 this is +15m (legacy behaviour); at h=60 it's +60m.
+    iv_used.index = iv_used.index + pd.Timedelta(seconds=freq_s)
     # Align to the label index (forward-fill is NOT appropriate here — if a
     # decision-time iv_used is missing, the row should drop out of training).
     return iv_used.reindex(index)
@@ -89,7 +92,9 @@ def load_labels(config: VolModelConfig) -> pd.DataFrame:
     # Optional target reparameterization: subtract log(IV_at_decision_time)
     # BEFORE clipping, so the clip bounds reflect the reparam'd distribution.
     if getattr(config, "predict_excess_logvol", False):
-        iv_decision = _load_iv_at_decision_time(config.asset, valid.index)
+        iv_decision = _load_iv_at_decision_time(
+            config.asset, valid.index, config.freq_s
+        )
         log_iv = np.log(iv_decision)
         ln_vol = ln_vol - log_iv
         # Rows where iv_used is missing at decision time become NaN — drop

@@ -46,16 +46,24 @@ import numpy as np
 import pandas as pd
 
 
-# Kernel decay values — fast (0.05, half-life ~14 bars = 3.5h), medium (0.1,
-# half-life ~7 bars = 1.75h), slow (0.3, half-life ~2 bars = 30min).
-# These span the range where Corsi-HAR uses 1/5/22-day fixed windows.
+# Kernel decay values — fast (0.05, half-life ~14 bars = 3.5h @ 15m), medium
+# (0.1, half-life ~7 bars = 1.75h @ 15m), slow (0.3, half-life ~2 bars = 30m
+# @ 15m). These span the range where Corsi-HAR uses 1/5/22-day fixed windows.
+# Half-life intuition scales with bar size — the per-bar decay rate is the
+# same; only the wall-clock duration of the kernel changes.
 ALPHA_GRID: tuple[float, ...] = (0.05, 0.1, 0.3)
 BETA_GRID: tuple[float, ...] = (0.05, 0.1, 0.3)
 
-# Truncate the exponential kernel at 96 bars (24 hours at 15-min cadence).
-# At alpha=0.05 (slowest), the weight at bar 96 is 0.05 * 0.95^95 ~ 0.0004 —
-# negligible relative to the sum. A finite K keeps the computation vectorizable.
-K_BARS: int = 96
+# Truncate the exponential kernel at 24 wall-clock hours (96 bars at 15-min,
+# 24 bars at 60-min, 288 bars at 5-min). At alpha=0.05 (slowest), the weight
+# at the truncation bar is ~0.0004 — negligible relative to the sum. A finite
+# K keeps the computation vectorizable.
+#
+# K_BARS_DEFAULT preserves the legacy 96-bar (= 24h @ 15m) default for any
+# caller that does NOT pass an explicit k_bars; the production path uses
+# config.bars_per_24h via compute_har_pd_features(..., k_bars=...).
+K_BARS_DEFAULT: int = 96
+K_BARS: int = K_BARS_DEFAULT  # backwards-compat alias (legacy callers)
 
 HAR_PD_RAW_FEATURES: tuple[str, ...] = (
     "har_pd_R1_a005", "har_pd_R1_a01", "har_pd_R1_a03",
@@ -63,7 +71,7 @@ HAR_PD_RAW_FEATURES: tuple[str, ...] = (
 )
 
 
-def _exponential_kernel_weights(alpha: float, k_bars: int = K_BARS) -> np.ndarray:
+def _exponential_kernel_weights(alpha: float, k_bars: int = K_BARS_DEFAULT) -> np.ndarray:
     """Return the exponential decay weights w_k = alpha*(1-alpha)^(k-1) for k=1..k_bars.
 
     Normalized so sum(w_k) == 1 (removes dependence on the sum-truncation).
@@ -103,18 +111,24 @@ def _weighted_rolling_sum(series: pd.Series, weights: np.ndarray) -> pd.Series:
     return pd.Series(out, index=series.index)
 
 
-def compute_har_pd_features(tsrv: pd.DataFrame) -> pd.DataFrame:
+def compute_har_pd_features(
+    tsrv: pd.DataFrame, k_bars: int = K_BARS_DEFAULT,
+) -> pd.DataFrame:
     """Build the HAR-PD feature block from a TSRV parquet.
 
     Parameters
     ----------
-    tsrv : DataFrame indexed by 15-min timestamp with columns
+    tsrv : DataFrame indexed by bar-frequency timestamp with columns
         rs_up, rs_down, rv_ann. Only these columns are used.
+    k_bars : Kernel truncation length in bars. Default = 96 (legacy 24h @
+        15m). Production callers should pass ``config.bars_per_24h`` so the
+        kernel covers exactly 24 wall-clock hours regardless of horizon.
+        See horizon SSOT in ``VolModelConfig``.
 
     Returns
     -------
     DataFrame indexed identically to tsrv, with six columns listed in
-    HAR_PD_RAW_FEATURES. First K_BARS rows are NaN by construction.
+    HAR_PD_RAW_FEATURES. First ``k_bars`` rows are NaN by construction.
     """
     required = {"rs_up", "rs_down", "rv_ann"}
     missing = required - set(tsrv.columns)
@@ -131,10 +145,10 @@ def compute_har_pd_features(tsrv: pd.DataFrame) -> pd.DataFrame:
 
     out: dict[str, pd.Series] = {}
     for alpha, suffix in zip(ALPHA_GRID, ("a005", "a01", "a03")):
-        w = _exponential_kernel_weights(alpha)
+        w = _exponential_kernel_weights(alpha, k_bars=k_bars)
         out[f"har_pd_R1_{suffix}"] = _weighted_rolling_sum(signed_flow, w)
     for beta, suffix in zip(BETA_GRID, ("b005", "b01", "b03")):
-        w = _exponential_kernel_weights(beta)
+        w = _exponential_kernel_weights(beta, k_bars=k_bars)
         out[f"har_pd_R2_{suffix}"] = _weighted_rolling_sum(realized_var, w)
 
     return pd.DataFrame(out, index=tsrv.index)
@@ -146,19 +160,38 @@ def main() -> int:
     ap.add_argument("--asset", default="BTCUSDT", choices=["BTCUSDT", "ETHUSDT"])
     ap.add_argument("--tsrv", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--horizon-minutes", type=int, default=15,
+        help="Bar size in minutes (15 default). Drives both the input "
+             "TSRV path suffix and the K_BARS=24h-equivalent kernel "
+             "truncation. See horizon SSOT in VolModelConfig.",
+    )
     args = ap.parse_args()
 
+    horizon_minutes: int = args.horizon_minutes
+    if 1440 % horizon_minutes != 0:
+        raise SystemExit(
+            f"--horizon-minutes={horizon_minutes} does not divide 1440; "
+            f"choose a value such that bars_per_day is integer (e.g. 5, 15, 30, 60)."
+        )
+    k_bars = 1440 // horizon_minutes  # bars_per_24h
+
     if args.tsrv is None:
-        args.tsrv = Path(f"TSRV/output/{args.asset}_tsrv_15m.parquet")
+        args.tsrv = Path(f"TSRV/output/{args.asset}_tsrv_{horizon_minutes}m.parquet")
     if args.out is None:
-        args.out = Path(f"vol_model/output/{args.asset}_features_har_pd_15m.parquet")
+        args.out = Path(
+            f"vol_model/output/{args.asset}_features_har_pd_{horizon_minutes}m.parquet"
+        )
 
     print(f"[har_pd] loading TSRV: {args.tsrv}")
     tsrv = pd.read_parquet(args.tsrv)
     print(f"[har_pd]   {len(tsrv)} rows, {len(tsrv.columns)} cols")
 
-    print(f"[har_pd] computing 6 features at K={K_BARS} bars, alpha/beta grids {ALPHA_GRID} / {BETA_GRID}...")
-    feats = compute_har_pd_features(tsrv)
+    print(
+        f"[har_pd] computing 6 features at K={k_bars} bars (= 24h @ "
+        f"{horizon_minutes}m), alpha/beta grids {ALPHA_GRID} / {BETA_GRID}..."
+    )
+    feats = compute_har_pd_features(tsrv, k_bars=k_bars)
 
     # Stats
     for c in feats.columns:

@@ -72,14 +72,21 @@ def _load_oi_15m(
     oi_dir: str,
     symbol: str,
     target_index: pd.DatetimeIndex,
+    tf_str: str,
     close_prices: pd.Series | None = None,
     hl_cache_dir: str = "data/hl-asset-ctxs/cache_15m",
 ) -> pd.DataFrame:
-    """Load 15m OI data and compute features.
+    """Load OI data and compute features at the bar frequency given by ``tf_str``.
 
     Tries sources in order:
-    1. Binance OI (data/oi/{SYMBOL}_oi_15m.parquet)
-    2. HL asset_ctxs cache (data/hl-asset-ctxs/cache_15m/{COIN}.parquet)
+    1. Binance OI (data/oi/{SYMBOL}_oi_15m.parquet) — fixed 15m granularity
+       on disk; assumed to align with target_index when h=15.
+    2. HL asset_ctxs cache (data/hl-asset-ctxs/cache_15m/{COIN}.parquet) —
+       1-min source, resampled to ``tf_str`` here.
+
+    ``tf_str`` MUST equal ``config.tf_str`` (see horizon SSOT in
+    VolModelConfig). The legacy "15m" suffix in the function name is
+    historical — the implementation is horizon-aware.
 
     Returns empty DataFrame if no OI data is available.
     """
@@ -105,9 +112,11 @@ def _load_oi_15m(
             if "open_interest" in hl.columns and "mark_px" in hl.columns:
                 # OI in coin units -> USD: open_interest * mark_px
                 oi_usd = hl["open_interest"] * hl["mark_px"]
-                # Resample 1-min to 15-min (last value per window)
-                oi = oi_usd.resample("15min").last().dropna()
-                logger.info("  OI source: HL asset_ctxs (%d rows after 15m resample)", len(oi))
+                # Resample 1-min to bar frequency (last value per window).
+                # tf_str comes from config.tf_str (horizon SSOT) — at h=15
+                # this is "15min", at h=60 it's "60min" etc.
+                oi = oi_usd.resample(tf_str).last().dropna()
+                logger.info("  OI source: HL asset_ctxs (%d rows after %s resample)", len(oi), tf_str)
 
     if oi is None:
         logger.info("  OI data not found — skipping OI features")
@@ -164,8 +173,11 @@ def compute_derivatives_features(
         config.funding_dir, config.asset, target_index,
         config.funding_window_short, config.funding_window_long)
 
-    # OI features (optional — gracefully degrades if not available)
-    oi = _load_oi_15m(config.oi_dir, config.asset, target_index, close_prices)
+    # OI features (optional — gracefully degrades if not available).
+    # Pass config.tf_str so HL 1-min source resamples to the active horizon.
+    oi = _load_oi_15m(
+        config.oi_dir, config.asset, target_index, config.tf_str, close_prices,
+    )
 
     # Merge
     features = pd.concat([funding, oi], axis=1)

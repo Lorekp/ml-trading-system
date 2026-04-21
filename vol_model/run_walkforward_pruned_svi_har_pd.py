@@ -55,8 +55,9 @@ from optuna.pruners import MedianPruner
 from scipy.stats import spearmanr
 
 from vol_arb.paths import (
-    drop_features_path, pruned_features_path, pruned_svi_model_dir,
-    svi_features_path, transvol_dir, CURRENCY_FOR_ASSET,
+    drop_features_path, har_pd_features_path, pruned_features_path,
+    pruned_svi_model_dir, svi_features_path, transvol_dir,
+    CURRENCY_FOR_ASSET,
 )
 from vol_model.config import VolModelConfig
 from vol_model.model import qlike_loss, qlike_metric, qlike_objective
@@ -115,51 +116,58 @@ ADD_HAR_PD_FEATURES = [
 ]
 
 
-def _load_har_pd(asset: str) -> pd.DataFrame:
-    """Load HAR-PD sidecar with a −15m alignment shift.
+def _load_har_pd(asset: str, horizon_minutes: int = 15) -> pd.DataFrame:
+    """Load HAR-PD sidecar with a −1-bar alignment shift.
 
     Alignment rationale (maximise usable information without leakage)
     ----------------------------------------------------------------
     Ideal: at decision time wall-clock T, predict the label for bar
-    [T, T+15m) using ALL data known at or before wall-clock T. The most
-    recent complete TSRV bar is [T-15m, T) — end-stamped at T, realised
-    at wall-clock T, therefore safe to use.
+    [T, T+h) using ALL data known at or before wall-clock T. The most
+    recent complete TSRV bar is [T-h, T) — end-stamped at T, realised
+    at wall-clock T, therefore safe to use. (h = horizon_minutes.)
 
     Raw HAR-PD sidecar (end-stamped, inherited from TSRV): the sidecar's
     construction uses ``shift(1).rolling(K)``, so HAR-PD at sidecar
     index T uses TSRV values at end-stamps T-1, T-2, ..., T-K (i.e.,
-    bars ending 15m..K*15m before wall-clock T). Latest info in those
-    values is known at wall-clock T-15m.
+    bars ending h..K*h before wall-clock T). Latest info in those
+    values is known at wall-clock T-h.
 
     Joined WITHOUT shift to the start-stamped label at index T (vol of
-    [T, T+15m)): feature-info cutoff = T-15m, prediction window starts
-    = T. That is a 15-minute GAP of wasted data — the bar ending at T
+    [T, T+h)): feature-info cutoff = T-h, prediction window starts
+    = T. That is an h-minute GAP of wasted data — the bar ending at T
     (known at T, strictly before the prediction window) is silently
     discarded. Non-leaky but sub-optimal.
 
-    Fix: shift the sidecar index by −15m. After the shift, "new sidecar
-    index T" holds values that originally lived at T+15m, i.e., a HAR-PD
+    Fix: shift the sidecar index by −h. After the shift, "new sidecar
+    index T" holds values that originally lived at T+h, i.e., a HAR-PD
     row computed from TSRV end-stamps T, T-1, ..., T-(K-1). Latest TSRV
     used = bar ending at wall-clock T, known at T. Joined to label at
-    T (vol of [T, T+15m)): feature-info cutoff = T, prediction start =
+    T (vol of [T, T+h)): feature-info cutoff = T, prediction start =
     T. Zero-minute gap, still non-leaky (feature is strictly known at
     decision time, prediction window is strictly in the future).
 
     This matches the 0-minute-gap alignment production's SVI feature
-    uses (``_load_svi_atm_1d`` applies +15m to raw SVI whose natural
-    stamp lives 15m AHEAD of the label). Both features therefore land
+    uses (``_load_svi_atm_1d`` applies +h to raw SVI whose natural
+    stamp lives h AHEAD of the label). Both features therefore land
     with feature-info-cutoff = label-start = decision time.
 
     Leakage safety is empirically verified by
     tests/test_walkforward_pruned_svi_har_pd.py::test_no_lookahead_after_shift
     which mutates TSRV at bars starting at or after T and confirms that
     the post-shift HAR-PD value at new-index T is byte-identical.
+
+    ``horizon_minutes`` defaults to 15 to preserve byte-identity with the
+    pre-horizon-SSOT call site; production callers should pass
+    ``vol_config.horizon_minutes`` so the shift always equals one bar.
     """
-    path = Path("vol_model/output") / f"{asset}_features_har_pd_15m.parquet"
+    # Sidecar file naming via the horizon-aware path helper (SSOT in
+    # vol_arb.paths.har_pd_features_path).
+    path = har_pd_features_path(asset, horizon_minutes)
     if not path.exists():
         raise FileNotFoundError(
             f"HAR-PD sidecar not found at {path} — "
-            f"build via `python -m vol_model.features.har_pd --asset {asset}`"
+            f"build via `python -m vol_model.features.har_pd --asset {asset}"
+            f" --horizon-minutes {horizon_minutes}`"
         )
     hpd = pd.read_parquet(path)
     if "timestamp" in hpd.columns and not isinstance(hpd.index, pd.DatetimeIndex):
@@ -176,19 +184,29 @@ def _load_har_pd(asset: str) -> pd.DataFrame:
 
     # Alignment shift: see docstring. After this line, the value at
     # index T is HAR-PD computed from TSRV end-stamps T, T-1, ..., T-K+1,
-    # i.e., info known exactly through wall-clock T.
-    hpd_add.index = hpd_add.index - pd.Timedelta(minutes=15)
+    # i.e., info known exactly through wall-clock T. Shift size = one
+    # bar = horizon_minutes (15 by default for byte-identity).
+    hpd_add.index = hpd_add.index - pd.Timedelta(minutes=horizon_minutes)
 
     coverage = hpd_add.notna().all(axis=1).mean()
     logger.info(
-        "Loaded HAR-PD sidecar (−15m aligned): %d rows, cols=%s, %.1f%% full-coverage",
-        len(hpd_add), ADD_HAR_PD_FEATURES, 100 * coverage,
+        "Loaded HAR-PD sidecar (−%dm aligned): %d rows, cols=%s, %.1f%% full-coverage",
+        horizon_minutes, len(hpd_add), ADD_HAR_PD_FEATURES, 100 * coverage,
     )
     return hpd_add
 
 
-def _load_svi_atm_1d(currency: str) -> pd.DataFrame:
-    """Load svi_atm_1d from the per-currency SVI features parquet with leakage shift."""
+def _load_svi_atm_1d(currency: str, horizon_minutes: int = 15) -> pd.DataFrame:
+    """Load svi_atm_1d from the per-currency SVI features parquet with leakage shift.
+
+    The underlying SVI features parquet is built at 15-min resolution
+    (a function of the option-chain snapshot cadence); samples at
+    coarser horizons (30m, 60m) are taken on-grid (every 4th / 2nd
+    sample). Finer horizons (5m) are not supported until a 5-min SVI
+    feature regen is run separately. The shift below scales with
+    horizon so the +1-bar alignment is always exactly one production
+    bar wide.
+    """
     svi_path = svi_features_path(currency)
     if not svi_path.exists():
         raise FileNotFoundError(
@@ -210,16 +228,18 @@ def _load_svi_atm_1d(currency: str) -> pd.DataFrame:
     svi_add = svi[ADD_SVI_FEATURES].copy()
 
     # LEAKAGE FIX (Stage 15.1): X.index is the LABEL timestamp (T+1) but X's
-    # data comes from the feature time T.  SVI features indexed at T+1 would
-    # be contemporaneous with the label.  Shift SVI index forward by 15 min
-    # so SVI[T] aligns with X[T+1] — i.e., SVI from the PREVIOUS bar is
-    # associated with the CURRENT bar's label.
-    svi_add.index = svi_add.index + pd.Timedelta(minutes=15)
+    # data comes from the feature time T. SVI features indexed at T+1 would
+    # be contemporaneous with the label. Shift SVI index forward by ONE
+    # PRODUCTION BAR (= horizon_minutes) so SVI[T] aligns with X[T+1] —
+    # i.e., SVI from the PREVIOUS bar is associated with the CURRENT bar's
+    # label. Default 15m for byte-identity with the pre-horizon-SSOT
+    # production code path.
+    svi_add.index = svi_add.index + pd.Timedelta(minutes=horizon_minutes)
 
     coverage = svi_add[ADD_SVI_FEATURES[0]].notna().mean()
     logger.info(
-        "Loaded SVI features (+15m aligned): %d rows, cols=%s, %.1f%% coverage",
-        len(svi_add), ADD_SVI_FEATURES, 100 * coverage,
+        "Loaded SVI features (+%dm aligned): %d rows, cols=%s, %.1f%% coverage",
+        horizon_minutes, len(svi_add), ADD_SVI_FEATURES, 100 * coverage,
     )
     return svi_add
 
@@ -358,12 +378,14 @@ def main() -> None:
     from vol_model.labels import load_labels
     labels = load_labels(vol_config)
 
-    # Load the SVI feature(s)
-    svi_add = _load_svi_atm_1d(currency)
+    # Load the SVI feature(s) — alignment shift = one production bar.
+    svi_add = _load_svi_atm_1d(currency, horizon_minutes=vol_config.horizon_minutes)
 
-    # Load HAR-PD sidecar (6 features). No leakage shift — sidecar index is
-    # already strictly-pre-label by construction (shift(1).rolling(K)).
-    har_pd_add = _load_har_pd(args.asset)
+    # Load HAR-PD sidecar (6 features). No LEAKAGE shift — sidecar index is
+    # already strictly-pre-label by construction (shift(1).rolling(K)). The
+    # `-horizon_minutes` shift inside `_load_har_pd` is an information-recovery
+    # shift, not a leakage fix (see docstring).
+    har_pd_add = _load_har_pd(args.asset, horizon_minutes=vol_config.horizon_minutes)
 
     data_start = X.index.min()
     start = pd.Timestamp(args.start + "-01", tz="UTC")
@@ -487,7 +509,10 @@ def main() -> None:
             sampler=TPESampler(seed=42),
             pruner=MedianPruner(n_startup_trials=5),
         )
-        obj = _make_objective(dtrain, dval, X_val_w.values, y_val.values, "cpu")
+        obj = _make_objective(
+            dtrain, dval, X_val_w.values, y_val.values, "cpu",
+            horizon_minutes=vol_config.horizon_minutes,
+        )
         study.optimize(
             obj,
             n_trials=args.max_trials,

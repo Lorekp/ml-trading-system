@@ -138,7 +138,21 @@ def main():
                              "(produced by scripts/generate_kelly_sidecar.py). "
                              "Multiplier >= 1.0 (upside only) applies AFTER "
                              "profit_scaling and BEFORE dynamic_btc_cap clip.")
+    parser.add_argument("--horizon-minutes", type=int, default=15,
+                        help="Prediction horizon in minutes (default 15). When "
+                             "combined with --btc-production-v2 selects the "
+                             "matching per-horizon V2 preset "
+                             "(`with_btc_production_h{N}m()`). Sidecars at "
+                             "h!=15 must already be regenerated; missing files "
+                             "surface as a backtester load error rather than "
+                             "silent fallback. Must divide 1440 (e.g., 5, 15, "
+                             "30, 60). See plan starry-rolling-rabin.md.")
     args = parser.parse_args()
+    if 1440 % args.horizon_minutes != 0:
+        parser.error(
+            f"--horizon-minutes={args.horizon_minutes} must divide 1440; "
+            f"choose 5, 15, 30, 60, etc."
+        )
 
     config_kwargs = dict(
         base_spread_iv=args.base_spread,
@@ -186,7 +200,17 @@ def main():
     if args.btc_production:
         config = config.with_btc_production_filters()
     if args.btc_production_v2:
-        config = config.with_btc_production_filters_v2()
+        # Per-horizon dispatch: at h=15 use the named legacy preset
+        # (preserves the test_production_v2_kelly_default_is_K1 invariant
+        # and is byte-identical to current production). At h!=15 use the
+        # generic for-horizon factory which composes for_timeframe(N) +
+        # V1 filters + V2 horizon-invariants + horizon-aware paths.
+        if args.horizon_minutes == 15:
+            config = config.with_btc_production_filters_v2()
+        else:
+            config = BacktestConfig.with_btc_production_for_horizon(
+                args.horizon_minutes,
+            )
     # Explicit --min-dte-days / --skip-long-hours-utc override the preset
     # so users can sweep filter-level knobs while keeping realistic costs.
     if args.min_dte_days is not None:

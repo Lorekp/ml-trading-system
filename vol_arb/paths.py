@@ -151,6 +151,126 @@ def oof_predictions_path(asset: str = "BTCUSDT") -> Path:
     return Path(f"vol_model/output/{asset}_oof_predictions.parquet")
 
 
+# ── Horizon-aware artifact paths ────────────────────────────────────────
+#
+# All horizon-suffixed helpers follow the same convention:
+#   - h=15 (legacy production) returns the existing UNSUFFIXED path so
+#     refactor-time byte-identity is automatic.
+#   - h≠15 returns the same path with a `_h{N}m` suffix appended before
+#     the .parquet extension.
+#
+# The convention lives ONLY here so any place that needs a
+# horizon-tagged file path goes through these helpers. The horizon
+# comes from `vol_model.config.VolModelConfig.horizon_minutes`
+# (the SSOT). See plan: starry-rolling-rabin.md Phase 1c.
+
+def _suffix_horizon(stem: str, horizon_minutes: int) -> str:
+    """Return ``stem`` with ``_h{N}m`` appended when N != 15.
+
+    At h=15 the stem is returned unchanged so production paths stay byte-
+    identical to the pre-horizon-SSOT layout.
+    """
+    if horizon_minutes == 15:
+        return stem
+    return f"{stem}_h{horizon_minutes}m"
+
+
+def har_pd_features_path(
+    asset: str = "BTCUSDT", horizon_minutes: int = 15,
+) -> Path:
+    """HAR-PD raw feature sidecar (per-horizon).
+
+    h=15: ``vol_model/output/{asset}_features_har_pd_15m.parquet``
+          (legacy name, kept for byte-identity).
+    h=N : ``vol_model/output/{asset}_features_har_pd_{N}m.parquet``.
+
+    Note: the legacy 15m suffix was always literal "_15m"; the helper
+    keeps that exact stem at h=15 and uses "_{N}m" at other horizons.
+    The "_h{N}m" convention used by other helpers does NOT apply here
+    because the on-disk legacy name embeds the bar size directly.
+    """
+    return Path(
+        f"vol_model/output/{asset}_features_har_pd_{horizon_minutes}m.parquet"
+    )
+
+
+def har_pd_predictions_path(
+    asset: str = "BTCUSDT",
+    horizon_minutes: int = 15,
+    *,
+    aligned_bias: bool = False,
+) -> Path:
+    """HAR-PD walk-forward OOS predictions (per-horizon).
+
+    h=15 (aligned_bias=False): ``vol_model/output/{asset}_pruned_svi_har_pd_predictions.parquet``
+    h=15 (aligned_bias=True):  ``vol_model/output/{asset}_pruned_svi_har_pd_predictions_aligned_bias.parquet``
+    h=N : same with ``_h{N}m`` appended before .parquet.
+    """
+    base = f"{asset}_pruned_svi_har_pd_predictions"
+    if aligned_bias:
+        base = f"{base}_aligned_bias"
+    stem = _suffix_horizon(base, horizon_minutes)
+    return Path(f"vol_model/output/{stem}.parquet")
+
+
+def har_pd_model_dir(
+    asset: str = "BTCUSDT", horizon_minutes: int = 15,
+) -> Path:
+    """LightGBM HAR-PD per-month walk-forward checkpoints (per-horizon).
+
+    h=15 (BTC, legacy): ``vol_model/output/models/expanding_pruned_svi_har_pd_v1``
+    h=15 (other asset): ``vol_model/output/models/expanding_pruned_svi_har_pd_v1_{asset}``
+    h=N : same with ``_h{N}m`` appended.
+    """
+    if asset == "BTCUSDT":
+        stem = "expanding_pruned_svi_har_pd_v1"
+    else:
+        stem = f"expanding_pruned_svi_har_pd_v1_{asset}"
+    stem = _suffix_horizon(stem, horizon_minutes)
+    return Path(f"vol_model/output/models/{stem}")
+
+
+def trade_log_path(
+    currency: str = "BTC",
+    horizon_minutes: int = 15,
+    *,
+    variant: str = "v2",
+    suffix: str = "",
+) -> Path:
+    """Backtester trade log (per-horizon, per-variant).
+
+    Legacy h=15 paths preserved verbatim:
+      - variant="v2", suffix="":         BTC_v2_trade_log.parquet
+      - variant="v2", suffix="baseline": BTC_v2_trade_log_baseline.parquet
+      - variant="v2", suffix="aligned_bias": BTC_v2_trade_log_aligned_bias.parquet
+      - variant="v2", suffix="dfl_A1_filter25": BTC_v2_trade_log_dfl_A1_filter25.parquet
+      - variant="v2", suffix="throttled_static": BTC_v2_trade_log_throttled_static.parquet
+
+    h=N appends ``_h{N}m`` before .parquet.
+    """
+    stem = f"{currency}_{variant}_trade_log"
+    if suffix:
+        stem = f"{stem}_{suffix}"
+    stem = _suffix_horizon(stem, horizon_minutes)
+    return Path(f"vol_arb/output/{stem}.parquet")
+
+
+def kelly_sidecar_path(
+    currency: str = "BTC",
+    horizon_minutes: int = 15,
+    *,
+    variant: str = "K1",
+) -> Path:
+    """Kelly multiplier sidecar (per-horizon).
+
+    h=15: ``vol_arb/output/{currency}_v2_kelly_mult_{variant}.parquet`` (legacy)
+    h=N : same with ``_h{N}m`` appended before .parquet.
+    """
+    stem = f"{currency}_v2_kelly_mult_{variant}"
+    stem = _suffix_horizon(stem, horizon_minutes)
+    return Path(f"vol_arb/output/{stem}.parquet")
+
+
 # ── DRL hedging per-asset artifacts ────────────────────────────────────
 
 def sac_model_dir(asset: str = "BTCUSDT", tag: str = "v4") -> Path:

@@ -56,6 +56,7 @@ DFL_LGBM_PARAMS = dict(
 def build_head_features(
     trade_log: pd.DataFrame,
     predictions: pd.DataFrame,
+    horizon_minutes: int = 15,
 ) -> pd.DataFrame:
     """Compute the 10 DFL-head input features.
 
@@ -67,24 +68,47 @@ def build_head_features(
     predictions :
         HAR-PD predictions, must have ``y_pred``, ``y_true``,
         indexed by matching timestamps.
+    horizon_minutes :
+        Bar size in minutes. Drives the wall-clock-equivalent of the
+        24h / 6h / 2h rolling windows below. Default 15 preserves
+        byte-identity with the production V2 (h=15) sidecar; per-
+        horizon callers MUST pass the active config's horizon (see
+        SSOT in ``VolModelConfig.horizon_minutes``).
 
     Returns
     -------
     pd.DataFrame indexed by trade_log index with the 10 feature
     columns (NaN where rolling windows lack history).
     """
+    # Wall-clock-fixed rolling windows derived from horizon. At h=15
+    # these reproduce the legacy 96 / 24 / 8 bar counts exactly.
+    if 1440 % horizon_minutes != 0:
+        raise ValueError(
+            f"horizon_minutes={horizon_minutes} does not divide 1440; "
+            f"choose 5, 15, 30, 60, etc."
+        )
+    bars_per_24h = 1440 // horizon_minutes              # 96 @ h=15, 24 @ h=60
+    bars_per_6h  = 360 // horizon_minutes               # 24 @ h=15,  6 @ h=60
     df = trade_log[["signal", "iv_used", "net_pnl_nc"]].join(
         predictions[["y_pred", "y_true"]], how="inner"
     )
     df["iv_log"] = np.log(df["iv_used"] / 100.0)
     df["pred_edge_log"] = df["y_pred"] - df["iv_log"]
     df["abs_pred_edge_log"] = df["pred_edge_log"].abs()
-    df["past_vol_24h"] = df["y_true"].shift(1).rolling(96, min_periods=24).mean()
-    df["past_vol_6h"]  = df["y_true"].shift(1).rolling(24, min_periods=8).mean()
-    df["past_vol_std"] = df["y_true"].shift(1).rolling(96, min_periods=24).std()
+    df["past_vol_24h"] = df["y_true"].shift(1).rolling(
+        bars_per_24h, min_periods=max(1, bars_per_24h // 4)).mean()
+    df["past_vol_6h"]  = df["y_true"].shift(1).rolling(
+        bars_per_6h, min_periods=max(1, bars_per_6h // 3)).mean()
+    df["past_vol_std"] = df["y_true"].shift(1).rolling(
+        bars_per_24h, min_periods=max(1, bars_per_24h // 4)).std()
     r = df["y_true"] - df["y_pred"]
-    df["recent_resid_24h"]     = r.shift(1).rolling(96, min_periods=24).mean()
-    df["recent_abs_resid_24h"] = r.abs().shift(1).rolling(96, min_periods=24).mean()
+    df["recent_resid_24h"]     = r.shift(1).rolling(
+        bars_per_24h, min_periods=max(1, bars_per_24h // 4)).mean()
+    df["recent_abs_resid_24h"] = r.abs().shift(1).rolling(
+        bars_per_24h, min_periods=max(1, bars_per_24h // 4)).mean()
+    # Byte-identity check at h=15: bars_per_24h=96, bars_per_24h//4=24;
+    # bars_per_6h=24, //3=8. Production h=15 reproduces the original
+    # 96/24, 24/8, 96/24, 96/24, 96/24 (window, min_periods) tuples.
     return df[DFL_HEAD_FEATURES].copy()
 
 
@@ -95,6 +119,7 @@ def compute_walkforward_scores(
     min_train_trades: int = 500,
     train_bucket: str = "year",
     seed: int = 42,
+    horizon_minutes: int = 15,
 ) -> pd.Series:
     """Train a DFF head walk-forward and return P(win) for each
     trade-fired bar in the trade log.
@@ -118,7 +143,7 @@ def compute_walkforward_scores(
     """
     from lightgbm import LGBMClassifier, early_stopping
 
-    feats = build_head_features(trade_log, predictions)
+    feats = build_head_features(trade_log, predictions, horizon_minutes=horizon_minutes)
     tr = trade_log.loc[trade_log["signal"] != 0].copy()
     tr["win"] = (tr["net_pnl_nc"] > 0).astype(int)
 

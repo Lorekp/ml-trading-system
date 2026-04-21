@@ -4,10 +4,22 @@ Added 2026-04-17 foundation fix: prevent accidental drift of the V2 production
 hold config back to 30m. The 15m hold was chosen to match the model's
 ``[D, D+15m]`` prediction horizon; see
 ``vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md``.
+
+Generalised 2026-04-21 (Phase 1g of starry-rolling-rabin.md) to cover
+per-horizon presets — the parametrized invariant
+``test_v2_preset_horizon_matches_holding_minutes`` lifts the original
+"hold == 15" lock to "hold == prediction horizon" for any horizon the
+plan adds. The legacy literal-15 test
+(``test_production_v2_holding_minutes_is_15``) is kept verbatim because
+it is the byte-identity guarantee for the existing h=15 production
+default.
 """
 from __future__ import annotations
 
+import pytest
+
 from vol_arb.backtester import BacktestConfig
+from vol_arb.paths import har_pd_predictions_path, kelly_sidecar_path
 
 
 def test_production_v2_holding_minutes_is_15():
@@ -119,4 +131,60 @@ def test_production_v2_kelly_default_is_K1():
         f"at {expected!r}; got {cfg.kelly_mult_path!r}. Reverting "
         f"to None re-introduces the +$114K PnL gap (long-side "
         f"high-|edge| boost) — see KELLY_SHRINKAGE_PHASE2_REPORT.md."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-04-21 Phase 1g: generalized foundation invariant.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("horizon_minutes", [15, 5, 30, 60])
+def test_v2_preset_horizon_matches_holding_minutes(horizon_minutes):
+    """Generalised foundation-fix invariant: the V2 BTC preset's
+    ``holding_minutes`` MUST equal the horizon embedded in its
+    ``predictions_path`` (and its ``kelly_mult_path``).
+
+    Construction pattern under test (see ``BacktestConfig`` Phase 1f):
+      - h=15: ``with_btc_production_filters_v2()`` (legacy entry point)
+      - h≠15: ``with_btc_production_for_horizon(N)`` /
+              ``with_btc_production_h{N}m()``
+
+    The invariant catches the foundation-fix failure mode in any future
+    horizon: pairing a 60-min predictions parquet with a 15-min hold
+    silently throws away half the information, just as 30-min hold on
+    15-min predictions did before 2026-04-17. See
+    ``project_foundation_fix_2026_04_17.md``.
+
+    NOTE: This test does NOT load the predictions parquet (which may
+    not exist for new horizons until Phase 2); it asserts the
+    config-level pairing only. The runtime check happens when the
+    backtester opens the file in Phase 3.
+    """
+    if horizon_minutes == 15:
+        cfg = BacktestConfig().with_btc_production_filters_v2()
+    else:
+        cfg = BacktestConfig.with_btc_production_for_horizon(horizon_minutes)
+    assert cfg.holding_minutes == horizon_minutes, (
+        f"V2 preset at h={horizon_minutes}m has "
+        f"holding_minutes={cfg.holding_minutes}; this re-introduces the "
+        f"foundation-fix failure mode (model-horizon != backtester-hold)."
+    )
+    expected_predictions = har_pd_predictions_path(
+        "BTCUSDT", horizon_minutes, aligned_bias=True,
+    ).as_posix()
+    assert cfg.predictions_path == expected_predictions, (
+        f"V2 preset at h={horizon_minutes}m has "
+        f"predictions_path={cfg.predictions_path!r}; expected "
+        f"{expected_predictions!r}. Mismatch means the backtester would "
+        f"open a wrong-horizon predictions file silently."
+    )
+    expected_kelly = kelly_sidecar_path(
+        "BTC", horizon_minutes, variant="K1",
+    ).as_posix()
+    assert cfg.kelly_mult_path == expected_kelly, (
+        f"V2 preset at h={horizon_minutes}m has "
+        f"kelly_mult_path={cfg.kelly_mult_path!r}; expected "
+        f"{expected_kelly!r}. Cross-horizon Kelly load is invalid by "
+        f"construction (sidecar is fit to a specific trade log)."
     )

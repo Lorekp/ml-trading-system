@@ -32,9 +32,18 @@ class PurgedKFold(BaseCrossValidator):
         t1: Series mapping observation start → observation end (barrier touch time).
             This is the 't1' column from get_events().
         pct_embargo: Fraction of total observations to exclude after each test fold.
-                     Default 0.01 = 1% of data as buffer zone.
+                     Default 0.01 = 1% of data as buffer zone. **Used only when
+                     ``embargo_bars`` is None.**
         label_span: Number of bars a label spans (for index-based purge when t1 is None).
                     Default 30. Set to fwd_bars for your specific setup.
+        embargo_bars: Optional ABSOLUTE bar count for embargo. When provided,
+                      overrides ``pct_embargo`` so the embargo size is
+                      independent of total observation count. Use this when the
+                      caller has horizon-aware lookback information (e.g.,
+                      max(label_span, max_feature_lookback_bars)) — see plan
+                      starry-rolling-rabin.md Phase 1d. Default ``None``
+                      preserves the legacy ``pct_embargo`` behaviour
+                      byte-identically.
     """
 
     def __init__(
@@ -43,12 +52,14 @@ class PurgedKFold(BaseCrossValidator):
         t1: pd.Series | None = None,
         pct_embargo: float = 0.01,
         label_span: int = 30,
+        embargo_bars: int | None = None,
     ):
         super().__init__()
         self.n_splits = n_splits
         self.t1 = t1
         self.pct_embargo = pct_embargo
         self.label_span = label_span
+        self.embargo_bars = embargo_bars
 
     def get_n_splits(self, X=None, y=None, groups=None) -> int:
         return self.n_splits
@@ -72,7 +83,14 @@ class PurgedKFold(BaseCrossValidator):
                 indices = self.t1.index[:len(X)]
 
         n_obs = len(indices)
-        embargo_size = int(n_obs * self.pct_embargo)
+        # Embargo size: prefer the absolute bar count when caller supplied one
+        # (horizon-aware path used by per-horizon training pipelines); fall
+        # back to the legacy pct_embargo behaviour when not. This preserves
+        # byte-identity for all pre-horizon-SSOT call sites.
+        if self.embargo_bars is not None:
+            embargo_size = int(self.embargo_bars)
+        else:
+            embargo_size = int(n_obs * self.pct_embargo)
 
         # Create time-based folds (chronological splits)
         fold_boundaries = np.linspace(0, n_obs, self.n_splits + 1, dtype=int)

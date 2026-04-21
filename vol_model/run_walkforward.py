@@ -150,8 +150,27 @@ def _load_month_features(model_dir: Path, month_str: str) -> list[str] | None:
 # ── Optuna objective with cached datasets ────────────────────
 
 def _make_objective(dtrain: lgb.Dataset, dval: lgb.Dataset,
-                    X_val: np.ndarray, y_val: np.ndarray, device: str):
-    """Create an Optuna objective closure over pre-built LGB datasets."""
+                    X_val: np.ndarray, y_val: np.ndarray, device: str,
+                    *, horizon_minutes: int = 15):
+    """Create an Optuna objective closure over pre-built LGB datasets.
+
+    ``horizon_minutes`` scales the ``min_data_in_leaf`` search range so the
+    leaf-size bounds in WALL-CLOCK terms stay roughly constant across
+    bar frequencies. At h=15 (legacy default) the range is the original
+    [50, 500] — byte-identical. At h=60 it becomes [200, 2000]
+    (~50–500 hours of leaf data); at h=5 [16, 166] (~1.4–13.8 hours).
+    Bar-count granularity is what LGBM actually optimises over, but
+    leaf-time governs how generalisable each leaf is — keeping the latter
+    constant prevents the search from collapsing to either degenerate
+    over-fitting (h=5 with [50, 500] = trivial leaves) or
+    under-resolution (h=60 with [50, 500] = monstrously coarse leaves).
+    See plan starry-rolling-rabin.md Phase 1e and
+    feedback_gauntlet_budget.md (TPE convergence is bar-count-agnostic;
+    don't crank trials).
+    """
+    scale = horizon_minutes / 15.0
+    leaf_lo = max(10, int(round(50 * scale)))
+    leaf_hi = max(leaf_lo + 1, int(round(500 * scale)))
 
     def objective(trial):
         params = {
@@ -159,7 +178,7 @@ def _make_objective(dtrain: lgb.Dataset, dval: lgb.Dataset,
             "num_leaves": trial.suggest_int("num_leaves", 16, 128),
             "max_depth": trial.suggest_int("max_depth", 3, 10),
             "learning_rate": trial.suggest_float("learning_rate", 0.001, 0.05, log=True),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 500),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", leaf_lo, leaf_hi),
             "lambda_l1": trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
             "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 0.9),

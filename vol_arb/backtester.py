@@ -67,8 +67,13 @@ class BacktestConfig(BaseModel):
 
     # VRP baseline (off by default — inflates edge and creates false long signals)
     use_vrp: bool = False
-    vrp_window: int = 672             # rolling window for VRP (672 = 7 days of 15m bars)
-    vrp_min_periods: int = 96         # minimum periods (96 = 1 day)
+    # Bar-count constants below are LEGACY 15m defaults. For other horizons
+    # use ``BacktestConfig.for_timeframe(bar_minutes=N)`` which derives
+    # ``vrp_window=bpd*7`` and ``vrp_min_periods=bpd`` from N — preserves
+    # the "7 days / 1 day" wall-clock semantics across horizons. Per-horizon
+    # presets ``with_btc_production_h{N}m()`` chain through that factory.
+    vrp_window: int = 672             # rolling window for VRP (672 = 7 days @ 15m)
+    vrp_min_periods: int = 96         # minimum periods (96 = 1 day @ 15m)
 
     # Position sizing: Deribit Portfolio Margin utilization
     initial_equity: float = 100_000.0
@@ -499,19 +504,8 @@ class BacktestConfig(BaseModel):
               ``vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md``.
         """
         return self.with_btc_production_filters().model_copy(update=dict(
-            entry_threshold_long=12.0,
-            use_drl_hedging=True,
-            use_profit_scaling=True,
-            profit_scaling_floor=0.3,
-            target_margin_utilization=0.15,
+            **self._v2_horizon_invariants(),
             holding_minutes=15,
-            # sizing_model stays "composite_v2" (the v1 default) —
-            # native Kelly strategy tested but broke compound-mode
-            # path. The Kelly-shrinkage sidecar below is a different
-            # mechanism: a per-bar UPSIDE-ONLY multiplier (>=1.0)
-            # applied AFTER profit_scaling and BEFORE dynamic_btc_cap
-            # clip. Walk-forward, leakage-tested.
-            skip_long_if_term_slope_gt=0.0,
             # Kelly-shrinkage long-side boost adopted 2026-04-21 as
             # an accepted Sharpe-for-PnL tradeoff. Phase 2 backtest:
             # NC PnL +$114K (+13.5%) and Compound PnL +$2.84M (+17.9%)
@@ -525,6 +519,93 @@ class BacktestConfig(BaseModel):
                 "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
             ),
         ))
+
+    @staticmethod
+    def _v2_horizon_invariants() -> dict:
+        """V2-stack fields that DO NOT depend on prediction horizon.
+
+        Factored out so per-horizon presets (`with_btc_production_h{N}m`)
+        can apply the same V2 stack without duplicating the field list.
+
+        Excluded (because horizon-coupled): ``holding_minutes``,
+        ``predictions_path``, ``kelly_mult_path``, ``vrp_window``,
+        ``vrp_min_periods``. Those are set by `for_timeframe()` (vrp) and
+        per-horizon path helpers (predictions, kelly).
+        """
+        return dict(
+            entry_threshold_long=12.0,
+            use_drl_hedging=True,
+            use_profit_scaling=True,
+            profit_scaling_floor=0.3,
+            target_margin_utilization=0.15,
+            # sizing_model stays "composite_v2" (the v1 default) —
+            # native Kelly strategy tested but broke compound-mode
+            # path. The Kelly-shrinkage sidecar (kelly_mult_path) is a
+            # different mechanism: a per-bar UPSIDE-ONLY multiplier
+            # (>=1.0) applied AFTER profit_scaling and BEFORE
+            # dynamic_btc_cap clip. Walk-forward, leakage-tested.
+            skip_long_if_term_slope_gt=0.0,
+        )
+
+    @classmethod
+    def with_btc_production_for_horizon(cls, horizon_minutes: int) -> "BacktestConfig":
+        """Compose the V2 BTC stack at an arbitrary prediction horizon.
+
+        Used by `with_btc_production_h{5,30,60}m()` per-horizon presets.
+        Chain:
+          1. `for_timeframe(N)` → holding_minutes / vrp_window / vrp_min_periods.
+          2. `with_btc_production_filters()` → V1 filter stack
+             (thresholds, DTE, hour skip, util floor, taker-only).
+          3. `_v2_horizon_invariants()` → V2 risk stack
+             (DRL, profit_scaling, util=0.15, contango filter, thr_L=12).
+          4. Horizon-aware path overrides: aligned-bias HAR-PD predictions
+             + Kelly K1 sidecar resolved through `vol_arb.paths` helpers.
+
+        Sidecars at h≠15 must be regenerated separately; this preset
+        merely points at the convention-named locations. A missing file
+        will surface as a backtester load error rather than silently
+        falling back to a wrong-horizon sidecar.
+
+        See plan starry-rolling-rabin.md Phase 1f.
+        """
+        from vol_arb.paths import har_pd_predictions_path, kelly_sidecar_path
+
+        if 1440 % horizon_minutes != 0:
+            raise ValueError(
+                f"horizon_minutes={horizon_minutes} does not divide 1440; "
+                f"choose a value such that bars_per_day is integer."
+            )
+        base = cls.for_timeframe(horizon_minutes).with_btc_production_filters()
+        # ``.as_posix()`` (not ``str()``) so paths land in the same
+        # forward-slash form the legacy literal field defaults use; this
+        # keeps stored paths cross-platform identical (Windows would
+        # otherwise stringify Path objects with backslashes and silently
+        # diverge from the literal "vol_model/output/..." defaults).
+        return base.model_copy(update=dict(
+            **cls._v2_horizon_invariants(),
+            # holding_minutes already set by for_timeframe(); do NOT override.
+            predictions_path=har_pd_predictions_path(
+                "BTCUSDT", horizon_minutes, aligned_bias=True,
+            ).as_posix(),
+            kelly_mult_path=kelly_sidecar_path(
+                "BTC", horizon_minutes, variant="K1",
+            ).as_posix(),
+        ))
+
+    @classmethod
+    def with_btc_production_h5m(cls) -> "BacktestConfig":
+        """V2 BTC stack at h=5m. Sidecars must be regenerated per Phase 4."""
+        return cls.with_btc_production_for_horizon(5)
+
+    @classmethod
+    def with_btc_production_h30m(cls) -> "BacktestConfig":
+        """V2 BTC stack at h=30m. Sidecars must be regenerated per Phase 4."""
+        return cls.with_btc_production_for_horizon(30)
+
+    @classmethod
+    def with_btc_production_h60m(cls) -> "BacktestConfig":
+        """V2 BTC stack at h=60m. Sidecars must be regenerated per Phase 4."""
+        return cls.with_btc_production_for_horizon(60)
 
 
 # ── Discrete Delta Hedging Simulator ──────────────────────────

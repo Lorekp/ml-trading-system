@@ -185,5 +185,47 @@ class VolModelConfig(BaseModel):
             return self.tsrv_path
         tf_min = self.freq_s // 60
         return f"TSRV/output/{self.asset}_tsrv_{tf_min}m.parquet"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Horizon SSOT (single source of truth for bar frequency)
+    # ────────────────────────────────────────────────────────────────────
+    # The pipeline supports multiple prediction horizons (15m default; 5m,
+    # 30m, 60m via per-horizon presets). Every horizon-dependent constant
+    # downstream — feature lookback windows, backtester holding_minutes,
+    # sidecar paths — derives from these helpers, NOT from a hardcoded "15"
+    # somewhere. See plan: starry-rolling-rabin.md and
+    # tests/test_horizon_parametrization.py for the byte-identity guarantee
+    # at h=15.
+    #
+    # Why properties (not fields)? `freq_s` already encodes the horizon in
+    # seconds; adding a parallel `horizon_minutes` field would create the
+    # exact "two sources of truth" failure mode the foundation fix
+    # (2026-04-17) was designed to prevent. Properties stay derived and
+    # cannot drift.
+    @property
+    def horizon_minutes(self) -> int:
+        """Prediction horizon in minutes. Derived from freq_s."""
+        return self.freq_s // 60
+
+    @property
+    def bars_per_day(self) -> int:
+        """Number of bars in a calendar day at the current horizon."""
+        return 1440 // self.horizon_minutes
+
+    @property
+    def bars_per_24h(self) -> int:
+        """Alias for bars_per_day; clearer when used as a feature lookback."""
+        return self.bars_per_day
+
+    @property
+    def tf_str(self) -> str:
+        """pandas resample/Timedelta-compatible frequency string, e.g. '15min'."""
+        return f"{self.horizon_minutes}min"
+
+    @property
+    def horizon_suffix(self) -> str:
+        """Filename suffix used by horizon-aware path helpers, e.g. 'h60m'."""
+        return f"h{self.horizon_minutes}m"
+
     winsorize_lo: float = 0.01
     winsorize_hi: float = 0.99

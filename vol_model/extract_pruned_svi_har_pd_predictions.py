@@ -29,8 +29,9 @@ import numpy as np
 import pandas as pd
 
 from vol_arb.paths import (
-    drop_features_path, pruned_features_path, pruned_svi_model_dir,
-    pruned_svi_predictions_path, transvol_dir, CURRENCY_FOR_ASSET,
+    drop_features_path, har_pd_predictions_path, pruned_features_path,
+    pruned_svi_model_dir, pruned_svi_predictions_path, transvol_dir,
+    CURRENCY_FOR_ASSET,
 )
 from vol_model.config import VolModelConfig
 from vol_model.pipeline import build_dataset
@@ -81,7 +82,10 @@ def main() -> None:
         args.tag = "excess"
 
     currency = CURRENCY_FOR_ASSET[args.asset]
-    hybrid_dir = transvol_dir(args.asset)
+    # TransVol checkpoint dir must match the active horizon (see
+    # foundation-fix invariant: model horizon == feature horizon ==
+    # TransVol horizon). Legacy h=15 returns the unsuffixed BTC path.
+    hybrid_dir = transvol_dir(args.asset, horizon_minutes=args.tf // 60)
 
     # Resolve model dir — default mirrors the HAR-PD walk-forward's output dir.
     if args.model_dir:
@@ -97,9 +101,12 @@ def main() -> None:
     if args.output:
         output_path = Path(args.output)
     elif args.tf != 900:
-        base_path = pruned_svi_predictions_path(args.asset)
-        output_path = base_path.with_name(
-            base_path.stem.replace("_pruned_svi", "_pruned_svi_har_pd") + f"_{tf_min}m" + base_path.suffix
+        # Horizon-suffixed output via the Phase 1c path helper so this
+        # matches what backtester presets + sidecar generators expect.
+        # har_pd_predictions_path returns e.g. vol_model/output/
+        # BTCUSDT_pruned_svi_har_pd_predictions_h60m.parquet at h=60.
+        output_path = har_pd_predictions_path(
+            args.asset, tf_min, aligned_bias=False,
         )
     elif args.predict_excess_logvol:
         base_path = pruned_svi_predictions_path(args.asset)
@@ -107,9 +114,9 @@ def main() -> None:
             base_path.stem.replace("_pruned_svi", "_pruned_svi_har_pd") + "_excess" + base_path.suffix
         )
     else:
-        base_path = pruned_svi_predictions_path(args.asset)
-        output_path = base_path.with_name(
-            base_path.stem.replace("_pruned_svi", "_pruned_svi_har_pd") + base_path.suffix
+        # h=15 default — legacy unsuffixed name via the path helper.
+        output_path = har_pd_predictions_path(
+            args.asset, tf_min, aligned_bias=False,
         )
 
     print("=" * 70)

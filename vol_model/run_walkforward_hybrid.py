@@ -58,9 +58,16 @@ from vol_model.run_walkforward import _make_objective
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _load_all_data(asset: str):
-    """Load features, labels, and pruned feature list once for the given asset."""
-    vol_config = VolModelConfig(asset=asset)
+def _load_all_data(asset: str, horizon_minutes: int = 15):
+    """Load features, labels, and pruned feature list once for the given asset.
+
+    ``horizon_minutes`` drives the bar frequency of the underlying TSRV /
+    labels / features via ``VolModelConfig.freq_s``. Default 15 preserves
+    legacy behaviour byte-identically. The SVI features sidecar is fixed
+    at 15-min resolution, so h<15 would effectively subsample; at h=30 /
+    h=60 the intersection is clean.
+    """
+    vol_config = VolModelConfig(asset=asset, freq_s=horizon_minutes * 60)
     X, y, t1 = build_dataset(vol_config)
 
     # Pruned features (per-asset; BTC keeps legacy unsuffixed file)
@@ -285,19 +292,35 @@ def main():
     parser.add_argument("--end", default="2026-03")
     parser.add_argument("--max-trials", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--horizon-minutes", type=int, default=15,
+                        help="Prediction horizon / bar size in minutes. "
+                             "Default 15 preserves legacy behaviour. "
+                             "Per-horizon TransVol checkpoints land in a "
+                             "horizon-tagged directory via "
+                             "vol_arb.paths.transvol_dir so existing h=15 "
+                             "production checkpoints are never overwritten. "
+                             "Must divide 1440 (e.g., 15, 30, 60). See "
+                             "plan starry-rolling-rabin.md Phase 2c.")
     args = parser.parse_args()
+    if 1440 % args.horizon_minutes != 0:
+        parser.error(
+            f"--horizon-minutes={args.horizon_minutes} must divide 1440; "
+            f"choose 15, 30, 60, etc."
+        )
 
-    model_dir = transvol_dir(args.asset)
+    model_dir = transvol_dir(args.asset, horizon_minutes=args.horizon_minutes)
     model_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(f"  WALK-FORWARD HYBRID (strict no-leakage) — {args.asset}")
+    print(f"  WALK-FORWARD HYBRID (strict no-leakage) — {args.asset} @ h={args.horizon_minutes}m")
     print(f"  Checkpoints → {model_dir}")
     print("=" * 70)
 
     # Load all data once
     logger.info("Loading data...")
-    X, y, t1, pruned_cols, tv_cols, labels, vol_config = _load_all_data(args.asset)
+    X, y, t1, pruned_cols, tv_cols, labels, vol_config = _load_all_data(
+        args.asset, horizon_minutes=args.horizon_minutes,
+    )
     X_pruned = X[pruned_cols]
     X_tv = X[tv_cols]
     data_start = X.index.min()

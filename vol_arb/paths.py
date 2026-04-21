@@ -127,11 +127,21 @@ def drop_features_path(asset: str = "BTCUSDT") -> Path:
     return Path(f"vol_model/output/{asset}_drop_features.csv")
 
 
-def transvol_dir(asset: str = "BTCUSDT") -> Path:
-    """Walk-forward TransVol encoder checkpoints (50 months)."""
+def transvol_dir(asset: str = "BTCUSDT", horizon_minutes: int = 15) -> Path:
+    """Walk-forward TransVol encoder checkpoints (50 months).
+
+    h=15 keeps the legacy unsuffixed path for both BTC and non-BTC
+    assets (byte-identical to the pre-horizon-SSOT layout). h!=15
+    appends ``_h{N}m`` before any per-asset suffix so a single asset
+    can have multiple horizon-specific TransVol checkpoint trees
+    without collision.
+    """
     if asset == "BTCUSDT":
-        return Path("vol_model/output/models/expanding_hybrid")  # legacy
-    return Path(f"vol_model/output/models/expanding_hybrid_{asset}")
+        stem = "expanding_hybrid"  # legacy BTC
+    else:
+        stem = f"expanding_hybrid_{asset}"
+    stem = _suffix_horizon(stem, horizon_minutes)
+    return Path(f"vol_model/output/models/{stem}")
 
 
 def pruned_svi_model_dir(asset: str = "BTCUSDT") -> Path:

@@ -289,13 +289,34 @@ def main() -> None:
                              "to the output model directory so existing predictions "
                              "are not overwritten. See VolModelConfig.predict_excess_logvol "
                              "docstring for rationale.")
+    parser.add_argument("--no-transvol", action="store_true",
+                        help="Train WITHOUT TransVol embedding features "
+                             "(pruned + SVI + HAR-PD only). Required at "
+                             "horizons other than 15m unless TransVol "
+                             "checkpoints have been pre-trained at the "
+                             "active horizon (h=15 ships with 50 monthly "
+                             "checkpoints; new horizons would need ~24h+ "
+                             "of TransVol retraining each). Auto-applies "
+                             "tag 'no_tv' to the output model directory "
+                             "and predictions parquet so the no-TransVol "
+                             "variant cannot collide with the production "
+                             "TransVol-included artifacts.")
     args = parser.parse_args()
     # Auto-tag excess runs so we never overwrite the default-target predictions.
     if args.predict_excess_logvol and not args.tag and not args.output_dir:
         args.tag = "excess"
+    # Auto-tag no-TransVol runs so the artifact tree never collides with
+    # the production TransVol-included pipeline.
+    if args.no_transvol and not args.tag and not args.output_dir:
+        args.tag = "no_tv"
 
     currency = CURRENCY_FOR_ASSET[args.asset]
-    hybrid_dir = transvol_dir(args.asset)
+    # Resolve TransVol checkpoint dir from the ACTIVE horizon (set via
+    # --tf below before this line could have taken effect — re-read it
+    # after vol_config is finalized). Falls back to legacy h=15
+    # (unsuffixed) when args.tf is the default 900s.
+    _hybrid_h = args.tf // 60
+    hybrid_dir = transvol_dir(args.asset, horizon_minutes=_hybrid_h)
 
     # Resolve output directory
     if args.output_dir:
@@ -403,13 +424,16 @@ def main() -> None:
             logger.info("[%d/%d] %s: cached, skipping", i + 1, len(months), month_str)
             continue
 
-        tv_path = hybrid_dir / f"{month_str}_transvol.pt"
-        if not tv_path.exists():
-            logger.warning(
-                "[%d/%d] %s: no TransVol checkpoint at %s — skipping",
-                i + 1, len(months), month_str, tv_path,
-            )
-            continue
+        if not args.no_transvol:
+            tv_path = hybrid_dir / f"{month_str}_transvol.pt"
+            if not tv_path.exists():
+                logger.warning(
+                    "[%d/%d] %s: no TransVol checkpoint at %s — skipping",
+                    i + 1, len(months), month_str, tv_path,
+                )
+                continue
+        else:
+            tv_path = None  # not used in --no-transvol mode
 
         test_end = M + pd.DateOffset(months=1)
         V = max(M - pd.DateOffset(months=4), data_start + pd.DateOffset(months=12))
@@ -423,31 +447,52 @@ def main() -> None:
         )
         t0 = time.time()
 
-        # Extract TransVol embeddings from the frozen checkpoint
-        try:
-            emb_df = _extract_compact_embeddings(tv_path, X_tv, labels, test_end)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("%s: TransVol embedding extraction failed: %s", month_str, exc)
-            continue
+        # Extract TransVol embeddings from the frozen checkpoint (production
+        # path), unless the caller explicitly opted out via --no-transvol —
+        # used at non-15m horizons where TransVol was never retrained.
+        emb_df: pd.DataFrame | None
+        if args.no_transvol:
+            emb_df = None
+        else:
+            try:
+                emb_df = _extract_compact_embeddings(tv_path, X_tv, labels, test_end)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("%s: TransVol embedding extraction failed: %s", month_str, exc)
+                continue
 
-        # Build the training matrix: TransVol embeddings + pruned base
-        # + svi_atm_1d + HAR-PD. Intersect across all four indexes so every
-        # training row has all four feature groups populated.
-        common = (
-            X_pruned.index
-            .intersection(emb_df.index)
-            .intersection(svi_add.index)
-            .intersection(har_pd_add.index)
-        )
-        X_month = pd.concat(
-            [
-                emb_df.loc[common],
-                X_pruned.loc[common],
-                svi_add.loc[common],
-                har_pd_add.loc[common],
-            ],
-            axis=1,
-        )
+        # Build the training matrix: pruned base + svi_atm_1d + HAR-PD,
+        # plus TransVol embeddings when available. Intersect across all
+        # included feature groups so every training row has full coverage.
+        if emb_df is not None:
+            common = (
+                X_pruned.index
+                .intersection(emb_df.index)
+                .intersection(svi_add.index)
+                .intersection(har_pd_add.index)
+            )
+            X_month = pd.concat(
+                [
+                    emb_df.loc[common],
+                    X_pruned.loc[common],
+                    svi_add.loc[common],
+                    har_pd_add.loc[common],
+                ],
+                axis=1,
+            )
+        else:
+            common = (
+                X_pruned.index
+                .intersection(svi_add.index)
+                .intersection(har_pd_add.index)
+            )
+            X_month = pd.concat(
+                [
+                    X_pruned.loc[common],
+                    svi_add.loc[common],
+                    har_pd_add.loc[common],
+                ],
+                axis=1,
+            )
 
         common_y = X_month.index.intersection(y.index)
         X_month = X_month.loc[common_y]
@@ -572,10 +617,13 @@ def main() -> None:
             except Exception as shap_err:  # noqa: BLE001
                 logger.warning("SHAP failed for %s: %s", month_str, shap_err)
 
-        # Compare to the cached baseline from expanding_hybrid/ for this month
+        # Compare to the cached baseline from expanding_hybrid/ for this month.
+        # Skipped in --no-transvol mode because the baseline model itself
+        # uses TransVol embeddings (it would also be horizon-mismatched at
+        # h!=15 — the baseline checkpoints live only at h=15).
         baseline_path = hybrid_dir / f"{month_str}.txt"
         baseline_qlike = None
-        if baseline_path.exists():
+        if baseline_path.exists() and emb_df is not None:
             base_feat_path = hybrid_dir / f"{month_str}_features.json"
             if base_feat_path.exists():
                 base_cols = json.loads(base_feat_path.read_text())

@@ -58,16 +58,59 @@ and 59% better MDD, but ~5× fewer trades drops total dollar PnL to 24%
 of h=15. The pre-committed gates are dollar-PnL based → reject. Does not
 ship.
 
-### h=30m — pending
+### h=30m — full V2 stack (aligner + Kelly K1)
 
-HAR-PD walk-forward still running (`bgrxlh4fh` at launch). Results will
-be populated when the backtest completes.
-
-Training so far:
+Training:
 - TSRV bars: 91,535 (pre-existing).
 - HAR-PD sidecar: 91,487 non-null rows at K_BARS=48 (24h @ 30m).
-- TransVol full walk-forward: 50/50 months, avg QLIKE **0.5744**
-  (better than h=60's 0.5931), RankIC **0.633** (better than h=60's 0.573).
+- TransVol full walk-forward: 50/50 months, avg QLIKE 0.5744, RankIC 0.633.
+- HAR-PD walk-forward (w/ TransVol): 50/50 months, **avg ΔQLIKE −32.9%**
+  vs h=30 pruned+TransVol baseline (even larger relative gain than h=60's
+  −23.3% and far above h=15's −3.67%).
+- Walk-forward aligner: avg QLIKE improvement **−9.30%**; β̃ median +0.12
+  (under-prediction bias similar to h=60's +0.16).
+- Kelly K1 sidecar: 636/72,511 bars boosted, mean mult 1.0032, max 2.0.
+
+Backtest headline:
+
+| metric              | h=30m            | h=15m (production) | Δ             |
+|---------------------|------------------|--------------------|---------------|
+| NC PnL              | **$565,499**     | $959,571           | **−$394,072** |
+| CP PnL              | $10,019,806      | $18,707,982        | −$8,688,176   |
+| NC Sharpe           | 6.25             | 6.29               | −0.04         |
+| NC MDD              | −$7,458          | −$8,521            | +$1,063 ✓     |
+| n_trades            | 2,955            | 7,417              | −4,462        |
+| $/trade (NC)        | $191             | $129               | **+48%**      |
+
+Kelly K1 contribution at h=30: **+$74,664 NC (+15.2%)** at **−1.05 Sharpe**
+(bare Sharpe 7.30 → Kelly 6.25).
+
+**Gate check**: NC PnL Δ = −$394K < −$50K → **REJECT**.
+
+Best per-trade economics of the horizon grid ($191/trade, +48% vs h=15's
+$129), but ~40% of the trade count at h=15 collapses the absolute PnL.
+
+### Cross-horizon daily PnL correlation (h=5 pending)
+
+| pair           | Pearson ρ | Spearman ρ (tail-robust) |
+|----------------|-----------|--------------------------|
+| h=15 vs h=30   | **0.870** | 0.543                    |
+| h=15 vs h=60   | 0.747     | 0.450                    |
+| h=30 vs h=60   | 0.682     | 0.468                    |
+
+Closer bar sizes → higher correlation, as predicted. h=15 vs h=30 at 0.87
+is effectively the same signal sampled at a different cadence.
+
+**Portfolio Sharpe (equal-risk inverse-vol weighted)**:
+
+| blend                | solo Sharpe pair    | blend Sharpe | vs solo h=15 |
+|----------------------|---------------------|--------------|--------------|
+| h=15 + h=30 (41/59)  | 6.08 / 5.26         | 5.87         | **−0.21**    |
+| h=15 + h=60 (25/75)  | 6.08 / 4.41         | 5.61         | **−0.47**    |
+
+No multi-timeframe blend we tested beats solo h=15 on Sharpe. The
+observed correlations are too high for diversification to overcome the
+standalone-Sharpe drop at h≠15.
 
 ### h=15m — control (existing production, memory reference)
 

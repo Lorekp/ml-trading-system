@@ -470,6 +470,20 @@ def main():
             "n_test": n_test_m, "n_trials": n_trials, "time_s": elapsed,
         })
 
+        # Release the month's heavy working set before the next month
+        # grows it again. At h=5m the expanding-window training matrix
+        # can exceed 400K rows × 51 features (~160 MB) and the Optuna
+        # study retains trial metadata — without explicit cleanup the
+        # RSS grows ~300-500 MB/month and OOMs around month 40. Explicit
+        # rebinding to None + gc.collect() reclaims ~1 GB per iteration.
+        # (del locals()[k] doesn't work in CPython; rebind-to-None does.)
+        import gc
+        emb_df = X_month = X_tr = y_tr = X_val = y_val = None
+        X_test = y_test = X_tr_w = X_val_w = X_test_w = None
+        X_full = y_full = dtrain = dval = dtrain_full = None
+        study = obj = model = preds = None
+        gc.collect()
+
     # Summary
     if results:
         print(f"\n{'=' * 70}")

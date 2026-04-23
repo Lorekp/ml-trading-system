@@ -201,7 +201,19 @@ def _make_objective(dtrain: lgb.Dataset, dval: lgb.Dataset,
         )
 
         preds = model.predict(X_val)
-        return qlike_loss(y_val, preds)
+        loss = qlike_loss(y_val, preds)
+
+        # Explicit release of the per-trial LightGBM booster. Without
+        # this, CPython's reference counter holds the booster alive across
+        # trials long enough for a 400K+ row training set at h=5m to
+        # exhaust system memory around trial ~9-15. Seen in Phase 2h5.3:
+        # 0.4 GB booster × 10 trials = 4 GB leaked before MemoryError at
+        # a later 3 MiB allocation inside qlike_objective. gc.collect()
+        # is cheap (~5 ms) and one call per trial is safe.
+        del model, preds
+        import gc
+        gc.collect()
+        return loss
 
     return objective
 

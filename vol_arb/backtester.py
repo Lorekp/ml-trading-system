@@ -1486,6 +1486,22 @@ class VolArbBacktester:
         if cfg.use_drl_hedging:
             try:
                 from vol_arb.drl_hedging.env import DRLHedger  # lazy
+                # Horizon-cadence audit (Phase 2h5.7.B). The shipped SAC
+                # policy (production_sac_v4_final) was trained at the
+                # default DRLHedgingConfig.bar_minutes=15. When the
+                # backtester runs at a different holding cadence the
+                # policy still emits actions but its observation regime
+                # is off-distribution. Log a single warning so the
+                # mismatch is loud rather than silent.
+                if cfg.holding_minutes != 15:
+                    logger.warning(
+                        "DRL hedger horizon mismatch: policy trained at "
+                        "bar_minutes=15 but backtester holding_minutes=%d. "
+                        "Hedge actions are off-distribution; consider "
+                        "use_drl_hedging=False for this horizon. See plan "
+                        "starry-rolling-rabin.md Phase 2h5.7.B.",
+                        cfg.holding_minutes,
+                    )
                 if not hasattr(self, "_drl_hedger") or self._drl_hedger is None:
                     logger.info("Loading DRL hedging policy from %s", cfg.drl_policy_path)
                     self._drl_hedger = DRLHedger(

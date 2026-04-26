@@ -386,3 +386,140 @@ def test_no_hardcoded_resample_15min(path):
         f"cadence from `config.bucket_freq` / `config.tf_str` / "
         f"`tf_str` kwarg instead."
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 8. train_purged_cv embargo wiring (Phase 2h5.7.A)
+# ─────────────────────────────────────────────────────────────────────
+#
+# The embargo audit (plan §Phase-0 Phase 2h5.7) found that
+# ``vol_model.model.train_purged_cv`` invoked ``PurgedKFold`` without
+# passing the absolute-bar ``embargo_bars`` parameter. At horizons finer
+# than 15m, ``pct_embargo=0.01`` collapses below the HAR-PD 7-day
+# feature lookback, leaving val-QLIKE optimistically biased. Production
+# walk-forward (run_walkforward_pruned_svi_har_pd.py) is unaffected
+# because it uses chronological masks, not PurgedKFold — but this
+# research-path bug deserves a permanent regression lock.
+
+def test_train_purged_cv_byte_identity_at_h15_when_no_lookback():
+    """At h=15 with no caller-supplied lookback, the new signature
+    behaves identically to the legacy call: ``embargo_bars`` defaults to
+    ``None`` so ``PurgedKFold`` falls back to ``pct_embargo``. Catches
+    accidental introduction of a new default that would break the 442+
+    h=15 byte-identity tests.
+    """
+    import inspect
+    from vol_model.model import train_purged_cv
+
+    sig = inspect.signature(train_purged_cv)
+    # New kwargs MUST default to None / 0 — anything else is a silent
+    # behavior change at h=15.
+    assert sig.parameters["embargo_bars"].default is None
+    assert sig.parameters["max_feature_lookback_bars"].default == 0
+
+
+def test_train_purged_cv_derives_embargo_from_max_feature_lookback():
+    """When the caller supplies ``max_feature_lookback_bars`` (e.g.,
+    ``7 * config.bars_per_24h`` for HAR-PD), ``train_purged_cv`` must
+    auto-derive ``embargo_bars`` to dominate the HAR-PD lookback at any
+    horizon.
+
+    This test is the leakage-safety contract: at h=5 the embargo MUST
+    exceed 2016 bars (7d × 288 bars/day), regardless of how few total
+    observations the caller has.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from src.afml.cross_val import PurgedKFold
+    from vol_model.config import VolModelConfig
+    from vol_model.model import train_purged_cv
+
+    # Tiny synthetic dataset just to drive the embargo derivation logic.
+    # We only need to confirm the value passed into PurgedKFold; full
+    # training is irrelevant.
+    cfg_h5 = VolModelConfig(freq_s=300, n_splits=2)
+    assert cfg_h5.horizon_minutes == 5
+    assert cfg_h5.bars_per_24h == 288  # sanity
+
+    # Capture the embargo_bars argument PurgedKFold receives.
+    captured: dict[str, int | None] = {}
+    real_init = PurgedKFold.__init__
+
+    def spy(self, *args, **kwargs):
+        captured["embargo_bars"] = kwargs.get("embargo_bars")
+        return real_init(self, *args, **kwargs)
+
+    # We don't need to actually train — just trigger the PurgedKFold
+    # construction inside train_purged_cv. Use a 0-row dataset with
+    # n_splits=2 so the cv.split() loop is a no-op.
+    n = 20
+    X = pd.DataFrame(
+        np.random.RandomState(0).randn(n, 3),
+        index=pd.date_range("2024-01-01", periods=n, freq="5min"),
+    )
+    y = pd.Series(np.zeros(n), index=X.index)
+    t1 = pd.Series(X.index, index=X.index)
+
+    PurgedKFold.__init__ = spy
+    try:
+        # Caller passes 7-day HAR-PD lookback; expect embargo >= 2016.
+        try:
+            train_purged_cv(
+                X, y, t1, cfg_h5,
+                max_feature_lookback_bars=7 * cfg_h5.bars_per_24h,
+            )
+        except Exception:
+            # Training may fail on the tiny dataset — we only care that
+            # PurgedKFold was constructed with the expected embargo.
+            pass
+    finally:
+        PurgedKFold.__init__ = real_init
+
+    assert captured["embargo_bars"] is not None
+    assert captured["embargo_bars"] >= 7 * 288, (
+        f"Embargo at h=5 with 7-day HAR-PD lookback should be >= 2016 "
+        f"bars, got {captured['embargo_bars']}"
+    )
+
+
+def test_train_purged_cv_explicit_embargo_dominates_pct():
+    """An explicit ``embargo_bars=N`` ALWAYS overrides the legacy
+    ``pct_embargo`` path, regardless of horizon. This is the contract
+    that lets per-horizon training scripts pin the embargo to a known
+    horizon-aware value.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from src.afml.cross_val import PurgedKFold
+    from vol_model.config import VolModelConfig
+    from vol_model.model import train_purged_cv
+
+    cfg = VolModelConfig(freq_s=900, n_splits=2)  # h=15 default
+
+    captured: dict[str, int | None] = {}
+    real_init = PurgedKFold.__init__
+
+    def spy(self, *args, **kwargs):
+        captured["embargo_bars"] = kwargs.get("embargo_bars")
+        return real_init(self, *args, **kwargs)
+
+    n = 20
+    X = pd.DataFrame(
+        np.random.RandomState(0).randn(n, 3),
+        index=pd.date_range("2024-01-01", periods=n, freq="15min"),
+    )
+    y = pd.Series(np.zeros(n), index=X.index)
+    t1 = pd.Series(X.index, index=X.index)
+
+    PurgedKFold.__init__ = spy
+    try:
+        try:
+            train_purged_cv(X, y, t1, cfg, embargo_bars=42)
+        except Exception:
+            pass
+    finally:
+        PurgedKFold.__init__ = real_init
+
+    assert captured["embargo_bars"] == 42

@@ -79,20 +79,54 @@ def train_purged_cv(
     y: pd.Series,
     t1: pd.Series,
     config: VolModelConfig,
+    *,
+    embargo_bars: int | None = None,
+    max_feature_lookback_bars: int = 0,
 ) -> dict:
     """Train LightGBM with purged K-fold cross-validation.
+
+    Args:
+        X / y / t1: standard purged-CV inputs.
+        config: VolModelConfig.
+        embargo_bars: Absolute-bar embargo. When provided, OVERRIDES
+            ``config.pct_embargo`` so the embargo is independent of total
+            observation count — the horizon-aware path (plan
+            starry-rolling-rabin.md Phase 1d / Phase 2h5.7.A). Default
+            ``None`` preserves the legacy ``pct_embargo`` behaviour
+            byte-identically at h=15 and at every existing call site.
+        max_feature_lookback_bars: Convenience for HAR-PD-style models with
+            multi-day feature lookback. When ``embargo_bars`` is None and
+            this is positive, the function auto-derives an embargo of
+            ``max(label_span=1, max_feature_lookback_bars, 60min-floor)``.
+            Caller passes ``7 * config.bars_per_24h`` for HAR-PD's 7-day
+            path-dependent window.
 
     Returns dict with:
         models: list of fitted LGBMRegressor (one per fold)
         oof_preds: out-of-fold predictions (full array)
         fold_metrics: per-fold QLIKE, RMSE, MAE
         feature_names: column names
+
+    Note: The production walk-forward training path is
+    ``vol_model/run_walkforward_pruned_svi_har_pd.py`` and uses strictly
+    chronological train/val/test masks (not PurgedKFold). This function is
+    used by ``run_train.py``, ``run_optuna.py``, and ``hybrid.py`` for
+    SHAP-importance / certification-scale retrain.
     """
+    if embargo_bars is None and max_feature_lookback_bars > 0:
+        # Derive horizon-aware embargo from feature-lookback metadata.
+        # Floor: max(label_span=1 bar, feature lookback bars, 60-min floor).
+        min_embargo_floor = max(
+            1, int(round(60 / max(config.horizon_minutes, 1)))
+        )
+        embargo_bars = max(1, max_feature_lookback_bars, min_embargo_floor)
+
     cv = PurgedKFold(
         n_splits=config.n_splits,
         t1=t1,
         pct_embargo=config.pct_embargo,
-        label_span=1,  # label spans 1 bar (15m)
+        label_span=1,  # label spans 1 bar (config.horizon_minutes)
+        embargo_bars=embargo_bars,
     )
 
     params = build_lgbm_params(config)

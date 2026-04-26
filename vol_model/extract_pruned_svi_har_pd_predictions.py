@@ -39,11 +39,15 @@ from vol_model.run_walkforward_hybrid import _extract_compact_embeddings
 from vol_model.run_walkforward_pruned_svi import (
     ADD_SVI_FEATURES,
     DROP_FEATURES,
-    _load_svi_atm_1d,
 )
+# Load both helpers from the HAR-PD walk-forward variant — that one
+# accepts ``horizon_minutes`` (Phase 1 horizon-parametrization), the
+# pruned_svi-only variant does not. Functionally identical at h=15
+# and supports h=5/30/60 cleanly.
 from vol_model.run_walkforward_pruned_svi_har_pd import (
     ADD_HAR_PD_FEATURES,
     _load_har_pd,
+    _load_svi_atm_1d,
 )
 
 logging.basicConfig(
@@ -159,10 +163,15 @@ def main() -> None:
     from vol_model.labels import load_labels
     labels = load_labels(vol_config)
 
-    svi_add = _load_svi_atm_1d(currency)
+    # Load horizon-matched sidecars — at h=5m the loaders MUST point at the
+    # h=5m SVI/HAR-PD files (not the h=15 legacy unsuffixed ones), otherwise
+    # extraction silently runs at the legacy 15-min cadence and produces
+    # ~1/3 the expected h=5 prediction count. Prior bug: 144,955 predictions
+    # at h=5 vs the expected ~432K, surfaced 2026-04-26 mid-Phase 2h5.5.
+    svi_add = _load_svi_atm_1d(currency, horizon_minutes=tf_min)
 
-    # HAR-PD sidecar with -15m alignment shift (matches training).
-    har_pd_add = _load_har_pd(args.asset)
+    # HAR-PD sidecar with -h_min alignment shift (matches training).
+    har_pd_add = _load_har_pd(args.asset, horizon_minutes=tf_min)
 
     data_start = X.index.min()
     start = pd.Timestamp(args.start + "-01", tz="UTC")

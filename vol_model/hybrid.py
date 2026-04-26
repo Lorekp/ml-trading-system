@@ -87,9 +87,19 @@ def main():
     # Build hybrid dataset
     X, y, t1 = build_hybrid_dataset(vol_config, args.embedding_path)
 
-    # Train with existing infrastructure
+    # Train with existing infrastructure.
+    # Pass max_feature_lookback_bars so the embargo dominates the legacy
+    # pct_embargo at non-15m horizons (HAR-PD's 7-day path-dependent
+    # window). At h=15, the auto-derived embargo (672 bars) is larger than
+    # the legacy pct_embargo (~500 bars) — preserves no leakage but is
+    # NOT byte-identical to legacy h=15 runs. Callers that need exact
+    # byte-id at h=15 should omit max_feature_lookback_bars and rely on
+    # config.pct_embargo.
     logger.info("Training hybrid LightGBM (PurgedKFold, %d splits)...", vol_config.n_splits)
-    results = train_purged_cv(X, y, t1, vol_config)
+    results = train_purged_cv(
+        X, y, t1, vol_config,
+        max_feature_lookback_bars=7 * vol_config.bars_per_24h,
+    )
 
     # Summary
     oof = results["oof_preds"]

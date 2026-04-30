@@ -165,6 +165,13 @@ class PaperConfig:
     features_parquet: str = ""              # sentinel -> resolved from currency + bar_minutes
     svi_features_parquet: str = ""          # sentinel -> resolved from bar_minutes
 
+    # ── Config preset metadata (set by CLI / with_v2_preset) ────────
+    # Tagged into harness trade rows so the I4 reproduction analysis
+    # can attribute drift to a specific preset. "default" preserves
+    # the legacy live behaviour; "v2" enables the production parity
+    # stack (β*, Kelly K1, realistic_taker, contango filter, …).
+    config_preset: str = "default"
+
     # ── V2 sidecars (predictions, Kelly, slippage) ─────────────────
     # Aligned-bias HAR-PD predictions parquet — used as the parquet
     # source for β* extraction (``scripts/extract_aligner_betas.py``)
@@ -328,6 +335,7 @@ class PaperConfig:
         will fail Phase A's regression gate.
         """
         cfg = base if base is not None else cls()
+        cfg.config_preset = "v2"
         cfg.entry_threshold = 22.0  # V1 production stack short threshold
         cfg.entry_threshold_long = 12.0
         cfg.skip_long_if_term_slope_gt = 0.0

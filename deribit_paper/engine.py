@@ -48,6 +48,7 @@ from deribit_paper.market_data import (
     TradeBuffer,
 )
 from deribit_paper.monitoring import MetricsSink, TelegramNotifier, setup_json_logging
+from deribit_paper.monitoring.harness_writer import HarnessWriter
 from deribit_paper.position import EquityTracker, PositionTracker, SQLiteStore
 from deribit_paper.risk.dry_run import get_dry_run
 from deribit_paper.risk.kill_switch import KillSwitch
@@ -138,6 +139,14 @@ class TradingEngine:
         # None falls back to ``cfg.max_slippage_pct`` flat cap (legacy
         # live default 0.5%).
         self._bar_slip_series: Any = None  # pd.Series | None
+
+        # Harness-grade trade-row writer (V2 wiring, C6 2026-04-26).
+        # Appends one row per closed trade to
+        # vol_arb/output/live_trades_harness.parquet. Used by I4 to
+        # diff live PnL vs the V2 backtest replay over the same window.
+        self._harness_writer = HarnessWriter(
+            "vol_arb/output/live_trades_harness.parquet",
+        )
 
         # Rolling edge history for composite_v2 edge_scale (1 day of 15m bars)
         self._edge_history: deque[float] = deque(maxlen=96)
@@ -1054,6 +1063,23 @@ class TradingEngine:
                 await self.store.persist_equity_snapshot(latest_snap)
             except Exception:  # noqa: BLE001 - persistence failure is non-fatal
                 logger.exception("Persist trade failed")
+
+            # ── Harness row (C6) — one row per completed trade in the
+            # V2 backtest schema, consumed offline by the I4 harness.
+            term_slope = (
+                self.predictor._compute_term_slope_1w_2w()
+                if (self.predictor is not None
+                    and hasattr(self.predictor, "_compute_term_slope_1w_2w"))
+                else None
+            )
+            self._harness_writer.consolidate_and_write(
+                outcome,
+                realized_pnl_usd=realized_pnl_usd,
+                kelly_mult=kelly_mult,
+                taker_slippage_pct=taker_slippage_pct,
+                term_slope_1w_2w=term_slope,
+                config_preset=self.config.config_preset,
+            )
         else:
             self.stats.trades_aborted += 1
             self.kill_switch.on_trade_result(success=False)

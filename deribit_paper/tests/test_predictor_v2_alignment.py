@@ -7,7 +7,7 @@ when ``svi_term_slope_1w_2w > threshold``) wired in
 
 Two contracts under test:
 
-1. **β\* application**: ``Predictor`` adds the calendar-month β* to the
+1. **β* application**: ``Predictor`` adds the calendar-month β* to the
    raw LGBM log-vol output before exp(); the resulting ``rv_pred_pct``
    is shifted by ``exp(β*) - 1`` relative to the no-β baseline. Empty
    dict → no shift. Live month past sidecar → most-recent-prior fallback.
@@ -245,17 +245,21 @@ def test_filter_disabled_when_threshold_none():
     assert sig.direction == 1
 
 
-def test_filter_passes_through_when_svi_uncalibrated():
-    """SVI not calibrated yet → return None from term_slope helper → LONG passes.
+def test_filter_passes_through_when_atm_dte_returns_nan():
+    """SVI calibrated but atm_vol_at_dte returns NaN → term_slope None → LONG passes.
 
-    Defensive: don't suppress signals during SVI warmup just because we
-    can't determine the regime.
+    Defensive contract: don't suppress signals when the slope helper
+    can't return a finite value, even though SVI itself is "calibrated".
+    Testing this rather than ``has_params=False`` because the latter
+    short-circuits at ``_lookup_iv`` (step 3) before the contango filter
+    (step 4) is reached.
     """
     p = _make_predictor(
         rv_pred_pct_target=85.0, iv_used_pct=60.0,
         skip_long_if_term_slope_gt=0.0,
+        atm_1w_pct=float("nan"),                # forces _compute_term_slope_1w_2w to return None
+        atm_2w_pct=72.0,
     )
-    p._svi.has_params = False
     bar = _make_bar()
     sig = p.predict(bar, _make_tsrv(), straddle=_make_straddle())
     assert sig.direction == 1

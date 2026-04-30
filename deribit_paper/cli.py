@@ -91,6 +91,19 @@ def _parse_args() -> argparse.Namespace:
         help="Deribit venue (default: testnet)",
     )
     parser.add_argument(
+        "--config-preset",
+        choices=["default", "v2"],
+        default="default",
+        help=(
+            "Strategy preset. 'default' preserves the legacy live config "
+            "(byte-id with prior runs). 'v2' applies the production V2 "
+            "stack from BacktestConfig.with_btc_production_filters_v2: "
+            "entry_threshold_long=12, contango-long filter, "
+            "target_margin_utilization=0.15, profit_scaling on, β* + "
+            "Kelly K1 + realistic_taker slippage sidecars wired."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Python logging level (default: INFO)",
@@ -169,6 +182,11 @@ def main() -> None:
     _setup_logging(args.log_level)
 
     cfg = PaperConfig.from_env()
+    if args.config_preset == "v2":
+        cfg = PaperConfig.with_v2_preset(base=cfg)
+        logging.getLogger("cli").info(
+            "Applied --config-preset=v2 (production parity stack)",
+        )
     if args.venue == "prod":
         cfg.switch_to_prod()
 

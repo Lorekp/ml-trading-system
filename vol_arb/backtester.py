@@ -1766,28 +1766,15 @@ class VolArbBacktester:
             has_sor = False
 
         # ── Per-bar taker slippage from trade tape (realistic_taker) ──
+        # Sidecar load via vol_arb.sidecars.load_bar_exec_slip — shared with
+        # the live engine (deribit_paper) so both stacks read from one
+        # contract; preserves the prior ffill+12.0-fallback semantics.
         _bar_taker_slip = None
         if cfg.slippage_model == "realistic_taker":
-            eq_path = Path(cfg.bar_exec_quality_path)
-            if eq_path.exists():
-                _eq_df = pd.read_parquet(eq_path)
-                _eq_df.index = pd.to_datetime(_eq_df.index, utc=True)
-                # Align to vol_arb bars via forward-fill (trailing, no lookahead)
-                _bar_taker_slip = (
-                    _eq_df["bar_taker_slip_usd"]
-                    .reindex(df.index, method="ffill")
-                    .fillna(12.0)  # fallback to empirical median
-                    .values
-                )
-                logger.info(
-                    "Loaded realistic_taker slippage: %d bars, median $%.1f/BTC",
-                    len(_bar_taker_slip), float(np.nanmedian(_bar_taker_slip)),
-                )
-            else:
-                logger.warning(
-                    "bar_exec_quality_path %s not found, falling back to grid",
-                    eq_path,
-                )
+            from vol_arb.sidecars import load_bar_exec_slip
+            _bar_taker_slip = load_bar_exec_slip(
+                cfg.bar_exec_quality_path, df.index
+            )
 
         # ── Continuous impact model (optional) ──
         _impact_model = None
@@ -1846,36 +1833,12 @@ class VolArbBacktester:
         )
 
         # ── Kelly-shrinkage multiplier sidecar (Phase 2 2026-04-21) ──
-        # Loaded once, aligned to df.index. Defaults None -> no-op.
-        _kelly_mult_arr: np.ndarray | None = None
+        # Sidecar load via vol_arb.sidecars.load_kelly_mult — shared with the
+        # live engine; preserves the prior reindex + NaN→1.0 + clip[1,2]
+        # contract.
+        from vol_arb.sidecars import load_kelly_mult
+        _kelly_mult_arr = load_kelly_mult(cfg.kelly_mult_path, df.index)
         _kelly_applied_arr = np.ones(n_bars)
-        if cfg.kelly_mult_path is not None:
-            kpath = Path(cfg.kelly_mult_path)
-            if not kpath.exists():
-                logger.warning(
-                    "kelly_mult_path=%s does not exist -- skipping Kelly boost",
-                    kpath,
-                )
-            else:
-                km_df = pd.read_parquet(kpath)
-                if "size_mult" in km_df.columns:
-                    km_ser = km_df["size_mult"]
-                else:
-                    km_ser = km_df.iloc[:, 0]
-                km_aligned = km_ser.reindex(df.index)
-                arr = km_aligned.to_numpy(dtype=float)
-                # Safety: floor at 1.0 (upside-only), cap at 2.0 (hard
-                # risk bound), and pass-through NaN -> 1.0.
-                arr = np.where(np.isnan(arr), 1.0, arr)
-                arr = np.clip(arr, 1.0, 2.0)
-                _kelly_mult_arr = arr
-                n_boost = int((arr > 1.0 + 1e-9).sum())
-                logger.info(
-                    "Kelly sidecar loaded (%s): %d bars with mult>1.0, "
-                    "mean mult=%.4f, max mult=%.4f",
-                    kpath.name, n_boost,
-                    float(arr.mean()), float(arr.max()),
-                )
 
         for i in range(n_bars):
             if signal[i] == 0 or eq <= 0.0:

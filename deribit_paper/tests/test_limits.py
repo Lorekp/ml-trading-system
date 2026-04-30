@@ -13,13 +13,19 @@ from deribit_paper.features.straddle import StraddleSelection
 
 
 def _make_signal(*, direction: int = -1, spot: float = 100_000.0) -> Signal:
+    # Timestamps are relative to wall-clock now so RiskLimits.check_signal
+    # (which falls back to pd.Timestamp.now(tz="UTC") for the DTE gate when
+    # no explicit `now=` is passed) sees a future expiry. Keep the original
+    # "signal at T, expiry at T+10d" semantic.
+    now = pd.Timestamp.now(tz="UTC")
+    expiry = now + pd.Timedelta(days=10)
     straddle = StraddleSelection(
         call_instrument="BTC-C", put_instrument="BTC-P",
-        strike=spot, expiry_dt=pd.Timestamp("2026-04-20 08:00:00", tz="UTC"),
-        index_price=spot, moneyness=1.0, dte_days=5.0,
+        strike=spot, expiry_dt=expiry,
+        index_price=spot, moneyness=1.0, dte_days=10.0,
     )
     return Signal(
-        timestamp=pd.Timestamp("2026-04-10 12:00:00", tz="UTC"),
+        timestamp=now,
         direction=direction, edge_vol_pts=-1.5,
         rv_pred_pct=73.0, iv_used_pct=75.0,
         bar_tsrv=None, straddle=straddle, reason="test",
@@ -73,16 +79,18 @@ def test_minimum_lot_blocked_when_position_already_open():
         min_single_trade_btc=0.1,
         im_fraction=0.10,
     )
-    # Simulate one open position
+    # Simulate one open position. Same relative-to-now convention as
+    # _make_signal so the synthetic state stays internally consistent.
     from deribit_paper.position.tracker import OpenPosition
+    now = pd.Timestamp.now(tz="UTC")
     tracker._positions["existing"] = OpenPosition(
         trade_id="existing", signal_direction=-1,
         call_instrument="BTC-C", put_instrument="BTC-P",
         strike=100_000.0,
-        expiry_dt=pd.Timestamp("2026-04-20 08:00:00", tz="UTC"),
+        expiry_dt=now + pd.Timedelta(days=10),
         n_contracts_btc=0.1,
         entry_call_price=0.05, entry_put_price=0.05,
-        entry_timestamp=pd.Timestamp("2026-04-10 12:00:00", tz="UTC"),
+        entry_timestamp=now,
         entry_equity_usd=750.0,
     )
     signal = _make_signal()

@@ -60,7 +60,17 @@ class PaperConfig:
     base_spread_iv: float = 1.5
     spread_jump_k: float = 3.0
     entry_threshold: float = 25.0       # mirrors BacktestConfig: shorts need 25 vp edge
-    entry_threshold_long: float = 30.0  # longs require more edge (higher slippage on entry)
+    # NOTE: ``default`` preset uses 30 (legacy live behaviour). The V2
+    # production stack drops this to 12 because the contango filter
+    # (``skip_long_if_term_slope_gt=0.0``) already removes the bad-regime
+    # longs, so surviving longs have structural positive edge — see
+    # ``BacktestConfig.with_btc_production_filters_v2`` docstring. Flipped
+    # to 12.0 by ``PaperConfig.with_v2_preset()``.
+    entry_threshold_long: float = 30.0
+    # V2: drop LONG signals when 1w-2w term slope > 0 (IV contango).
+    # ``None`` disables the filter (legacy live default). The V2 preset
+    # sets this to 0.0 to match the backtest contract.
+    skip_long_if_term_slope_gt: float | None = None
     option_maker_fee: float = 0.0003    # Deribit: 0.03% of underlying (same maker & taker)
     perp_taker_fee: float = 0.0005     # Deribit: 0.05% taker (maker gets -0.01% rebate)
     perp_slippage_bps: float = 2.0
@@ -76,7 +86,17 @@ class PaperConfig:
 
     # ── Position sizing ────────────────────────────────────────────
     initial_equity: float = 1.0              # demo BTC (testnet starts with ~10 BTC)
-    target_margin_utilization: float = 0.05  # mirrors BacktestConfig
+    # ``default`` preset matches the legacy live conservative posture
+    # (5%). The V2 preset bumps this to 0.15 — the 3x leverage difference
+    # is the single largest dollar driver of live-vs-backtest divergence
+    # per ``01-landscape.md``. Flipped to 0.15 by
+    # ``PaperConfig.with_v2_preset()``.
+    target_margin_utilization: float = 0.05
+    # Conviction-weighted size scaling (mirrors BacktestConfig): scales
+    # position by trailing-window profit factor floored at
+    # ``profit_scaling_floor``. Off in ``default``, on under V2 preset.
+    use_profit_scaling: bool = False
+    profit_scaling_floor: float = 0.3
     # Deribit ATM option IM = max(0.15 - OTM/spot, 0.10) + mark_price.
     # For ATM straddles: 0.15 + mark ≈ 0.20.  The backtester uses 0.10
     # (understates real margin); the paper engine uses the realistic value
@@ -144,6 +164,26 @@ class PaperConfig:
     # 126-column base features + the 13-column SVI features.
     features_parquet: str = ""              # sentinel -> resolved from currency + bar_minutes
     svi_features_parquet: str = ""          # sentinel -> resolved from bar_minutes
+
+    # ── V2 sidecars (predictions, Kelly, slippage) ─────────────────
+    # Aligned-bias HAR-PD predictions parquet — used as the parquet
+    # source for β* extraction (``scripts/extract_aligner_betas.py``)
+    # and as the cross-check against fresh LightGBM inference.
+    # Default: empty string disables β* application. The V2 preset
+    # points this at the production aligner output.
+    aligned_predictions_parquet: str = ""
+    # Per-month aligner β* JSON sidecar produced by the extract script.
+    # Live engine reads this at startup, picks up the appropriate
+    # β* per current calendar month (with most-recent-prior fallback)
+    # and adds it to fresh LightGBM predictions.
+    aligner_betas_json: str = ""
+    # Per-bar Kelly K1 multiplier sidecar (parquet, indexed on the
+    # 15-min UTC bar timestamp). Empty string disables Kelly boost.
+    kelly_mult_path: str = ""
+    # Per-bar empirical taker slip USD/BTC sidecar (parquet). Live
+    # engine consults this when sizing IOC limit prices in C4. Empty
+    # string falls back to ``max_slippage_pct`` flat cap.
+    bar_exec_quality_path: str = ""
 
     # ── SVI live calibration ───────────────────────────────────────
     svi_recalibrate_hours: int = 1           # run calibrate_surface() every N hours
@@ -259,6 +299,50 @@ class PaperConfig:
         cfg.kill_switch_daily_dd_pct = 5.0
         cfg.initial_equity = equity_usd / btc_approx
         cfg.min_trade_floor = True
+        return cfg
+
+    @classmethod
+    def with_v2_preset(cls, base: "PaperConfig | None" = None) -> "PaperConfig":
+        """Return a config aligned with ``BacktestConfig.with_btc_production_filters_v2()``.
+
+        Eight invariants flipped or set:
+
+        * ``entry_threshold_long``: 30.0 → 12.0 (contango filter compensates).
+        * ``skip_long_if_term_slope_gt``: None → 0.0 (drop longs in IV contango).
+        * ``target_margin_utilization``: 0.05 → 0.15 (3x leverage closer to backtest).
+        * ``use_profit_scaling``: False → True (conviction-weighted sizing).
+        * ``profit_scaling_floor``: stays 0.3 (matches BacktestConfig V2).
+        * ``aligned_predictions_parquet`` → production aligner parquet.
+        * ``aligner_betas_json`` → derived per-month β* JSON path.
+        * ``kelly_mult_path`` → V2 Kelly K1 sidecar.
+        * ``bar_exec_quality_path`` → V2 realistic_taker slippage sidecar.
+
+        ``base`` (optional) lets the caller pre-populate venue / credentials
+        from ``PaperConfig.from_env()`` first; the preset only overrides
+        strategy fields and leaves env-bound fields alone.
+
+        Single source of truth: this method's expected output is asserted
+        against ``BacktestConfig.with_btc_production_filters_v2()`` in
+        ``deribit_paper/tests/test_config_v2_parity.py``. Updating the V2
+        invariants in either side without updating the cross-check test
+        will fail Phase A's regression gate.
+        """
+        cfg = base if base is not None else cls()
+        cfg.entry_threshold = 22.0  # V1 production stack short threshold
+        cfg.entry_threshold_long = 12.0
+        cfg.skip_long_if_term_slope_gt = 0.0
+        cfg.target_margin_utilization = 0.15
+        cfg.use_profit_scaling = True
+        cfg.profit_scaling_floor = 0.3
+        cfg.aligned_predictions_parquet = (
+            "vol_model/output/"
+            "BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"
+        )
+        cfg.aligner_betas_json = (
+            "vol_model/output/aligner_betas_by_month.json"
+        )
+        cfg.kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+        cfg.bar_exec_quality_path = "vol_arb/output/bar_execution_quality.parquet"
         return cfg
 
     def ensure_dirs(self) -> None:

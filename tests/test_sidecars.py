@@ -30,7 +30,9 @@ from vol_arb.sidecars import (
     load_aligner_betas,
     load_bar_exec_slip,
     load_kelly_mult,
+    load_kelly_mult_series,
     lookup_beta_for_month,
+    lookup_kelly_mult_at,
 )
 
 
@@ -235,3 +237,38 @@ def test_lookup_falls_back_to_zero_when_pre_coverage():
 def test_lookup_empty_dict_returns_zero():
     ts = pd.Timestamp("2026-01-15", tz="UTC")
     assert lookup_beta_for_month({}, ts, fallback_zero_warn=False) == 0.0
+
+
+# ── load_kelly_mult_series + lookup_kelly_mult_at ────────────────────────
+
+def test_kelly_mult_series_returns_none_for_missing(target_index):
+    assert load_kelly_mult_series(None) is None
+    assert load_kelly_mult_series("/no/such/path.parquet") is None
+
+
+def test_kelly_mult_series_loads(kelly_parquet):
+    ser = load_kelly_mult_series(kelly_parquet)
+    assert ser is not None
+    assert ser.shape == (8,)
+    assert ser.iloc[0] == 1.0
+    assert ser.iloc[7] == 3.0  # raw value (clipping happens in lookup_kelly_mult_at)
+
+
+def test_lookup_kelly_at_exact_match(kelly_parquet, target_index):
+    ser = load_kelly_mult_series(kelly_parquet)
+    # Bar 4: source value 1.5 → in band, no clip.
+    assert lookup_kelly_mult_at(ser, target_index[4]) == 1.5
+    # Bar 7: source value 3.0 → clipped to KELLY_CAP=2.0.
+    assert lookup_kelly_mult_at(ser, target_index[7]) == KELLY_CAP
+
+
+def test_lookup_kelly_at_missing_timestamp_returns_fallback(kelly_parquet):
+    ser = load_kelly_mult_series(kelly_parquet)
+    # A timestamp not in the sidecar's index → fallback (1.0).
+    miss = pd.Timestamp("2027-01-01 00:00", tz="UTC")
+    assert lookup_kelly_mult_at(ser, miss) == KELLY_FALLBACK
+
+
+def test_lookup_kelly_at_none_series_returns_fallback():
+    ts = pd.Timestamp("2026-01-15", tz="UTC")
+    assert lookup_kelly_mult_at(None, ts) == KELLY_FALLBACK

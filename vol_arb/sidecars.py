@@ -246,12 +246,80 @@ def lookup_beta_for_month(
     return 0.0
 
 
+def load_kelly_mult_series(
+    path: str | Path | None,
+    *,
+    column: str = "size_mult",
+) -> pd.Series | None:
+    """Load the per-bar Kelly multiplier as a tz-aware ``pd.Series``.
+
+    Used by the live engine which needs scalar lookups by single
+    timestamp rather than the array-aligned interface
+    ``load_kelly_mult`` provides for the vectorised backtester.
+
+    Returns ``None`` for missing path or missing column. The caller is
+    expected to apply the floor / cap / NaN-fallback contract via
+    ``lookup_kelly_mult_at`` for each lookup.
+    """
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.exists():
+        logger.warning(
+            "kelly_mult sidecar %s does not exist — Kelly disabled in live", p
+        )
+        return None
+    df = pd.read_parquet(p)
+    df.index = pd.to_datetime(df.index, utc=True)
+    if column in df.columns:
+        ser = df[column].astype(float)
+    else:
+        ser = df.iloc[:, 0].astype(float)
+    ser.name = column
+    logger.info(
+        "Kelly sidecar loaded into Series (%s): %d bars, %d > %.2f, max=%.4f",
+        p.name, len(ser),
+        int((ser > KELLY_FLOOR + 1e-9).sum()), KELLY_FLOOR,
+        float(ser.max()),
+    )
+    return ser
+
+
+def lookup_kelly_mult_at(
+    series: pd.Series | None,
+    timestamp: pd.Timestamp,
+    *,
+    floor: float = KELLY_FLOOR,
+    cap: float = KELLY_CAP,
+    fallback: float = KELLY_FALLBACK,
+) -> float:
+    """Return the Kelly multiplier for a single ``timestamp``.
+
+    Walk-forward fallback ladder mirrors the backtester:
+
+    1. Exact match on the bar timestamp (most common case).
+    2. NaN / missing → ``fallback`` (1.0 by default; passes through).
+    3. Always clipped to ``[floor, cap]`` so a malformed sidecar can't
+       produce risk-unbounded sizing.
+
+    ``series`` ``None`` → ``fallback`` (Kelly disabled).
+    """
+    if series is None:
+        return fallback
+    val = series.get(timestamp, fallback)
+    if pd.isna(val):
+        val = fallback
+    return float(np.clip(val, floor, cap))
+
+
 __all__ = [
     "KELLY_FLOOR",
     "KELLY_CAP",
     "KELLY_FALLBACK",
     "SLIP_FALLBACK_USD",
     "load_kelly_mult",
+    "load_kelly_mult_series",
+    "lookup_kelly_mult_at",
     "load_bar_exec_slip",
     "load_aligner_betas",
     "lookup_beta_for_month",

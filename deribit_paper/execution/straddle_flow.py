@@ -136,10 +136,12 @@ class StraddleFlow:
         edge_vp: float = 0.0,
         rolling_median_edge: float = 1.0,
         peak_equity: float = 0.0,
+        kelly_mult: float = 1.0,
     ) -> float:
         """Compute the BTC notional for a new straddle trade.
 
-        Mirrors backtester's composite_v2 model:
+        Mirrors backtester's composite_v2 model with the V2 Kelly-shrinkage
+        upside-only multiplier appended after the four base scales:
 
         1. **DVOL-scaled base margin** — `target_margin * (baseline_dvol / dvol)`,
            clipped so we never exceed ``target_margin_utilization``.
@@ -149,6 +151,12 @@ class StraddleFlow:
            with a floor of ``sizing_dd_floor``.
         4. **Liquidity scale** (liq_scale, caller-supplied) — spread-EMA/current
            spread.  Already implemented by the caller via exec_cost_ema.
+        5. **Kelly K1 multiplier** (kelly_mult, caller-supplied) — per-bar
+           upside-only multiplier in [1.0, 2.0] sourced from
+           ``BTC_v2_kelly_mult_K1.parquet``. Applied AFTER DVOL/edge/dd/liq
+           and BEFORE the dynamic BTC cap, mirroring the backtester at
+           ``vol_arb/backtester.py:2038-2043``. Shorts always pass through
+           with mult=1.0 (caller is responsible for the asymmetry).
 
         Returns 0.0 if the computed size is below the minimum contract size.
         """
@@ -188,6 +196,14 @@ class StraddleFlow:
 
         # 4. Liquidity scale (supplied by caller from spread EMA vs current spread)
         n *= edge_scale * dd_scale * liq_scale
+
+        # 5. Kelly K1 multiplier (upside-only, applied AFTER edge/dd/liq).
+        # Caller passes 1.0 when the sidecar is missing / signal is short /
+        # bar timestamp falls outside sidecar coverage. The backtester
+        # short-circuits on ``km > 1.0`` so the size_mult arithmetic is a
+        # no-op at floor=1.0; we mirror that exactly.
+        if kelly_mult > 1.0 + 1e-12:
+            n *= kelly_mult
 
         # Hard cap
         n = min(n, self._max_trade_size)

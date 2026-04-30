@@ -130,6 +130,10 @@ class TradingEngine:
         self._exec_cost_ema: float = 12.0  # empirical median from backtester data
         self._exec_cost_alpha: float = 2.0 / (config.execution_cost_ema_bars + 1)
 
+        # Kelly K1 sidecar (loaded once at initialize). None disables Kelly
+        # boost — every per-bar lookup returns 1.0 via lookup_kelly_mult_at.
+        self._kelly_mult_series: Any = None  # pd.Series | None
+
         # Rolling edge history for composite_v2 edge_scale (1 day of 15m bars)
         self._edge_history: deque[float] = deque(maxlen=96)
 
@@ -266,6 +270,29 @@ class TradingEngine:
             svi_calibrator=self.svi_calibrator,
             rolling_history_bars=cfg.bars_per_day * 7,
         )
+        # ── V2 sidecar loads (aligner β* + Kelly K1) ──
+        # Aligner β*: per-month QLIKE-optimal scalar bias on log-vol
+        # predictions (C2 2026-04-26). Empty dict → predictor passes raw
+        # LGBM output through. Kelly K1: per-bar upside-only multiplier
+        # in [1.0, 2.0] keyed by 15m UTC bar timestamp (C3 2026-04-26).
+        # Both are no-op fallbacks when their config paths are empty,
+        # so the ``default`` preset stays byte-id with prior live runs.
+        from vol_arb.sidecars import (
+            load_aligner_betas as _load_betas,
+            load_kelly_mult_series as _load_kelly,
+        )
+        aligner_betas = (
+            _load_betas(cfg.aligner_betas_json) if cfg.aligner_betas_json else {}
+        )
+        if aligner_betas:
+            logger.info(
+                "Aligner β* loaded: %d months, %s..%s",
+                len(aligner_betas),
+                min(aligner_betas.keys()), max(aligner_betas.keys()),
+            )
+        self._kelly_mult_series = (
+            _load_kelly(cfg.kelly_mult_path) if cfg.kelly_mult_path else None
+        )
         self.predictor = Predictor(
             feature_assembler=self.feature_assembler,
             svi_calibrator=self.svi_calibrator,
@@ -274,6 +301,8 @@ class TradingEngine:
             base_spread_iv=cfg.base_spread_iv,
             spread_jump_k=cfg.spread_jump_k,
             max_jump_fraction_for_shorts=cfg.max_jump_fraction_for_shorts,
+            skip_long_if_term_slope_gt=cfg.skip_long_if_term_slope_gt,
+            aligner_betas=aligner_betas,
             log_every_bar=True,
         )
         self.live_drl_hedger = LiveDRLHedger(
@@ -866,6 +895,11 @@ class TradingEngine:
 
         # 6. Size position + risk check
         trailing_vol = self._trailing_1h_volume_btc()
+        # Per-bar Kelly K1 lookup (V2 wiring, C3 2026-04-26). Returns 1.0
+        # for shorts (sidecar puts mult=1.0 by construction), bars
+        # outside sidecar coverage, and when Kelly is disabled.
+        from vol_arb.sidecars import lookup_kelly_mult_at
+        kelly_mult = lookup_kelly_mult_at(self._kelly_mult_series, bar.timestamp)
         n_contracts = self.straddle_flow.size_position(
             equity=self.equity_tracker.current_equity,
             signal_direction=signal.direction,
@@ -875,6 +909,7 @@ class TradingEngine:
             edge_vp=signal.edge_vol_pts,
             rolling_median_edge=rolling_median_edge,
             peak_equity=self.equity_tracker.peak_equity,
+            kelly_mult=kelly_mult,
         )
         # 6b. RND-based size scaling — shrinks position as market prices in
         # more tail risk. Returns 1.0 during warmup (insufficient history)

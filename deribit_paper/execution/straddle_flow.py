@@ -232,6 +232,8 @@ class StraddleFlow:
         edge_vp: float = 0.0,
         rolling_median_edge: float = 1.0,
         peak_equity: float = 0.0,
+        kelly_mult: float = 1.0,
+        taker_slippage_pct: float = 0.5,
     ) -> TradeOutcome:
         """Run the full signal → entry → hedge → exit lifecycle.
 
@@ -299,6 +301,7 @@ class StraddleFlow:
             edge_vp=edge_vp,
             rolling_median_edge=rolling_median_edge,
             peak_equity=peak_equity,
+            kelly_mult=kelly_mult,
         )
         if n_contracts <= 0.0:
             return TradeOutcome(
@@ -328,14 +331,14 @@ class StraddleFlow:
                 instrument_name=straddle.call_instrument,
                 side=entry_side,
                 amount=n_contracts,
-                max_slippage_pct=0.5,
+                max_slippage_pct=taker_slippage_pct,
                 label=f"straddle_entry_C_{started_at.value}",
             ),
             self._order_manager.place_ioc_taker(
                 instrument_name=straddle.put_instrument,
                 side=entry_side,
                 amount=n_contracts,
-                max_slippage_pct=0.5,
+                max_slippage_pct=taker_slippage_pct,
                 label=f"straddle_entry_P_{started_at.value}",
             ),
         )
@@ -469,7 +472,7 @@ class StraddleFlow:
                 instrument_name=straddle.call_instrument,
                 side=exit_side,
                 amount=n_contracts,
-                max_slippage_pct=0.5,
+                max_slippage_pct=taker_slippage_pct,
                 label=f"straddle_exit_C_{started_at.value}",
                 reduce_only=True,
             ),
@@ -477,7 +480,7 @@ class StraddleFlow:
                 instrument_name=straddle.put_instrument,
                 side=exit_side,
                 amount=n_contracts,
-                max_slippage_pct=0.5,
+                max_slippage_pct=taker_slippage_pct,
                 label=f"straddle_exit_P_{started_at.value}",
                 reduce_only=True,
             ),

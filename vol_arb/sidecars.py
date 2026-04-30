@@ -102,6 +102,67 @@ def load_kelly_mult(
     return arr
 
 
+def load_bar_exec_slip_series(
+    path: str | Path | None,
+    *,
+    column: str = "bar_taker_slip_usd",
+) -> pd.Series | None:
+    """Load per-bar empirical taker slip (USD/BTC) as a tz-aware ``pd.Series``.
+
+    Live-engine variant of ``load_bar_exec_slip``. Returns the raw series
+    without target-index alignment; per-bar lookups go through
+    ``lookup_slip_usd_at``. Returns ``None`` when ``path`` is missing or
+    the column isn't present.
+    """
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.exists():
+        logger.warning(
+            "bar_exec_quality sidecar %s does not exist — live slip disabled", p
+        )
+        return None
+    df = pd.read_parquet(p)
+    df.index = pd.to_datetime(df.index, utc=True)
+    if column not in df.columns:
+        logger.warning(
+            "column %r not in bar_exec_quality sidecar %s — None", column, p
+        )
+        return None
+    ser = df[column].astype(float)
+    ser.name = column
+    logger.info(
+        "bar_exec_quality Series loaded (%s): %d bars, median $%.2f/BTC",
+        p.name, len(ser), float(np.nanmedian(ser.to_numpy())),
+    )
+    return ser
+
+
+def lookup_slip_usd_at(
+    series: pd.Series | None,
+    timestamp: pd.Timestamp,
+    *,
+    fallback_usd: float = SLIP_FALLBACK_USD,
+) -> float:
+    """Per-bar empirical slip USD/BTC. Forward-fill semantics via
+    ``index.searchsorted``: use the nearest entry at-or-before
+    ``timestamp`` (leakage-safe walk-forward). Falls back to
+    ``fallback_usd`` when ``series`` is None or ``timestamp`` predates
+    every entry in the sidecar.
+    """
+    if series is None or len(series) == 0:
+        return fallback_usd
+    # ``searchsorted(side="right")`` returns the insertion point AFTER
+    # equal values, so the last index ≤ ts is searchsorted-1.
+    idx = series.index.searchsorted(timestamp, side="right") - 1
+    if idx < 0:
+        return fallback_usd
+    val = float(series.iloc[idx])
+    if not np.isfinite(val):
+        return fallback_usd
+    return val
+
+
 def load_bar_exec_slip(
     path: str | Path | None,
     target_index: pd.DatetimeIndex,
@@ -321,6 +382,8 @@ __all__ = [
     "load_kelly_mult_series",
     "lookup_kelly_mult_at",
     "load_bar_exec_slip",
+    "load_bar_exec_slip_series",
+    "lookup_slip_usd_at",
     "load_aligner_betas",
     "lookup_beta_for_month",
 ]

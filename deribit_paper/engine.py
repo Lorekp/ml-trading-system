@@ -134,6 +134,11 @@ class TradingEngine:
         # boost — every per-bar lookup returns 1.0 via lookup_kelly_mult_at.
         self._kelly_mult_series: Any = None  # pd.Series | None
 
+        # bar_execution_quality slip series (V2 wiring, C4 2026-04-26).
+        # None falls back to ``cfg.max_slippage_pct`` flat cap (legacy
+        # live default 0.5%).
+        self._bar_slip_series: Any = None  # pd.Series | None
+
         # Rolling edge history for composite_v2 edge_scale (1 day of 15m bars)
         self._edge_history: deque[float] = deque(maxlen=96)
 
@@ -279,6 +284,7 @@ class TradingEngine:
         # so the ``default`` preset stays byte-id with prior live runs.
         from vol_arb.sidecars import (
             load_aligner_betas as _load_betas,
+            load_bar_exec_slip_series as _load_slip,
             load_kelly_mult_series as _load_kelly,
         )
         aligner_betas = (
@@ -292,6 +298,10 @@ class TradingEngine:
             )
         self._kelly_mult_series = (
             _load_kelly(cfg.kelly_mult_path) if cfg.kelly_mult_path else None
+        )
+        self._bar_slip_series = (
+            _load_slip(cfg.bar_exec_quality_path)
+            if cfg.bar_exec_quality_path else None
         )
         self.predictor = Predictor(
             feature_assembler=self.feature_assembler,
@@ -898,8 +908,20 @@ class TradingEngine:
         # Per-bar Kelly K1 lookup (V2 wiring, C3 2026-04-26). Returns 1.0
         # for shorts (sidecar puts mult=1.0 by construction), bars
         # outside sidecar coverage, and when Kelly is disabled.
-        from vol_arb.sidecars import lookup_kelly_mult_at
+        # Per-bar empirical slip USD/BTC (V2 wiring, C4 2026-04-26)
+        # converted to a max_slippage_pct cap for the IOC taker. Falls
+        # back to the legacy ``cfg.max_slippage_pct`` flat cap when the
+        # sidecar is missing or covers different bars.
+        from vol_arb.sidecars import lookup_kelly_mult_at, lookup_slip_usd_at
+        from deribit_paper.execution.slippage_calc import live_slippage_pct
         kelly_mult = lookup_kelly_mult_at(self._kelly_mult_series, bar.timestamp)
+        slip_usd = lookup_slip_usd_at(self._bar_slip_series, bar.timestamp)
+        taker_slippage_pct = live_slippage_pct(
+            slip_usd_per_btc=slip_usd,
+            spot=index_price,
+            observed_spread_usd=None,                     # spread unavailable here; override happens at order site
+            fallback_pct=self.config.max_slippage_pct,
+        )
         n_contracts = self.straddle_flow.size_position(
             equity=self.equity_tracker.current_equity,
             signal_direction=signal.direction,
@@ -947,6 +969,8 @@ class TradingEngine:
                 edge_vp=signal.edge_vol_pts,
                 rolling_median_edge=rolling_median_edge,
                 peak_equity=self.equity_tracker.peak_equity,
+                kelly_mult=kelly_mult,
+                taker_slippage_pct=taker_slippage_pct,
             ),
             name=f"trade_{bar.timestamp.value}",
         )
@@ -960,6 +984,8 @@ class TradingEngine:
         edge_vp: float = 0.0,
         rolling_median_edge: float = 1.0,
         peak_equity: float = 0.0,
+        kelly_mult: float = 1.0,
+        taker_slippage_pct: float = 0.5,
     ) -> None:
         """Run a straddle trade + update all state after completion."""
         try:
@@ -972,6 +998,8 @@ class TradingEngine:
                 edge_vp=edge_vp,
                 rolling_median_edge=rolling_median_edge,
                 peak_equity=peak_equity,
+                kelly_mult=kelly_mult,
+                taker_slippage_pct=taker_slippage_pct,
             )
         except Exception as exc:  # noqa: BLE001 - log + kill-switch
             logger.exception("StraddleFlow.execute failed: %s", exc)

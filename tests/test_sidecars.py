@@ -29,10 +29,12 @@ from vol_arb.sidecars import (
     SLIP_FALLBACK_USD,
     load_aligner_betas,
     load_bar_exec_slip,
+    load_bar_exec_slip_series,
     load_kelly_mult,
     load_kelly_mult_series,
     lookup_beta_for_month,
     lookup_kelly_mult_at,
+    lookup_slip_usd_at,
 )
 
 
@@ -272,3 +274,43 @@ def test_lookup_kelly_at_missing_timestamp_returns_fallback(kelly_parquet):
 def test_lookup_kelly_at_none_series_returns_fallback():
     ts = pd.Timestamp("2026-01-15", tz="UTC")
     assert lookup_kelly_mult_at(None, ts) == KELLY_FALLBACK
+
+
+# ── load_bar_exec_slip_series + lookup_slip_usd_at ────────────────────────
+
+def test_slip_series_returns_none_for_missing():
+    assert load_bar_exec_slip_series(None) is None
+    assert load_bar_exec_slip_series("/no/such/path.parquet") is None
+
+
+def test_slip_series_loads(slip_parquet):
+    ser = load_bar_exec_slip_series(slip_parquet)
+    assert ser is not None
+    assert ser.shape == (4,)
+    assert ser.iloc[0] == 10.0
+
+
+def test_lookup_slip_at_exact_match(slip_parquet):
+    ser = load_bar_exec_slip_series(slip_parquet)
+    ts = pd.Timestamp("2026-01-01 00:30", tz="UTC")
+    assert lookup_slip_usd_at(ser, ts) == 20.0
+
+
+def test_lookup_slip_at_uses_prior_bar(slip_parquet):
+    """Walk-forward semantics: a timestamp BETWEEN sidecar entries uses
+    the most recent past entry, never the future one."""
+    ser = load_bar_exec_slip_series(slip_parquet)
+    # Sidecar coverage at 00:00, 00:30, 01:00, 01:30. Ask for 00:45.
+    ts = pd.Timestamp("2026-01-01 00:45", tz="UTC")
+    assert lookup_slip_usd_at(ser, ts) == 20.0  # value from 00:30, not 01:00.
+
+
+def test_lookup_slip_at_pre_coverage_returns_fallback(slip_parquet):
+    ser = load_bar_exec_slip_series(slip_parquet)
+    ts = pd.Timestamp("2025-12-01", tz="UTC")
+    assert lookup_slip_usd_at(ser, ts) == SLIP_FALLBACK_USD
+
+
+def test_lookup_slip_at_none_series_returns_fallback():
+    ts = pd.Timestamp("2026-01-15", tz="UTC")
+    assert lookup_slip_usd_at(None, ts) == SLIP_FALLBACK_USD

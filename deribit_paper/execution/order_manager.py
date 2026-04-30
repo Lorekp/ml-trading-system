@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +69,10 @@ class OrderResult:
     is_dry_run: bool
     error: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    # ── Latency telemetry (V2 wiring, I3 2026-04-26) ──
+    submit_to_ack_ms: float | None = None   # time from .place_order() call → ack received
+    ack_to_terminal_ms: float | None = None  # time from ack → state in _TERMINAL_STATES
+    total_ms: float | None = None            # wall-clock from submit → terminal
 
     @property
     def is_filled(self) -> bool:
@@ -122,6 +127,13 @@ class OrderManager:
         """
         if label is None:
             label = new_client_order_id()
+
+        # ── Latency telemetry start (V2 wiring, I3 2026-04-26) ──
+        # Capture wall-clock submit-to-ack and total latencies on every
+        # order. Useful for diagnosing live-vs-backtest fill drift and
+        # for the kill-switch threshold (plumbed but disabled on
+        # testnet — testnet latency is meaningless).
+        _t0_submit_ns = time.perf_counter_ns()
 
         # Idempotency check — don't double-send the same label
         if self._guard.was_sent(label):
@@ -201,6 +213,8 @@ class OrderManager:
             )
 
         self._guard.mark_sent(label)
+        _t1_ack_ns = time.perf_counter_ns()
+        _submit_to_ack_ms = (_t1_ack_ns - _t0_submit_ns) / 1e6
 
         is_dry_run = bool(submit_result.get("_stub", False))
         order = submit_result.get("order", {}) or {}
@@ -211,6 +225,7 @@ class OrderManager:
 
         if is_dry_run:
             # Dry-run stubs are already filled — short-circuit
+            _total_ms = (time.perf_counter_ns() - _t0_submit_ns) / 1e6
             return OrderResult(
                 client_order_id=label,
                 order_id=order_id,
@@ -222,6 +237,9 @@ class OrderManager:
                 state=state,
                 is_dry_run=True,
                 raw=submit_result,
+                submit_to_ack_ms=_submit_to_ack_ms,
+                ack_to_terminal_ms=0.0,
+                total_ms=_total_ms,
             )
 
         # Poll for terminal state
@@ -233,6 +251,18 @@ class OrderManager:
             amount_requested=amount,
             timeout_seconds=timeout_seconds,
         )
+        # Stamp the latency telemetry onto the live result (the
+        # _poll_until_terminal path can't see the original submit time).
+        _t2_terminal_ns = time.perf_counter_ns()
+        result.submit_to_ack_ms = _submit_to_ack_ms
+        result.ack_to_terminal_ms = (_t2_terminal_ns - _t1_ack_ns) / 1e6
+        result.total_ms = (_t2_terminal_ns - _t0_submit_ns) / 1e6
+        if result.submit_to_ack_ms > 2000.0:
+            logger.warning(
+                "High submit-to-ack latency on %s: %.0fms — investigate "
+                "Deribit congestion / network",
+                label, result.submit_to_ack_ms,
+            )
         return result
 
     # ── Smart taker execution ─────────────────────────────────

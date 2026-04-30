@@ -50,6 +50,47 @@ _TERMINAL_STATES: frozenset[str] = frozenset({
 })
 
 
+def _merge_tier_results(a: "OrderResult", b: "OrderResult") -> "OrderResult":
+    """Aggregate two tiered IOC results (filled_amount weighted average).
+
+    Returns a fresh :class:`OrderResult` whose ``client_order_id``,
+    ``order_id`` and ``state`` come from ``b`` (the latest tier);
+    ``filled_amount`` is the sum, ``average_price`` is the size-weighted
+    mean, and the latency fields reflect the SUM of both tiers'
+    ``total_ms``. Used by ``_place_tiered_taker``.
+    """
+    total_filled = a.filled_amount + b.filled_amount
+    if total_filled > 0:
+        avg_px = (
+            a.average_price * a.filled_amount + b.average_price * b.filled_amount
+        ) / total_filled
+    else:
+        avg_px = 0.0
+    submit_to_ack = (
+        (a.submit_to_ack_ms or 0.0) + (b.submit_to_ack_ms or 0.0)
+    )
+    ack_to_term = (
+        (a.ack_to_terminal_ms or 0.0) + (b.ack_to_terminal_ms or 0.0)
+    )
+    total_ms = (a.total_ms or 0.0) + (b.total_ms or 0.0)
+    return OrderResult(
+        client_order_id=b.client_order_id,
+        order_id=b.order_id,
+        instrument_name=b.instrument_name,
+        side=b.side,
+        amount_requested=a.amount_requested,         # original request
+        filled_amount=total_filled,
+        average_price=avg_px,
+        state="filled" if total_filled >= a.amount_requested - 1e-9 else b.state,
+        is_dry_run=a.is_dry_run or b.is_dry_run,
+        error=b.error if b.state not in {"filled"} else None,
+        raw=b.raw,
+        submit_to_ack_ms=submit_to_ack,
+        ack_to_terminal_ms=ack_to_term,
+        total_ms=total_ms,
+    )
+
+
 @dataclass
 class OrderResult:
     """Final state of a submitted order.
@@ -276,6 +317,7 @@ class OrderManager:
         max_slippage_pct: float = 0.5,
         label: str | None = None,
         reduce_only: bool | None = None,
+        tiered: bool = False,
     ) -> OrderResult:
         """Taker order with IOC price protection.
 
@@ -283,7 +325,24 @@ class OrderManager:
         best + max_slippage_pct, and sends as IOC (immediate-or-cancel).
         If the book is empty beyond the cap, partial fill is returned
         instead of a catastrophic price.
+
+        When ``tiered=True`` (V2 wiring, I1 2026-04-26) escalates through
+        a 3-tier ladder: tier-1 IOC at touch+1tick, tier-2 IOC at the
+        full ``max_slippage_pct`` cap, tier-3 market on residual size.
+        Each tier only fires for the *unfilled* portion of the order so
+        early-tier fills aren't double-counted. Latency is captured per
+        tier via the underlying ``place_and_wait`` telemetry (I3); the
+        outermost result reflects the LAST tier that ran.
         """
+        if tiered:
+            return await self._place_tiered_taker(
+                instrument_name=instrument_name,
+                side=side,
+                amount=amount,
+                max_slippage_pct=max_slippage_pct,
+                label=label,
+                reduce_only=reduce_only,
+            )
         if label is None:
             label = new_client_order_id()
 
@@ -346,6 +405,117 @@ class OrderManager:
             label=label, reduce_only=reduce_only,
             timeout_seconds=10.0,
         )
+
+    async def _place_tiered_taker(
+        self,
+        *,
+        instrument_name: str,
+        side: str,
+        amount: float,
+        max_slippage_pct: float,
+        label: str | None,
+        reduce_only: bool | None,
+    ) -> OrderResult:
+        """3-tier IOC taker ladder. See :meth:`place_ioc_taker` ``tiered=True``.
+
+        Tier 1: IOC at touch + 1 tick (cheapest, highest miss rate on testnet).
+        Tier 2: IOC at touch ± ``max_slippage_pct``/100 (the C4 sidecar cap).
+        Tier 3: market on whatever didn't fill in tiers 1+2.
+
+        Each tier is a fresh ``place_and_wait`` call so the idempotency
+        guard sees a unique label per tier. Returns the LAST tier's
+        OrderResult with ``filled_amount`` aggregated across tiers.
+        """
+        if label is None:
+            label = new_client_order_id()
+
+        # Lookup the current touch + spread for tier-1 / tier-2 caps.
+        try:
+            ticker = await self._rest.get_ticker(instrument_name)
+        except Exception as exc:
+            logger.warning(
+                "Tiered IOC: get_ticker(%s) failed (%s) -- jumping to market",
+                instrument_name, exc,
+            )
+            return await self.place_and_wait(
+                instrument_name=instrument_name,
+                side=side, amount=amount,
+                order_type="market",
+                label=label, reduce_only=reduce_only,
+                timeout_seconds=30.0,
+            )
+
+        tick = 0.0005   # Deribit option tick size in BTC.
+        if side == "buy":
+            best = float(ticker.get("best_ask_price", 0.0) or 0.0)
+            tier1_cap = round((best + tick) / tick) * tick
+            tier2_cap = round((best * (1.0 + max_slippage_pct / 100.0)) / tick) * tick
+        else:
+            best = float(ticker.get("best_bid_price", 0.0) or 0.0)
+            tier1_cap = round((best - tick) / tick) * tick
+            tier2_cap = round((best * (1.0 - max_slippage_pct / 100.0)) / tick) * tick
+
+        if best <= 0:
+            logger.warning(
+                "Tiered IOC: no valid quote for %s -- jumping to market",
+                instrument_name,
+            )
+            return await self.place_and_wait(
+                instrument_name=instrument_name,
+                side=side, amount=amount,
+                order_type="market",
+                label=label, reduce_only=reduce_only,
+                timeout_seconds=30.0,
+            )
+
+        # ── Tier 1 ──
+        logger.info(
+            "Tiered IOC %s %s tier-1 @ %.6f (best=%.6f, amount=%.4f)",
+            side, instrument_name, tier1_cap, best, amount,
+        )
+        r1 = await self.place_and_wait(
+            instrument_name=instrument_name,
+            side=side, amount=amount,
+            order_type="limit", price=tier1_cap,
+            time_in_force="immediate_or_cancel",
+            label=f"{label}_t1", reduce_only=reduce_only,
+            timeout_seconds=10.0,
+        )
+        residual = amount - r1.filled_amount
+        if residual <= 1e-9:
+            return r1
+
+        # ── Tier 2 ──
+        logger.info(
+            "Tiered IOC %s %s tier-2 @ %.6f (residual=%.4f after tier-1)",
+            side, instrument_name, tier2_cap, residual,
+        )
+        r2 = await self.place_and_wait(
+            instrument_name=instrument_name,
+            side=side, amount=residual,
+            order_type="limit", price=tier2_cap,
+            time_in_force="immediate_or_cancel",
+            label=f"{label}_t2", reduce_only=reduce_only,
+            timeout_seconds=10.0,
+        )
+        residual2 = residual - r2.filled_amount
+        if residual2 <= 1e-9:
+            # Aggregate filled_amount + average_price across tiers 1+2.
+            return _merge_tier_results(r1, r2)
+
+        # ── Tier 3 (market) ──
+        logger.info(
+            "Tiered IOC %s %s tier-3 MARKET (residual=%.4f after tier-2)",
+            side, instrument_name, residual2,
+        )
+        r3 = await self.place_and_wait(
+            instrument_name=instrument_name,
+            side=side, amount=residual2,
+            order_type="market",
+            label=f"{label}_t3", reduce_only=reduce_only,
+            timeout_seconds=30.0,
+        )
+        return _merge_tier_results(_merge_tier_results(r1, r2), r3)
 
     async def place_chunked_taker(
         self,

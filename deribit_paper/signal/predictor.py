@@ -80,6 +80,8 @@ class Predictor:
         base_spread_iv: float = 1.5,
         spread_jump_k: float = 3.0,
         max_jump_fraction_for_shorts: float = 0.15,
+        skip_long_if_term_slope_gt: float | None = None,
+        aligner_betas: dict[str, float] | None = None,
         log_every_bar: bool = False,
     ):
         self._assembler = feature_assembler
@@ -90,6 +92,8 @@ class Predictor:
         self._base_spread_iv = base_spread_iv
         self._spread_jump_k = spread_jump_k
         self._max_jump_fraction_for_shorts = max_jump_fraction_for_shorts
+        self._skip_long_if_term_slope_gt = skip_long_if_term_slope_gt
+        self._aligner_betas: dict[str, float] = dict(aligner_betas or {})
         self._log_every_bar = log_every_bar
 
     def predict(
@@ -126,8 +130,21 @@ class Predictor:
                 reason="feature pipeline returned NaN — refusing to trade",
             )
 
-        # 2) LightGBM prediction — outputs ln(vol_ann), convert to vol points
-        pred_ln = float(self._bundle.lgbm_model.predict(row.values.reshape(1, -1))[0])
+        # 2) LightGBM prediction — outputs ln(vol_ann), convert to vol points.
+        # Apply per-month aligner β* (walk-forward QLIKE-optimal scalar
+        # bias) to mirror the offline contract baked into
+        # BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet
+        # (y_pred = y_pred_raw + β*_month). Lookup falls back to the
+        # most-recent-prior month when ``aligner_betas`` lags real time.
+        pred_ln_raw = float(self._bundle.lgbm_model.predict(row.values.reshape(1, -1))[0])
+        if self._aligner_betas:
+            from vol_arb.sidecars import lookup_beta_for_month
+            beta_star = lookup_beta_for_month(
+                self._aligner_betas, bar.timestamp, fallback_zero_warn=False,
+            )
+            pred_ln = pred_ln_raw + beta_star
+        else:
+            pred_ln = pred_ln_raw
         rv_pred_decimal = math.exp(pred_ln)
         rv_pred_pct = rv_pred_decimal * 100.0
 
@@ -161,6 +178,17 @@ class Predictor:
                 f"LONG — rv_pred ({rv_pred_pct:.2f}%) > iv ({iv_used_pct:.2f}%) "
                 f"by {edge:+.3f}vp (eff_thresh={effective_long:.2f})"
             )
+            # V2 contango filter (Phase C.5 2026-04-16): drop LONG signals
+            # in IV contango regimes where the 1w-2w term slope is positive.
+            if self._skip_long_if_term_slope_gt is not None:
+                slope = self._compute_term_slope_1w_2w()
+                if slope is not None and slope > self._skip_long_if_term_slope_gt:
+                    direction = 0
+                    reason = (
+                        f"FLAT (V2 contango filter) — term_slope_1w_2w "
+                        f"{slope:+.3f} > {self._skip_long_if_term_slope_gt:.2f}; "
+                        f"LONG candidate edge={edge:+.3f}vp suppressed"
+                    )
         elif edge < -effective_short:
             direction = -1
             reason = (
@@ -197,6 +225,22 @@ class Predictor:
             straddle=straddle if direction != 0 else None,
             reason=reason,
         )
+
+    def _compute_term_slope_1w_2w(self) -> float | None:
+        """Per-bar IV term slope at 1w-2w (matches ``svi_term_slope_1w_2w``).
+
+        Mirrors ``vol_arb/svi.py::_constant_maturity_features`` (line 1126):
+        ``svi_term_slope_1w_2w = svi_atm_2w - svi_atm_1w``. Both legs in
+        percent. Returns ``None`` when SVI hasn't calibrated yet so the
+        caller can pass through (don't suppress signals during warmup).
+        """
+        if not self._svi.has_params:
+            return None
+        atm_1w = self._svi.atm_vol_at_dte(7.0)
+        atm_2w = self._svi.atm_vol_at_dte(14.0)
+        if not (math.isfinite(atm_1w) and math.isfinite(atm_2w)):
+            return None
+        return float(atm_2w - atm_1w)
 
     def _lookup_iv(
         self, bar: Bar, straddle: StraddleSelection | None,

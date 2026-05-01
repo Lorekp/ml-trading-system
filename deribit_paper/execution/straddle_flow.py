@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -98,6 +99,7 @@ class StraddleFlow:
         sizing_edge_cap: float = 3.0,          # max edge multiplier (composite_v2)
         sizing_dd_floor: float = 0.25,         # min scale at deep drawdown (composite_v2)
         min_trade_floor: bool = False,         # return exchange min instead of 0.0
+        use_tiered_taker: bool = False,        # E.1.6: 3-tier IOC ladder
         on_position_opened: Callable[..., Awaitable[None]] | None = None,
         on_position_closed: Callable[..., Awaitable[None]] | None = None,
     ):
@@ -121,6 +123,7 @@ class StraddleFlow:
         self._baseline_target_dvol = baseline_target_dvol
         self._sizing_edge_cap = sizing_edge_cap
         self._sizing_dd_floor = sizing_dd_floor
+        self._use_tiered_taker = use_tiered_taker
 
     # ── Sizing ──────────────────────────────────────────────────────
 
@@ -136,6 +139,7 @@ class StraddleFlow:
         edge_vp: float = 0.0,
         rolling_median_edge: float = 1.0,
         peak_equity: float = 0.0,
+        profit_scale: float = 1.0,
         kelly_mult: float = 1.0,
     ) -> float:
         """Compute the BTC notional for a new straddle trade.
@@ -151,12 +155,19 @@ class StraddleFlow:
            with a floor of ``sizing_dd_floor``.
         4. **Liquidity scale** (liq_scale, caller-supplied) — spread-EMA/current
            spread.  Already implemented by the caller via exec_cost_ema.
-        5. **Kelly K1 multiplier** (kelly_mult, caller-supplied) — per-bar
+        5. **Profit scale** (profit_scale, caller-supplied) — empirical-Bayes
+           shrinkage estimator from
+           :class:`deribit_paper.execution.profit_scale.ProfitScaleEstimator`,
+           applied AFTER edge/dd/liq and BEFORE Kelly. Mirrors the backtester
+           at ``vol_arb/backtester.py:1986-1993``. Defaults to 1.0 (no-op)
+           so the ``default`` config preset stays byte-id with prior runs.
+        6. **Kelly K1 multiplier** (kelly_mult, caller-supplied) — per-bar
            upside-only multiplier in [1.0, 2.0] sourced from
            ``BTC_v2_kelly_mult_K1.parquet``. Applied AFTER DVOL/edge/dd/liq
-           and BEFORE the dynamic BTC cap, mirroring the backtester at
-           ``vol_arb/backtester.py:2038-2043``. Shorts always pass through
-           with mult=1.0 (caller is responsible for the asymmetry).
+           /profit_scale and BEFORE the dynamic BTC cap, mirroring the
+           backtester at ``vol_arb/backtester.py:2001-2006``. Shorts always
+           pass through with mult=1.0 (caller is responsible for the
+           asymmetry).
 
         Returns 0.0 if the computed size is below the minimum contract size.
         """
@@ -197,11 +208,21 @@ class StraddleFlow:
         # 4. Liquidity scale (supplied by caller from spread EMA vs current spread)
         n *= edge_scale * dd_scale * liq_scale
 
-        # 5. Kelly K1 multiplier (upside-only, applied AFTER edge/dd/liq).
-        # Caller passes 1.0 when the sidecar is missing / signal is short /
-        # bar timestamp falls outside sidecar coverage. The backtester
-        # short-circuits on ``km > 1.0`` so the size_mult arithmetic is a
-        # no-op at floor=1.0; we mirror that exactly.
+        # 5. Profit scale (empirical-Bayes shrinkage, V2 only). Mirrors
+        # backtester order: applied AFTER edge/dd/liq, BEFORE Kelly.
+        # Caller passes 1.0 when ``use_profit_scaling`` is off, so the
+        # default preset is byte-id with the pre-E.1.1 behaviour. Clip
+        # defensively to a safe band even though the estimator already
+        # bounds its output.
+        if 0.0 < profit_scale < 1.0 - 1e-12:
+            n *= float(np.clip(profit_scale, 0.05, 1.0))
+
+        # 6. Kelly K1 multiplier (upside-only, applied AFTER edge/dd/liq
+        # /profit_scale). Caller passes 1.0 when the sidecar is missing
+        # / signal is short / bar timestamp falls outside sidecar
+        # coverage. The backtester short-circuits on ``km > 1.0`` so the
+        # size_mult arithmetic is a no-op at floor=1.0; we mirror that
+        # exactly.
         if kelly_mult > 1.0 + 1e-12:
             n *= kelly_mult
 
@@ -232,6 +253,7 @@ class StraddleFlow:
         edge_vp: float = 0.0,
         rolling_median_edge: float = 1.0,
         peak_equity: float = 0.0,
+        profit_scale: float = 1.0,
         kelly_mult: float = 1.0,
         taker_slippage_pct: float = 0.5,
     ) -> TradeOutcome:
@@ -264,8 +286,13 @@ class StraddleFlow:
         straddle = signal.straddle
         spot = signal.straddle.index_price
 
-        # ── Liquidity scaling from current spread ──────────────────
+        # ── Liquidity scaling + observed-spread fetch ──────────────
+        # One ticker call serves both liq_scale (uses spread/EMA) and
+        # the observed-spread override clause in the slippage calc
+        # (E.1.9 2026-05-01: pre-E.1.9 the override path was unreachable
+        # because engine.py hardcoded ``observed_spread_usd=None``).
         liq_scale = 1.0
+        observed_spread_usd: float | None = None
         try:
             if (self._order_manager
                     and hasattr(self._order_manager, '_rest')
@@ -276,8 +303,11 @@ class StraddleFlow:
                 if isinstance(ticker, dict):
                     best_ask = float(ticker.get("best_ask_price", 0) or 0)
                     best_bid = float(ticker.get("best_bid_price", 0) or 0)
-                    if best_ask > 0 and best_bid > 0:
+                    if best_ask > 0 and best_bid > 0 and spot > 0:
+                        # Spread in USD = (ask - bid) × spot when prices
+                        # are quoted in BTC (Deribit option convention).
                         spread_usd = (best_ask - best_bid) * spot
+                        observed_spread_usd = max(spread_usd, 0.0)
                         current_cost = max(spread_usd, 1.0)
                         if exec_cost_ema > 0:
                             liq_scale = max(0.25, min(
@@ -291,6 +321,23 @@ class StraddleFlow:
         except Exception:
             logger.debug("Could not fetch spread for liq scaling", exc_info=True)
 
+        # Recompute the slippage cap using the observed spread, so the
+        # 1.5× override clause in ``live_slippage_pct`` becomes reachable.
+        # Caller (engine.process_bar) already passed ``taker_slippage_pct``
+        # computed from the sidecar alone; we override here only when we
+        # have a fresh observed_spread_usd.
+        if observed_spread_usd is not None and spot > 0:
+            from deribit_paper.execution.slippage_calc import live_slippage_pct
+            # Convert ``taker_slippage_pct`` (already a pct) to USD-per-BTC
+            # for the helper's "sidecar pct vs observed" comparison.
+            sidecar_implied_usd = taker_slippage_pct / 100.0 * spot
+            taker_slippage_pct = live_slippage_pct(
+                slip_usd_per_btc=sidecar_implied_usd,
+                spot=spot,
+                observed_spread_usd=observed_spread_usd,
+                fallback_pct=taker_slippage_pct,
+            )
+
         n_contracts = self.size_position(
             equity=equity,
             signal_direction=signal.direction,
@@ -301,6 +348,7 @@ class StraddleFlow:
             edge_vp=edge_vp,
             rolling_median_edge=rolling_median_edge,
             peak_equity=peak_equity,
+            profit_scale=profit_scale,
             kelly_mult=kelly_mult,
         )
         if n_contracts <= 0.0:
@@ -326,20 +374,26 @@ class StraddleFlow:
             n_contracts, straddle.strike,
         )
 
+        # E.1.13: append random suffix so labels can't be guessed by an
+        # adversary observing log timestamps. The timestamp prefix is
+        # kept for human-readable forensics.
+        entry_nonce = secrets.token_hex(8)
         entry_call, entry_put = await asyncio.gather(
             self._order_manager.place_ioc_taker(
                 instrument_name=straddle.call_instrument,
                 side=entry_side,
                 amount=n_contracts,
                 max_slippage_pct=taker_slippage_pct,
-                label=f"straddle_entry_C_{started_at.value}",
+                label=f"straddle_entry_C_{started_at.value}_{entry_nonce}",
+                tiered=self._use_tiered_taker,
             ),
             self._order_manager.place_ioc_taker(
                 instrument_name=straddle.put_instrument,
                 side=entry_side,
                 amount=n_contracts,
                 max_slippage_pct=taker_slippage_pct,
-                label=f"straddle_entry_P_{started_at.value}",
+                label=f"straddle_entry_P_{started_at.value}_{entry_nonce}",
+                tiered=self._use_tiered_taker,
             ),
         )
 
@@ -427,20 +481,21 @@ class StraddleFlow:
             )
             hedger.cancel()
             exit_side = "buy" if signal.direction == -1 else "sell"
+            cancel_nonce = secrets.token_hex(8)
             try:
                 await asyncio.gather(
                     self._order_manager.place_and_wait(
                         instrument_name=straddle.call_instrument,
                         side=exit_side, amount=n_contracts,
                         order_type="market",
-                        label=f"cancel_exit_C_{started_at.value}",
+                        label=f"cancel_exit_C_{started_at.value}_{cancel_nonce}",
                         timeout_seconds=15.0, reduce_only=True,
                     ),
                     self._order_manager.place_and_wait(
                         instrument_name=straddle.put_instrument,
                         side=exit_side, amount=n_contracts,
                         order_type="market",
-                        label=f"cancel_exit_P_{started_at.value}",
+                        label=f"cancel_exit_P_{started_at.value}_{cancel_nonce}",
                         timeout_seconds=15.0, reduce_only=True,
                     ),
                 )
@@ -467,22 +522,25 @@ class StraddleFlow:
 
         # ── 5. CLOSE both legs ─────────────────────────────────────
         exit_side = "buy" if signal.direction == -1 else "sell"
+        exit_nonce = secrets.token_hex(8)
         exit_call, exit_put = await asyncio.gather(
             self._order_manager.place_ioc_taker(
                 instrument_name=straddle.call_instrument,
                 side=exit_side,
                 amount=n_contracts,
                 max_slippage_pct=taker_slippage_pct,
-                label=f"straddle_exit_C_{started_at.value}",
+                label=f"straddle_exit_C_{started_at.value}_{exit_nonce}",
                 reduce_only=True,
+                tiered=self._use_tiered_taker,
             ),
             self._order_manager.place_ioc_taker(
                 instrument_name=straddle.put_instrument,
                 side=exit_side,
                 amount=n_contracts,
                 max_slippage_pct=taker_slippage_pct,
-                label=f"straddle_exit_P_{started_at.value}",
+                label=f"straddle_exit_P_{started_at.value}_{exit_nonce}",
                 reduce_only=True,
+                tiered=self._use_tiered_taker,
             ),
         )
 
@@ -548,7 +606,10 @@ class StraddleFlow:
                     side=close_side,
                     amount=order.filled_amount,
                     order_type="market",
-                    label=f"unilateral_close_{instrument}_{attempt}",
+                    label=(
+                        f"unilateral_close_{instrument}_{attempt}_"
+                        f"{secrets.token_hex(8)}"
+                    ),
                     timeout_seconds=15.0,
                     reduce_only=True,
                 )

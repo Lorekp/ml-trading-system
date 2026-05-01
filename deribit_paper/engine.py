@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import secrets
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,10 @@ from deribit_paper.client import DeribitAuth, DeribitRESTClient, DeribitWebSocke
 from deribit_paper.config import PaperConfig
 from deribit_paper.execution import OrderManager, StraddleFlow
 from deribit_paper.execution.idempotency import IdempotencyGuard
+from deribit_paper.execution.profit_scale import (
+    ProfitScaleEstimator,
+    bsm_vega_per_vol_pt,
+)
 from deribit_paper.features import LiveSVICalibrator, StrikePicker, compute_bar_tsrv
 from deribit_paper.market_data import (
     Bar,
@@ -127,6 +132,12 @@ class TradingEngine:
         self._stop = asyncio.Event()
         self._background_tasks: list[asyncio.Task] = []
 
+        # Fire-and-forget trade tasks tracked separately so shutdown can
+        # await their completion (E.1.4 2026-05-01). Without this, an
+        # in-flight trade dies on shutdown with positions still open on
+        # Deribit but no record locally — the dropped task path.
+        self._trade_tasks: list[asyncio.Task] = []
+
         # Execution cost EMA for liquidity-conditioned sizing
         self._exec_cost_ema: float = 12.0  # empirical median from backtester data
         self._exec_cost_alpha: float = 2.0 / (config.execution_cost_ema_bars + 1)
@@ -139,6 +150,13 @@ class TradingEngine:
         # None falls back to ``cfg.max_slippage_pct`` flat cap (legacy
         # live default 0.5%).
         self._bar_slip_series: Any = None  # pd.Series | None
+
+        # Profit-scale estimator (V2 wiring, E.1.1 2026-05-01).
+        # Empirical-Bayes shrinkage on realised gross PnL per BTC vs a
+        # theoretical edge×vega prior. ``None`` when ``use_profit_scaling``
+        # is False — engine emits profit_scale=1.0 in that case so the
+        # ``default`` preset stays byte-id with the prior live behaviour.
+        self._profit_scale_estimator: ProfitScaleEstimator | None = None
 
         # Harness-grade trade-row writer (V2 wiring, C6 2026-04-26).
         # Appends one row per closed trade to
@@ -312,6 +330,21 @@ class TradingEngine:
             _load_slip(cfg.bar_exec_quality_path)
             if cfg.bar_exec_quality_path else None
         )
+        if cfg.use_profit_scaling:
+            self._profit_scale_estimator = ProfitScaleEstimator(
+                floor=cfg.profit_scaling_floor,
+                cap=1.0,
+                edge_discount=0.5,                # backtester V2 default
+                tau=200.0,                        # backtester V2 default
+                spread_jump_k=cfg.spread_jump_k,
+                ioc_cap_multiplier=2.0,           # backtester V2 default
+                perp_taker_fee=cfg.perp_taker_fee,
+                option_maker_fee=cfg.option_maker_fee,
+            )
+            logger.info(
+                "ProfitScaleEstimator enabled (floor=%.2f, edge_disc=0.5, tau=200)",
+                cfg.profit_scaling_floor,
+            )
         self.predictor = Predictor(
             feature_assembler=self.feature_assembler,
             svi_calibrator=self.svi_calibrator,
@@ -322,6 +355,10 @@ class TradingEngine:
             max_jump_fraction_for_shorts=cfg.max_jump_fraction_for_shorts,
             skip_long_if_term_slope_gt=cfg.skip_long_if_term_slope_gt,
             aligner_betas=aligner_betas,
+            # E.1.14: V2 preset configures the aligner sidecar; an empty
+            # dict here means the configuration failed silently. Fail
+            # fast at startup rather than bypass β* on every bar.
+            require_aligner=(cfg.config_preset == "v2"),
             log_every_bar=True,
         )
         self.live_drl_hedger = LiveDRLHedger(
@@ -372,6 +409,7 @@ class TradingEngine:
             sizing_edge_cap=cfg.sizing_edge_cap,
             sizing_dd_floor=cfg.sizing_dd_floor,
             min_trade_floor=cfg.min_trade_floor,
+            use_tiered_taker=cfg.use_tiered_taker,
             on_position_opened=self._on_position_opened,
             on_position_closed=self._on_position_closed,
         )
@@ -645,10 +683,19 @@ class TradingEngine:
                 pass
 
     async def shutdown(self) -> None:
-        """Clean teardown of all services."""
+        """Clean teardown of all services.
+
+        Trade tasks (open straddles waiting on the holding period) are
+        awaited up to ``holding_minutes + 60s`` — long enough for an
+        in-flight trade to close cleanly. Background services (WS,
+        bar clock, telegram flush, heartbeat, vpin WS) are cancelled
+        first so they stop emitting bar/heartbeat events while the
+        trade tasks drain.
+        """
         logger.info("TradingEngine shutdown sequence starting")
         self._stop.set()
 
+        # ── 1. Cancel + await background services ──
         for task in self._background_tasks:
             if not task.done():
                 task.cancel()
@@ -658,6 +705,37 @@ class TradingEngine:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
         self._background_tasks.clear()
+
+        # ── 2. Drain trade tasks (let open trades finish) ──
+        # Reap any that have already finished, then wait on the rest
+        # with a generous timeout. On timeout, cancel — the cancellation
+        # path inside StraddleFlow.execute closes legs before re-raising
+        # so we don't strand naked positions.
+        active = [t for t in self._trade_tasks if not t.done()]
+        if active:
+            drain_timeout = self.config.holding_minutes * 60.0 + 60.0
+            logger.info(
+                "Shutdown: draining %d in-flight trade tasks (timeout %.0fs)",
+                len(active), drain_timeout,
+            )
+            done, pending = await asyncio.wait(
+                active,
+                timeout=drain_timeout,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            for t in pending:
+                logger.warning(
+                    "Trade task %s did not finish within drain timeout — "
+                    "cancelling (StraddleFlow handles leg-close on cancel)",
+                    t.get_name(),
+                )
+                t.cancel()
+            for t in pending:
+                try:
+                    await asyncio.wait_for(t, timeout=30.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+        self._trade_tasks.clear()
 
         if self.vpin_stream is not None:
             await self.vpin_stream.stop()
@@ -923,7 +1001,10 @@ class TradingEngine:
         # sidecar is missing or covers different bars.
         from vol_arb.sidecars import lookup_kelly_mult_at, lookup_slip_usd_at
         from deribit_paper.execution.slippage_calc import live_slippage_pct
-        kelly_mult = lookup_kelly_mult_at(self._kelly_mult_series, bar.timestamp)
+        kelly_mult = lookup_kelly_mult_at(
+            self._kelly_mult_series, bar.timestamp,
+            signal_direction=signal.direction,
+        )
         slip_usd = lookup_slip_usd_at(self._bar_slip_series, bar.timestamp)
         taker_slippage_pct = live_slippage_pct(
             slip_usd_per_btc=slip_usd,
@@ -931,6 +1012,55 @@ class TradingEngine:
             observed_spread_usd=None,                     # spread unavailable here; override happens at order site
             fallback_pct=self.config.max_slippage_pct,
         )
+        # First pass: get base notional with profit_scale=1.0 so the
+        # estimator can size its slippage estimate on the pre-scale N.
+        # Mirrors backtester.py:1854-1872 which calls compute_position_size
+        # before profit_scaling.
+        n_pre_ps = self.straddle_flow.size_position(
+            equity=self.equity_tracker.current_equity,
+            signal_direction=signal.direction,
+            spot=index_price,
+            trailing_1h_volume_btc=trailing_vol,
+            dvol_pct=dvol_pct,
+            edge_vp=signal.edge_vol_pts,
+            rolling_median_edge=rolling_median_edge,
+            peak_equity=self.equity_tracker.peak_equity,
+            profit_scale=1.0,
+            kelly_mult=1.0,                       # exclude Kelly from the estimator's N basis
+        )
+
+        # Profit-scale lookup (V2 wiring, E.1.1). ``None`` estimator →
+        # 1.0 (no-op); under V2 preset, computes empirical-Bayes
+        # shrinkage from realised gross EMA + theoretical edge×vega prior.
+        profit_scale = 1.0
+        if self._profit_scale_estimator is not None and n_pre_ps > 0.0 and signal.straddle is not None:
+            iv_dec = (
+                signal.iv_used_pct / 100.0
+                if (signal.iv_used_pct is not None
+                    and math.isfinite(signal.iv_used_pct)
+                    and signal.iv_used_pct > 0.0)
+                else 0.6
+            )
+            tau_years = max(
+                (signal.straddle.expiry_dt - bar.timestamp).total_seconds()
+                / (365.25 * 24 * 3600),
+                1e-6,
+            )
+            vega_per_pt_usd = bsm_vega_per_vol_pt(
+                spot=index_price,
+                strike=signal.straddle.strike,
+                iv_decimal=iv_dec,
+                tau_years=tau_years,
+            )
+            profit_scale = self._profit_scale_estimator.estimate(
+                edge_vp=signal.edge_vol_pts,
+                vega_per_vol_pt_usd=vega_per_pt_usd,
+                spot=index_price,
+                jump_fraction=float(bar_tsrv.jump_fraction or 0.0),
+                slip_usd_per_btc=slip_usd,
+                n_btc=n_pre_ps,
+            )
+
         n_contracts = self.straddle_flow.size_position(
             equity=self.equity_tracker.current_equity,
             signal_direction=signal.direction,
@@ -940,6 +1070,7 @@ class TradingEngine:
             edge_vp=signal.edge_vol_pts,
             rolling_median_edge=rolling_median_edge,
             peak_equity=self.equity_tracker.peak_equity,
+            profit_scale=profit_scale,
             kelly_mult=kelly_mult,
         )
         # 6b. RND-based size scaling — shrinks position as market prices in
@@ -969,20 +1100,28 @@ class TradingEngine:
             return
 
         # 7. Execute via straddle flow (fire-and-forget background task —
-        # the bar loop must not block waiting for the 15-min holding period)
+        # the bar loop must not block waiting for the 15-min holding period).
+        # Tracked in self._trade_tasks so shutdown() can await completion
+        # (E.1.4 2026-05-01).
         self.stats.signals_executed += 1
-        asyncio.create_task(
+        trade_task = asyncio.create_task(
             self._execute_and_persist(
                 signal, n_contracts,
                 dvol_pct=dvol_pct,
                 edge_vp=signal.edge_vol_pts,
                 rolling_median_edge=rolling_median_edge,
                 peak_equity=self.equity_tracker.peak_equity,
+                profit_scale=profit_scale,
                 kelly_mult=kelly_mult,
                 taker_slippage_pct=taker_slippage_pct,
             ),
             name=f"trade_{bar.timestamp.value}",
         )
+        self._trade_tasks.append(trade_task)
+        # Reap completed trade tasks so the list doesn't grow without bound.
+        # Safe to do every bar — list mutation is single-threaded under the
+        # asyncio loop.
+        self._trade_tasks = [t for t in self._trade_tasks if not t.done()]
 
     async def _execute_and_persist(
         self,
@@ -993,6 +1132,7 @@ class TradingEngine:
         edge_vp: float = 0.0,
         rolling_median_edge: float = 1.0,
         peak_equity: float = 0.0,
+        profit_scale: float = 1.0,
         kelly_mult: float = 1.0,
         taker_slippage_pct: float = 0.5,
     ) -> None:
@@ -1007,6 +1147,7 @@ class TradingEngine:
                 edge_vp=edge_vp,
                 rolling_median_edge=rolling_median_edge,
                 peak_equity=peak_equity,
+                profit_scale=profit_scale,
                 kelly_mult=kelly_mult,
                 taker_slippage_pct=taker_slippage_pct,
             )
@@ -1019,35 +1160,136 @@ class TradingEngine:
 
         if outcome.status == "completed":
             self.stats.trades_completed += 1
-            # Rough realized PnL in USD — exact MTM comes from position
-            # tracker's marks, computed at mark time.  For now: estimate
-            # from the entry vs exit fill prices × N × index_price.
-            realized_pnl_usd = 0.0
-            if (outcome.entry_call and outcome.exit_call
-                    and outcome.entry_put and outcome.exit_put):
+            # ── Net realized PnL (E.1.10 + E.1.15 2026-05-01) ──
+            # Net = option_premium_pnl + hedge_pnl - option_fees - hedge_fees.
+            # Mirrors V2 backtester's ``net_pnl_nc`` recipe so the I4
+            # harness compares like-with-like.
+            #
+            # E.1.15: refuse to compute realized PnL when the trade
+            # context is degenerate (no straddle, zero index price, NaN).
+            # Pre-E.1.15 the engine fell back to a hardcoded
+            # ``index_price = 60_000.0`` — silently masked ETH or
+            # other-asset misconfiguration. Now we log ERROR and skip
+            # the equity update; the engine's reconcile path catches
+            # any residual drift later.
+            straddle_ok = (
+                outcome.signal.straddle is not None
+                and outcome.signal.straddle.index_price > 0
+                and math.isfinite(outcome.signal.straddle.index_price)
+            )
+            legs_ok = (
+                outcome.entry_call is not None and outcome.exit_call is not None
+                and outcome.entry_put is not None and outcome.exit_put is not None
+            )
+            if not straddle_ok:
+                logger.error(
+                    "Trade %s: skipping equity update — degenerate "
+                    "straddle context (signal.straddle=%s index_price=%s). "
+                    "ETH or other-asset misconfiguration?",
+                    outcome.trade_id,
+                    outcome.signal.straddle is not None,
+                    getattr(outcome.signal.straddle, "index_price", None),
+                )
+                # Still mark kill-switch success so it doesn't trip on a
+                # data-quality issue. Persistence path below skips too.
+                self.kill_switch.on_trade_result(success=True)
+                return
+
+            index = float(outcome.signal.straddle.index_price)
+            option_pnl_usd = 0.0
+            option_fees_usd = 0.0
+            if legs_ok:
                 premium_in_btc = (
-                    outcome.entry_call.average_price + outcome.entry_put.average_price
+                    outcome.entry_call.average_price
+                    + outcome.entry_put.average_price
                 )
                 premium_out_btc = (
-                    outcome.exit_call.average_price + outcome.exit_put.average_price
+                    outcome.exit_call.average_price
+                    + outcome.exit_put.average_price
                 )
                 pnl_btc = (premium_in_btc - premium_out_btc) * outcome.n_contracts_btc
                 if outcome.signal.direction == 1:
                     pnl_btc = -pnl_btc
-                index = outcome.signal.straddle.index_price if outcome.signal.straddle else 60_000.0
-                realized_pnl_usd = pnl_btc * index
+                option_pnl_usd = pnl_btc * index
+                # Deribit option fee: 0.03% of underlying per contract
+                # (same maker & taker for options). Four fills per
+                # round-trip straddle (2 entry + 2 exit), each priced
+                # against the index, scaled by N_contracts.
+                option_fees_usd = (
+                    4.0 * self.config.option_maker_fee * index
+                    * outcome.n_contracts_btc
+                )
+            else:
+                logger.warning(
+                    "Skipping option PnL: missing leg fills "
+                    "(entry_call=%s entry_put=%s exit_call=%s exit_put=%s) "
+                    "— hedge PnL still folded in",
+                    outcome.entry_call is not None,
+                    outcome.entry_put is not None,
+                    outcome.exit_call is not None,
+                    outcome.exit_put is not None,
+                )
+
+            # Hedge PnL (E.1.10): from PerpHedger's running MTM.
+            hedge_pnl_usd = 0.0
+            hedge_fees_usd = 0.0
+            if outcome.hedge_summary is not None:
+                hedge_pnl_usd = float(getattr(
+                    outcome.hedge_summary, "realized_pnl_usd", 0.0,
+                ) or 0.0)
+                total_usd_traded = float(getattr(
+                    outcome.hedge_summary, "total_usd_traded", 0.0,
+                ) or 0.0)
+                hedge_fees_usd = self.config.perp_taker_fee * total_usd_traded
+
+            realized_pnl_usd = (
+                option_pnl_usd + hedge_pnl_usd
+                - option_fees_usd - hedge_fees_usd
+            )
 
             self.equity_tracker.on_trade_closed(realized_pnl_usd)
             self.kill_switch.on_trade_result(success=True)
 
+            # Profit-scale EMA update (V2 wiring, E.1.1).
+            # Treat ``realized_pnl_usd`` as the gross-pre-fees proxy for now;
+            # E.1.10 will refactor this to subtract hedge PnL + fees so the
+            # estimator's "gross" matches the backtester's vega+theta+delta
+            # decomposition. Until then, the EMA tracks the closest live
+            # analog to gross PnL we have access to.
+            #
+            # Hedge cost is the fee on total perp volume traded
+            # (HedgeRunSummary.total_usd_traded); slip is small relative
+            # to fees on a perp and tracked separately by exec_cost_ema.
+            if self._profit_scale_estimator is not None:
+                hedge_cost_usd = 0.0
+                if outcome.hedge_summary is not None:
+                    total_usd_traded = float(getattr(
+                        outcome.hedge_summary, "total_usd_traded", 0.0,
+                    ) or 0.0)
+                    hedge_cost_usd = (
+                        self.config.perp_taker_fee * total_usd_traded
+                    )
+                self._profit_scale_estimator.update_realized(
+                    gross_pnl_usd=realized_pnl_usd,
+                    hedge_cost_usd=hedge_cost_usd,
+                    n_btc=outcome.n_contracts_btc,
+                )
+
             # Update execution cost EMA from actual fill slippage
             if (outcome.entry_call and outcome.entry_call.average_price > 0
-                    and outcome.entry_put and outcome.entry_put.average_price > 0):
-                index = outcome.signal.straddle.index_price if outcome.signal.straddle else 60_000.0
-                # Approximate fill cost: total premium paid × index / N
-                total_premium = outcome.entry_call.average_price + outcome.entry_put.average_price
-                fill_cost = total_premium * index  # rough $/BTC execution cost proxy
-                self._exec_cost_ema += self._exec_cost_alpha * (fill_cost - self._exec_cost_ema)
+                    and outcome.entry_put and outcome.entry_put.average_price > 0
+                    and outcome.signal.straddle is not None
+                    and outcome.signal.straddle.index_price > 0):
+                spot_for_ema = float(outcome.signal.straddle.index_price)
+                # Approximate fill cost: total premium paid × spot
+                total_premium = (
+                    outcome.entry_call.average_price
+                    + outcome.entry_put.average_price
+                )
+                fill_cost = total_premium * spot_for_ema   # $/BTC proxy
+                self._exec_cost_ema += self._exec_cost_alpha * (
+                    fill_cost - self._exec_cost_ema
+                )
 
             if self.telegram is not None:
                 self.telegram.trade_close(
@@ -1066,19 +1308,18 @@ class TradingEngine:
 
             # ── Harness row (C6) — one row per completed trade in the
             # V2 backtest schema, consumed offline by the I4 harness.
-            term_slope = (
-                self.predictor._compute_term_slope_1w_2w()
-                if (self.predictor is not None
-                    and hasattr(self.predictor, "_compute_term_slope_1w_2w"))
-                else None
-            )
-            self._harness_writer.consolidate_and_write(
+            # ``term_slope_1w_2w`` cached on the Signal at predict time
+            # (E.1.8 2026-05-01) so the value reflects signal-fire SVI
+            # state, NOT post-hold T+15m state.
+            term_slope = getattr(outcome.signal, "term_slope_1w_2w", None)
+            await self._harness_writer.consolidate_and_write(
                 outcome,
                 realized_pnl_usd=realized_pnl_usd,
                 kelly_mult=kelly_mult,
                 taker_slippage_pct=taker_slippage_pct,
                 term_slope_1w_2w=term_slope,
                 config_preset=self.config.config_preset,
+                profit_scale=profit_scale,
             )
         else:
             self.stats.trades_aborted += 1
@@ -1283,7 +1524,10 @@ class TradingEngine:
                             side=close_side,
                             amount=close_amount,
                             order_type="market",
-                            label=f"orphan_close_{instrument}_{attempt}",
+                            label=(
+                                f"orphan_close_{instrument}_{attempt}_"
+                                f"{secrets.token_hex(8)}"
+                            ),
                             timeout_seconds=30.0,
                             reduce_only=True,
                         )
@@ -1397,14 +1641,14 @@ class TradingEngine:
                     instrument_name=db_row["call_instrument"],
                     side=exit_side, amount=n,
                     order_type="market",
-                    label=f"resume_exit_C_{trade_id}",
+                    label=f"resume_exit_C_{trade_id}_{secrets.token_hex(8)}",
                     timeout_seconds=30.0, reduce_only=True,
                 ),
                 self.order_manager.place_and_wait(
                     instrument_name=db_row["put_instrument"],
                     side=exit_side, amount=n,
                     order_type="market",
-                    label=f"resume_exit_P_{trade_id}",
+                    label=f"resume_exit_P_{trade_id}_{secrets.token_hex(8)}",
                     timeout_seconds=30.0, reduce_only=True,
                 ),
             )
@@ -1447,7 +1691,7 @@ class TradingEngine:
                             side=close_side,
                             amount=pos.n_contracts_btc,
                             order_type="market",
-                            label=f"emergency_{instrument}",
+                            label=f"emergency_{instrument}_{secrets.token_hex(8)}",
                             timeout_seconds=15.0,
                             reduce_only=True,
                         )
@@ -1479,7 +1723,7 @@ class TradingEngine:
                         side=close_side,
                         amount=abs(size),
                         order_type="market",
-                        label=f"emergency_perp_{instrument}",
+                        label=f"emergency_perp_{instrument}_{secrets.token_hex(8)}",
                         timeout_seconds=15.0,
                         reduce_only=True,
                     )

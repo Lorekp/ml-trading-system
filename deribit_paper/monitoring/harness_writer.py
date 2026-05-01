@@ -23,7 +23,10 @@ Schema design notes:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +52,7 @@ _HARNESS_COLUMNS: list[str] = [
     "iv_used_pct",
     "edge_vol_pts",
     "term_slope_1w_2w",       # NaN until SVI calibrator exposes it
+    "profit_scale",           # E.1.1: V2 empirical-Bayes shrinkage scalar
     "kelly_mult",              # 1.0 default
     "taker_slippage_pct",     # max_slippage_pct used at IOC
     "entry_call_price",
@@ -70,6 +74,7 @@ def _row_from_outcome(
     taker_slippage_pct: float = 0.5,
     term_slope_1w_2w: float | None = None,
     config_preset: str = "default",
+    profit_scale: float = 1.0,
 ) -> dict[str, Any]:
     """Flatten a :class:`TradeOutcome` plus engine-side metadata into one row.
 
@@ -109,6 +114,7 @@ def _row_from_outcome(
             float(term_slope_1w_2w)
             if term_slope_1w_2w is not None else float("nan")
         ),
+        "profit_scale": float(profit_scale),
         "kelly_mult": float(kelly_mult),
         "taker_slippage_pct": float(taker_slippage_pct),
         "entry_call_price": _avg_price(outcome.entry_call),
@@ -134,17 +140,48 @@ def _row_from_outcome(
 class HarnessWriter:
     """Append-only writer for the harness parquet.
 
-    Designed for low-frequency calls (one per closed trade) so we
-    re-read + re-write the entire parquet on each append. At V2's
-    ~150-300 trades/week the I/O cost is negligible.
+    Concurrency contract (E.1.3 2026-05-01):
+
+    * Reads + writes are gated behind an :class:`asyncio.Lock` so two
+      concurrent ``_execute_and_persist`` tasks never race each other.
+      Without the lock the read-modify-write pattern below silently
+      drops rows when both tasks read the same parquet then both write.
+    * Writes go to a sibling ``.tmp.<uuid>`` file then ``os.replace`` to
+      the final path. This is **atomic on POSIX and on Windows** for
+      same-volume renames — a crash mid-write leaves the prior parquet
+      intact rather than zeroing it.
+    * The lock is per-instance; tests pass a fresh instance per case so
+      no test sees state from another.
+
+    Designed for low-frequency calls (one per closed trade) so the
+    full read+rewrite cost is negligible at V2's ~150-300 trades/week.
     """
 
     def __init__(self, output_path: str | Path):
         self.path = Path(output_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
 
-    def append(self, row: dict[str, Any]) -> None:
-        """Append a single trade row to the parquet."""
+    def _atomic_write(self, df: pd.DataFrame) -> None:
+        """Write ``df`` to ``self.path`` atomically via tmp+rename."""
+        tmp = self.path.with_suffix(
+            f".tmp.{uuid.uuid4().hex}{self.path.suffix}",
+        )
+        try:
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, self.path)
+        except Exception:
+            # Best-effort cleanup of orphan tmp on failure.
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+    def _append_sync(self, row: dict[str, Any]) -> None:
+        """Read-modify-write under no lock (called by both sync and async paths).
+        The lock-acquisition is the caller's responsibility."""
         try:
             new_row = pd.DataFrame([row], columns=_HARNESS_COLUMNS)
             if self.path.exists():
@@ -158,13 +195,22 @@ class HarnessWriter:
                 merged = pd.concat([existing, new_row], ignore_index=True)
             else:
                 merged = new_row
-            merged.to_parquet(self.path, index=False)
+            self._atomic_write(merged)
         except Exception as exc:  # noqa: BLE001 — observability, not critical path
             logger.error(
                 "HarnessWriter append failed (%s): %s", self.path.name, exc,
             )
 
-    def consolidate_and_write(
+    def append(self, row: dict[str, Any]) -> None:
+        """Synchronous append.
+
+        Kept for back-compat with tests + non-async callers. The async
+        engine path goes through :meth:`consolidate_and_write` which
+        gates on :attr:`_lock`.
+        """
+        self._append_sync(row)
+
+    async def consolidate_and_write(
         self,
         outcome: Any,
         *,
@@ -173,10 +219,14 @@ class HarnessWriter:
         taker_slippage_pct: float = 0.5,
         term_slope_1w_2w: float | None = None,
         config_preset: str = "default",
+        profit_scale: float = 1.0,
     ) -> None:
         """High-level entry point: consolidate a TradeOutcome into a row
         and append. Public method used by the engine's _execute_and_persist
         hook.
+
+        Held under the per-instance ``asyncio.Lock`` so two concurrent
+        trades don't lose a row to a read-modify-write race.
         """
         if outcome is None or outcome.signal is None:
             return
@@ -187,8 +237,10 @@ class HarnessWriter:
             taker_slippage_pct=taker_slippage_pct,
             term_slope_1w_2w=term_slope_1w_2w,
             config_preset=config_preset,
+            profit_scale=profit_scale,
         )
-        self.append(row)
+        async with self._lock:
+            self._append_sync(row)
 
 
 __all__ = ["HarnessWriter", "_HARNESS_COLUMNS"]

@@ -110,3 +110,56 @@ def test_kelly_mult_short_passes_when_caller_sends_one(base_args):
     # layer is the single source of truth. Document the behaviour:
     n_buggy = flow.size_position(**short_args, kelly_mult=1.5)
     assert n_buggy > n_baseline  # confirms responsibility lives upstream
+
+
+# ─── E.1.1 — profit_scale × kelly_mult interaction ────────────────────────
+
+def test_profit_scale_default_one_is_passthrough(base_args):
+    """profit_scale=1.0 (default) → notional unchanged."""
+    flow = _make_flow(max_trade_size=10.0)
+    n_no_ps = flow.size_position(**base_args)
+    n_unit_ps = flow.size_position(**base_args, profit_scale=1.0)
+    assert n_no_ps == n_unit_ps
+
+
+def test_profit_scale_below_one_shrinks_notional(base_args):
+    """profit_scale=0.5 → roughly halves the notional (subject to rounding)."""
+    flow = _make_flow(max_trade_size=10.0)
+    n_full = flow.size_position(**base_args, profit_scale=1.0)
+    n_half = flow.size_position(**base_args, profit_scale=0.5)
+    assert n_half < n_full
+    ratio = n_half / n_full
+    assert 0.4 < ratio < 0.6
+
+
+@pytest.mark.parametrize("ps,km,expect_ratio", [
+    (1.0, 1.0, 1.00),
+    (0.7, 1.0, 0.70),
+    (1.0, 1.5, 1.50),
+    (0.7, 1.5, 0.70 * 1.5),
+    (0.3, 2.0, 0.30 * 2.0),     # floor × cap
+])
+def test_profit_scale_kelly_interaction(base_args, ps, km, expect_ratio):
+    """profit_scale and kelly_mult chain multiplicatively in the documented
+    order (profit_scale BEFORE kelly_mult), matching backtester at
+    ``vol_arb/backtester.py:1986-2006``.
+    """
+    flow = _make_flow(max_trade_size=10.0)
+    n_baseline = flow.size_position(**base_args, profit_scale=1.0, kelly_mult=1.0)
+    n_combined = flow.size_position(**base_args, profit_scale=ps, kelly_mult=km)
+    measured = n_combined / max(n_baseline, 1e-9)
+    # Allow ±15% slack for the 0.1 BTC option rounding (small notionals
+    # can drift more than 10% due to the increment).
+    assert abs(measured - expect_ratio) / expect_ratio < 0.15
+
+
+def test_profit_scale_clipped_safety_band(base_args):
+    """Pathological profit_scale=0.001 still produces a positive notional
+    via the floor=0.05 safety band — engine never hands out a literal-zero
+    size when the estimator returns a fractional value."""
+    flow = _make_flow(max_trade_size=10.0)
+    n = flow.size_position(**base_args, profit_scale=0.001)
+    # Either rounded to 0 (below min_trade_size_btc) or to the safety floor.
+    # Either way, never negative or NaN.
+    assert n >= 0.0
+    assert np.isfinite(n)

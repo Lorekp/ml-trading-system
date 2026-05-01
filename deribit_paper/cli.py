@@ -191,11 +191,13 @@ def main() -> None:
         cfg.switch_to_prod()
 
     if args.live:
-        if args.venue == "testnet":
-            # Testnet uses fake money — skip interactive confirmation
-            token = secrets.token_hex(16)
-        else:
-            token = _confirm_live()
+        # E.1.12 (2026-05-01): always require the passphrase, regardless of
+        # venue. Pre-E.1.12 testnet skipped the prompt — easy for an
+        # operator to forget the venue flag and accidentally enable live
+        # orders on production credentials. The passphrase is the
+        # ``--live`` invariant; venue is a ``--venue`` invariant. Coupling
+        # them lets one slip through the other.
+        token = _confirm_live()
         set_dry_run(False, confirmation_token=token)
         logging.getLogger("cli").warning("DRY_RUN disabled — live orders will be placed")
     else:

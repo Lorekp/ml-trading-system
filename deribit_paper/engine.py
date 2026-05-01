@@ -336,18 +336,28 @@ class TradingEngine:
                     pd.Timestamp.now(tz="UTC"), freq="M",
                 )
                 gap_months = (now_month - latest_month).n
-                if gap_months >= 2 and cfg.config_preset == "v2":
+                if (gap_months >= 2 and cfg.config_preset == "v2"
+                        and not getattr(cfg, "allow_stale_aligner", False)):
                     msg = (
                         f"Aligner β* sidecar stale by {gap_months} months "
                         f"(latest={latest_month_str}, now={now_month}). "
                         f"Under V2 preset this is a refusal to start — "
                         f"refresh via scripts/extract_aligner_betas.py + "
                         f"scripts/refresh_live_sidecars.py before "
-                        f"launching."
+                        f"launching, OR pass --allow-stale-aligner to "
+                        f"override (predictions will be biased)."
                     )
                     logger.error(msg)
                     raise RuntimeError(msg)
-                if gap_months >= 1:
+                if gap_months >= 2 and getattr(cfg, "allow_stale_aligner", False):
+                    logger.warning(
+                        "Aligner β* sidecar stale by %d months — "
+                        "OVERRIDDEN by --allow-stale-aligner. "
+                        "Predictions will fall back to the most-recent-"
+                        "prior β* month (%s).",
+                        gap_months, latest_month_str,
+                    )
+                elif gap_months >= 1:
                     logger.warning(
                         "Aligner β* sidecar stale by %d month(s) "
                         "(latest=%s) — predictions remain biased toward "

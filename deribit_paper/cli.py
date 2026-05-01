@@ -108,6 +108,17 @@ def _parse_args() -> argparse.Namespace:
         default="INFO",
         help="Python logging level (default: INFO)",
     )
+    parser.add_argument(
+        "--allow-stale-aligner",
+        action="store_true",
+        help=(
+            "Override the V2 preset's startup refusal when the aligner "
+            "β* sidecar is ≥ 2 months stale. The lookup will fall back "
+            "to the most-recent-prior month — predictions remain biased "
+            "toward older regime, but the engine starts. Use only when "
+            "a refreshed sidecar is unavailable (e.g. testnet smoke run)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -186,6 +197,12 @@ def main() -> None:
         cfg = PaperConfig.with_v2_preset(base=cfg)
         logging.getLogger("cli").info(
             "Applied --config-preset=v2 (production parity stack)",
+        )
+    if args.allow_stale_aligner:
+        cfg.allow_stale_aligner = True
+        logging.getLogger("cli").warning(
+            "--allow-stale-aligner: bypassing β* staleness check "
+            "(predictions may be biased toward older regime)",
         )
     if args.venue == "prod":
         cfg.switch_to_prod()

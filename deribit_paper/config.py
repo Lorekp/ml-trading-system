@@ -237,6 +237,11 @@ class PaperConfig:
     # path and by the CLI before allowing any live orders.  The only way
     # to disable it is an explicit ``--live`` flag + passphrase confirm.
     dry_run: bool = True
+    # E.2.3 escape hatch (set via CLI ``--allow-stale-aligner``). Defaults
+    # off — the V2 staleness check refuses to start at ≥2 months stale.
+    # When True, the check downgrades to a WARN and the lookup falls
+    # back to the most-recent-prior β* month.
+    allow_stale_aligner: bool = False
 
     def __post_init__(self) -> None:
         """Resolve sentinel defaults from (currency, bar_minutes)."""

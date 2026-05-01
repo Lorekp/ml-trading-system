@@ -73,3 +73,30 @@ def test_betas_default_preset_two_months_no_raise():
     # Default preset → no raise even at 2-month stale; only V2 enforces.
     if gap_months >= 2 and config_preset == "v2":
         raise AssertionError("would have raised — but config_preset is default")
+
+
+def test_allow_stale_aligner_override_does_not_raise():
+    """V2 preset + 2-month stale + ``allow_stale_aligner=True`` → WARN,
+    no raise. Operator-explicit override for testnet smoke runs when a
+    refreshed sidecar isn't available."""
+    aligner_betas = {_months_back(3): 0.05}
+    config_preset = "v2"
+    allow_stale = True
+
+    latest_month = pd.Period(max(aligner_betas.keys()), freq="M")
+    now_month = pd.Period(pd.Timestamp.now(tz="UTC"), freq="M")
+    gap_months = (now_month - latest_month).n
+    assert gap_months >= 2
+
+    # Replicate engine logic: under override, do NOT raise.
+    raised = False
+    if (gap_months >= 2 and config_preset == "v2" and not allow_stale):
+        raised = True
+    assert not raised
+
+
+def test_paperconfig_has_allow_stale_aligner_field():
+    """Field exists with default False."""
+    from deribit_paper.config import PaperConfig
+    cfg = PaperConfig()
+    assert cfg.allow_stale_aligner is False

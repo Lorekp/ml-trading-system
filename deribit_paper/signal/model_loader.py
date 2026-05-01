@@ -210,10 +210,33 @@ def load_model_bundle(
 
     from stable_baselines3 import SAC
 
+    # PyTorch 2.6 changed the default of ``weights_only`` from False to
+    # True. SAC.load() doesn't expose that knob; passing the SB3 zip
+    # through the new strict unpickler refuses (or segfaults) on the
+    # embedded LinearSchedule custom class. Force ``weights_only=False``
+    # for the SB3 load by patching BOTH ``torch.load`` and
+    # ``torch.serialization.load`` (SB3 calls the latter directly in
+    # some code paths). Safe because the .zip files are produced by our
+    # own training code (no untrusted-source concern).
+    import torch as _torch
+    import torch.serialization as _torch_ser
+    _orig_module_load = _torch.load
+    _orig_ser_load = _torch_ser.load
+
+    def _patched_load(*args, **kwargs):
+        kwargs["weights_only"] = False     # force, don't setdefault
+        return _orig_module_load(*args, **kwargs)
+
     drl_policy_path = Path(drl_policy_path)
     if not drl_policy_path.exists():
         raise FileNotFoundError(f"DRL policy not found: {drl_policy_path}")
-    drl_policy = SAC.load(str(drl_policy_path), device="cpu")
+    _torch.load = _patched_load
+    _torch_ser.load = _patched_load
+    try:
+        drl_policy = SAC.load(str(drl_policy_path), device="cpu")
+    finally:
+        _torch.load = _orig_module_load
+        _torch_ser.load = _orig_ser_load
     logger.info("  DRL policy loaded: %s", drl_policy_path.name)
 
     # Smoke test: one forward pass must succeed (catches cross-platform pickle issues)

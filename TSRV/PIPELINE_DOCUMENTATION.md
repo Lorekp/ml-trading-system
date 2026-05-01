@@ -8,11 +8,11 @@ This is a cryptocurrency volatility arbitrage system that predicts short-term re
 **Time horizon**: 15-minute prediction windows
 **Date range**: January 2021 to March 2026 (63 months, 183,065 windows)
 **Core edge**: Model-predicted RV vs market IV, exploiting the Variance Risk Premium
-**Prediction models**: TransVol V4 (test QLIKE 0.299) + Hybrid LightGBM (51 monthly expanding models, T2.1 pruned + svi_atm_1d) + HAR-PD path-dependent features (Session C add-on, 6 extra features) + per-month aligner β\* bias correction (QLIKE-optimal scalar shift)
+**Prediction models**: TransVol V4 (test QLIKE 0.299) + Hybrid LightGBM (50 features per month: 27 pruned base + 16 TransVol embeddings + 1 SVI `svi_atm_1d` + 6 HAR-PD path-dependent; per-month expanding retrain in `vol_model/output/models/expanding_pruned_svi_har_pd_v1/`) + per-month aligner β\* bias correction (QLIKE-optimal scalar shift)
 **Position sizing**: composite_v2 chain — `equity × dvol_scale × edge_scale × dd_scale × liq_scale × profit_scale × kelly_mult`, with 6 multiplicative scales bounded by per-bar dynamic_btc_cap re-clip after each step
 **Execution model**: Per-bar realistic taker cost from Deribit trade tape + 3-tier IOC ladder (touch+1tick → cap → bounded-IOC at 1.5×cap) + liquidity-conditioned sizing + observed-spread override
 **Best backtest (compound)**: Sharpe 5.15, $18.71M PnL, -5.03% MaxDD on $100K (V2 production: thr_L=12, util=0.15, contango filter, profit_scaling, Kelly K1 + bias-aligned predictions, realistic_taker, 51 months OOS)
-**Best backtest (non-compound)**: NC PnL **$960K**, NC Sharpe 6.29, NC MaxDD -4.65% on $200K (V2 production preset, post Kelly-K1 adoption 2026-04-21)
+**Best backtest (non-compound)**: NC PnL **$960K**, NC Sharpe 6.29, NC MaxDD -4.65% on the standard $100K NC reference notional (V2 production preset, post Kelly-K1 adoption 2026-04-21). Note: the V2 + Kelly K1 NC Sharpe is 6.29 because Kelly K1 was an accepted Sharpe-for-PnL trade — the pre-K1 V2-with-aligner NC Sharpe was 7.23. The h=15m comparisons in Stage 30 use the pre-K1 baseline (7.23); current production sizing chain is post-K1 (6.29).
 **Production config (offline)**: `BacktestConfig.with_btc_production_filters_v2()` — predictions_path=`BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet`, kelly_mult_path=`BTC_v2_kelly_mult_K1.parquet`, drl_policy_path=`production_sac_v4_final.zip`, entry_threshold=22 (short) / 12 (long), skip_long_if_term_slope_gt=0.0 (contango filter), target_margin_utilization=0.15, holding_minutes=15, use_profit_scaling=True (floor=0.3), sizing=composite_v2, realistic_taker, IOC 2x
 **Production config (live)**: `PaperConfig.with_v2_preset()` — field-by-field cross-checked against the backtest preset (`test_v2_preset_matches_backtest_v2`), enabled via `--config-preset v2`. As of 2026-05-01, paper-trading on Deribit testnet with all V2 invariants armed (β\*, Kelly K1, realistic_taker slip, contango filter, profit_scaling, 3-tier IOC ladder, latency kill-switch).
 
@@ -28,7 +28,7 @@ each timeframe. Unified sweep script: `scripts/sweep_all_tfs.py`.
 ### 1.1 Binance Aggregated Trades (Primary Data Source)
 
 **Path**: `data/binance-aggTrades-parquet/BTCUSDT/{YYYY-MM}.parquet`
-**Volume**: 63 monthly files, 40.6 GB total, ~39 million trades per month
+**Volume**: 63 monthly files, **38 GB** total on disk (verified `du -sh` 2026-05-01), ~39 million trades per month
 **Date range**: 2021-01 to 2026-03
 **Source**: data.binance.vision (USDT-M perpetual futures)
 
@@ -85,11 +85,11 @@ Funding rates settle every 8 hours (00:00, 08:00, 16:00 UTC). Positive funding =
 ### 1.5 Binance bookTicker (Best Bid/Offer)
 
 **Path**: `data/bookTicker_parquet/BTCUSDT/{YYYY-MM-DD}.parquet`
-**Volume**: 320 daily files, 11.4 million ticks per day
-**Date range**: 2023-05-16 to 2024-03-30 (limited availability from Binance Vision)
+**Volume**: 437 daily files (verified 2026-05-01), 11.4 million ticks per day
+**Date range**: 2023-04-15 to 2024-06-24 (continuous, no calendar gaps; coverage extended past the original "2023-05-16 to 2024-03-30" window in earlier doc revisions)
 **Columns**: `best_bid_price` (f32), `best_bid_qty` (f32), `best_ask_price` (f32), `best_ask_qty` (f32), `transaction_time` (i64 ms epoch)
 
-Only available for ~10 months. Features derived from bookTicker (liquidity, OFI) are computed in a separate legacy pipeline, not in the main dollar-bar feature engineer. The main 116 features do NOT depend on bookTicker data.
+Available for ~14 months. Features derived from bookTicker (liquidity, OFI) are computed in a separate legacy pipeline, not in the main dollar-bar feature engineer. The main 116 features do NOT depend on bookTicker data — Stage 9 introduced the Hyperliquid L2 pipeline (10-level depth, longer history, 1,028 days) which superseded bookTicker for live microstructure features.
 
 ---
 
@@ -189,8 +189,9 @@ In crypto: high `down_jump_fraction` = liquidation cascades (sustained vol, dang
 
 **Path**: `TSRV/output/BTCUSDT_tsrv_15m.parquet`
 **Rows**: 183,065 (one per 15-minute window)
-**Date range**: 2021-01-01 to 2026-03-31
+**Date range**: 2021-01-01 00:15 UTC to 2026-04-01 00:00 UTC (the parquet's first index is the close of the first window starting 2021-01-01 00:00; the last index is end-stamped 2026-04-01)
 **Index**: DatetimeIndex (UTC), 15-minute frequency
+**Columns**: 18 (the table below documents 17; the 18th, `rq` — realized quarticity — is appended for use in HAR-PD path-dependent features added in Stage 24+)
 
 | Column | Type | Description | Mean |
 |--------|------|-------------|------|
@@ -211,6 +212,7 @@ In crypto: high `down_jump_fraction` = liquidation cascades (sustained vol, dang
 | `n_dash` | float64 | Avg ticks per sub-bar | 63.8 |
 | `rv_ann` | float64 | Annualized TSRV variance | 0.206 |
 | `vol_ann` | float64 | sqrt(rv_ann) — annualized vol (decimal) | 0.459 |
+| `rq` | float64 | Realized quarticity (used by HAR-PD features) | — |
 
 **Annualization**: `rv_ann = tsrv * (365.25 * 24 * 4)` (35,064 windows per year), `vol_ann = sqrt(rv_ann)`
 
@@ -348,7 +350,7 @@ OI features are zero-filled before May 2023 (when OI data begins). This allows t
 
 After alignment and NaN warmup removal:
 - **Rows**: 182,687 (from 183,065 — only 374 NaN warmup rows lost, plus 1 from the shift)
-- **Features**: 116 (35 after static pruning via SHAP importance)
+- **Features**: 126 raw (the features parquet on disk is 183,065×126 — verified 2026-05-01); the original "23 base × 5 windowing + 1 = 116" arithmetic is from Stage 3 before microstructure features (VPIN/OFI/depth) were added in Stage 9. 35 features survive static SHAP pruning; the live production set is 50 (see Stage 33 status block).
 - **Label**: ln(vol_ann)
 - **Date range**: 2021-01-04 to 2026-03-31
 
@@ -1431,11 +1433,17 @@ The TransVol embeddings capture 8-hour temporal attention patterns that flat fea
 
 ### 11.4 Implementation
 
-**Script**: `vol_model/run_walkforward_hybrid.py`
+**Script**: `vol_model/run_walkforward_hybrid.py` (legacy, baseline 51-feature
+hybrid). Production training is now done by `run_walkforward_pruned_svi_har_pd.py`
+(see Stage 24+). The legacy hybrid script still trains TransVol; `expanding_hybrid/`
+is the live source of TransVol checkpoints consumed by the production stack.
+
 **Output**: `vol_model/output/models/expanding_hybrid/`
-- `{YYYY-MM}.txt` — LightGBM hybrid model
-- `{YYYY-MM}_transvol.pt` — TransVol checkpoint for that month
-- `{YYYY-MM}_features.json` — Feature list (51 features)
+- `{YYYY-MM}.txt` — LightGBM hybrid model (legacy, 51-feature mix)
+- `{YYYY-MM}_transvol.pt` — TransVol checkpoint for that month (still consumed
+  by production via the `expanding_pruned_svi_har_pd_v1` LightGBM stack)
+- `{YYYY-MM}_features.json` — Feature list (51 features for legacy hybrid; the
+  production model under `expanding_pruned_svi_har_pd_v1/` carries 50)
 - `walkforward_results.csv` — Per-month metrics summary
 
 **Optuna configuration**: 200 max trials, patience 50 (stop after 50 no-improvement trials)
@@ -2426,9 +2434,9 @@ The legacy `compute_metrics()` annualizes bar-level (15-minute) returns by `√(
 
 The new `metrics.py` annualizes **daily** returns by `√365.25 ≈ 19.1`. At the time of the original forensic audit, this gave Sharpe ≈ 3.46.
 
-**That 3.46 number is no longer the production baseline.** Stage 17 subsequently identified a bug in `_daily_returns` that computed non-compound Sharpe via `equity_nc.pct_change()` on an additive cumsum offset — a drifting denominator that understated non-comp Sharpe by ~35%. The same session also switched the default parquet to the SVI variant (`svi_iv_matched`), and the Stage 18 T2.1 retrain dropped 8 dead-weight features and added `svi_atm_1d`. The resulting non-comp daily Sharpe is **6.22** on the current production configuration; see Stages 17-18 for the full reconciliation.
+**That 3.46 number is no longer the production baseline.** Stage 17 subsequently identified a bug in `_daily_returns` that computed non-compound Sharpe via `equity_nc.pct_change()` on an additive cumsum offset — a drifting denominator that understated non-comp Sharpe by ~35%. The same session also switched the default parquet to the SVI variant (`svi_iv_matched`), and the Stage 18 T2.1 retrain dropped 8 dead-weight features and added `svi_atm_1d`. The Stage-18-era non-comp daily Sharpe was **6.22**. After Stage 26 (aligner default flip) and Stage 29 (Kelly K1 default), the current production NC Sharpe is **6.29** ($960K NC PnL, 51-month OOS). See Stages 17-18, 24-29 for the full session-over-session reconciliation; the System Overview at the top of this doc carries the up-to-date headline number.
 
-**Both are mathematically correct under their own definitions**, but the daily version is the industry standard. The bar-level version is inflated because 15-minute returns are strongly autocorrelated (volatility clustering, gamma effects over the holding period), so `√N` scaling overstates the true annualized Sharpe. A pro fund would report the current daily Sharpe 6.22 (t-stat 17.98, p ≪ 1e-12) — excellent and statistically significant — not the bar-level 16-24 range.
+**Both are mathematically correct under their own definitions**, but the daily version is the industry standard. The bar-level version is inflated because 15-minute returns are strongly autocorrelated (volatility clustering, gamma effects over the holding period), so `√N` scaling overstates the true annualized Sharpe. A pro fund would report the current daily NC Sharpe 6.29 (t-stat ≈ 18, p ≪ 1e-12) — excellent and statistically significant — not the bar-level 16-24 range.
 
 ### 14.6 Outstanding Questions — ALL CLOSED BY STAGE 17
 
@@ -2894,11 +2902,21 @@ Train/eval/test splits (inclusive):
 
 `BacktestConfig` gains:
 ```python
-use_drl_hedging: bool = False
-drl_policy_path: str = "vol_arb/drl_hedging/models/sac_hedger_final.zip"
+use_drl_hedging: bool = False                    # bare-config default
+drl_policy_path: str = "vol_arb/drl_hedging/models/production_sac_v4_final.zip"
 drl_svi_params_path: str = "vol_arb/output/svi_surface_params_1h.parquet"
 drl_fallback_on_error: bool = True
 ```
+
+(The default `drl_policy_path` was updated to the current SAC v4
+production checkpoint. The original Stage 16 doc referenced
+`sac_hedger_final.zip` from the initial training run; the field has
+since been re-pointed to the W5 v4 zip, with v3 retained on disk as
+`production_sac_v3_final.zip` for rollback.)
+
+**V2 preset** (`with_btc_production_filters_v2()`) flips
+`use_drl_hedging=True`. The bare `BacktestConfig()` keeps DRL off so
+legacy backtest comparisons stay reproducible.
 
 When `use_drl_hedging=True`, `compute_pnl()` constructs a cached `DRLHedger` instance and calls its `simulate()` method with the same per-trade arrays as the rule-based function. Any exception during DRL execution triggers a warning and falls back to `simulate_discrete_hedging` (configurable via `drl_fallback_on_error`).
 
@@ -3687,9 +3705,17 @@ strong feature. The SHAP bimodality at Stage 15.9 (`svi_atm_1d` 8.91% vs
 next SVI 0.53%, a 17× gap) should have been a stronger prior that only
 the top SVI feature matters.
 
-### 18.6 Current production configuration
+### 18.6 Current production configuration (as of Stage 18 — superseded by Stage 24+)
 
-`vol_arb/backtester.py::BacktestConfig` now defaults to:
+> **As-of-2026-04-11 snapshot**: this section captures the production
+> defaults on the day Stage 18 shipped. The defaults have since
+> evolved through Stage 23 (parity audit), Stage 24 (V2 preset),
+> Stage 25 (foundation fix), Stage 26 (aligner default), and Stage 29
+> (Kelly K1 default). For the **current production config** see the
+> System Overview at the top of this document; the values below are
+> historical.
+
+At Stage 18 close, `vol_arb/backtester.py::BacktestConfig` defaulted to:
 
 ```python
 vol_arb_path: str = "vol_arb/output/BTC_vol_arb_svi.parquet"
@@ -3697,9 +3723,15 @@ predictions_path: str = "vol_model/output/BTCUSDT_pruned_svi_predictions.parquet
 ```
 
 Running `python -m vol_arb.run_backtest --threshold 25 --no-sor --extended`
-on a clean checkout now produces:
+on the Stage 18 checkpoint produced:
 - Compound: $17,536,300 PnL, Sharpe 3.902, Max DD -10.49%
 - **Non-comp: $965,262 PnL, Sharpe 6.221, Sortino 27.79, Max DD -4.98%**
+
+The current `predictions_path` default was flipped to
+`BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet` in Stage 26
+(adds 6 HAR-PD features + per-month aligner β\* bias correction). The
+current bare-`BacktestConfig()` numbers therefore differ from the
+Stage 18 snapshot above.
 
 **Total session-over-session improvement**: the pre-session baseline was
 non-comp Sharpe 4.56 (non-SVI parquet + OOF + buggy metrics). Current
@@ -3741,11 +3773,11 @@ Compound Max DD: pre-session -15.22%, current -10.49% (-31% reduction).
 - `print_extended_tearsheet` takes `is_nc` kwarg; renders `N/A` for CAGR and labels stability R-squared as "(raw vs time)" in NC mode
 - `full_metrics_both` passes `is_nc` explicitly to each branch -- no hidden state
 
-Test suite: 19 tests in `tests/test_metrics.py` covering both paths with deterministic synthetic trade logs; every NC metric compared against inline numpy reference computations.
+Test suite: 25 tests in `tests/test_metrics.py` (verified 2026-05-01; the doc revision that landed alongside W1.2 cited "19 tests" — additional regression tests were added in subsequent stages) covering both paths with deterministic synthetic trade logs; every NC metric compared against inline numpy reference computations.
 
 ### 19.2 RND Circuit Breaker (T3.2, W2.2, 2026-04-11)
 
-`deribit_paper/monitoring/rnd_monitor.py`: extracts risk-neutral density from live SVI
+`deribit_paper/risk/rnd_monitor.py`: extracts risk-neutral density from live SVI
 surface each bar; fires when `rnd_tail_prob > sigma_mult x max(30d_baseline, 90d_baseline)`.
 
 Design:
@@ -3765,7 +3797,9 @@ meant to catch.
 **Production choice: ship "armed but silent."** Monitor remains available as telemetry and
 as a defensive backstop for genuinely unprecedented vol regimes.
 
-14 new tests in `deribit_paper/tests/test_rnd_monitor.py`.
+17 unit tests in `deribit_paper/tests/test_rnd_monitor.py` (verified 2026-05-01; the
+"14 new tests" figure cited in earlier doc revisions counted only the W2.2 additions on
+top of the original Stage 17.4 set of 13 tests — the file has since grown).
 
 ---
 
@@ -3839,8 +3873,9 @@ This stage expands the DRL section (16.9c) with the full system-level integratio
   injected as callable `vpin_provider` to `StraddleFlow`; VPIN included in 60-min Telegram
   heartbeat diagnostics. Reads Binance aggTrade WebSocket, warms from
   `vpin_streamer_state.json`; fallback=0.189 (training-distribution mean)
-- **14 new tests**: `deribit_paper/tests/test_vpin_live.py` (accumulator, serialization,
-  WS mock, integration with engine)
+- **14 new tests at W5 close**: `deribit_paper/tests/test_vpin_live.py` (accumulator,
+  serialization, WS mock, integration with engine). File now contains 17 tests
+  (verified 2026-05-01) after subsequent additions.
 - **Status**: SAC v4 + live VPIN live on testnet since 2026-04-12
 
 ---
@@ -3869,11 +3904,14 @@ not applying circuit breakers.
 - DVOL proxy: `signal.iv_used_pct` when available, else `tsrv.vol_ann_continuous x 100`
 - All new sizing params threaded through `process_bar()` -> `_execute_and_persist()`
 
-**New tests**: `deribit_paper/tests/test_predictor.py` (11 tests -- half-spread boundary,
+**New tests**: `deribit_paper/tests/test_predictor.py` (10 tests verified 2026-05-01 — half-spread boundary,
 circuit breaker, dynamic spread at high jf, no-straddle flat, cold-start flat); 6 new
 tests in `test_straddle_flow.py` (DVOL scaling, edge scale, dd scale, dd boundary);
 1 new test in `test_config.py` (sizing fields present).
-**Test baseline after all fixes**: 311/311 green.
+**Test baseline after Stage 23**: 311/311 green at the time of the audit. Note that
+total collected tests have grown substantially since (deribit_paper alone collects 479
+as of 2026-05-01); the 311 figure refers to the focused regression slice exercised by
+the parity-audit gate.
 
 ---
 
@@ -4321,7 +4359,7 @@ Walk-forward fit across 12 trailing months. Generated by
 | Compound PnL | $15.87M | **$18.71M** | +$2.84M (+17.9%) |
 | Compound MDD | -5.65% | **-5.03%** | -0.62 pp (better) |
 | Compound Sharpe | 5.35 | 5.15 | -0.20 |
-| NC Sharpe | 6.29 | 7.23 → 6.29 | -0.94 |
+| NC Sharpe | **7.23** | **6.29** | **-0.94** (the accepted Sharpe-for-PnL trade) |
 
 ### 29.4 Pre-committed reject gate triggered, user override
 
@@ -4369,6 +4407,14 @@ advantage but fails the Sharpe-DD floor).
 | NC Sharpe | 7.23 | 3.61 (-2.68) | ≥6.0 | **FAIL** |
 | NC MDD | -$8.5K | -$21.4K (-$12.9K) | ≥-$15K | **FAIL** |
 
+> **Note on h=15m Sharpe value**: the h=15m baseline above was
+> measured against the **pre-Kelly-K1** production preset (Sharpe
+> 7.23). The Kelly K1 default flip in Stage 29 dropped that to 6.29
+> as an explicit Sharpe-for-PnL trade. The h=5m comparison was
+> structured against the pre-K1 baseline so both arms exercise the
+> same sizing chain — dropping the comparison through a different
+> sizing layer would conflate horizon and sizing changes.
+
 Strict-gate REJECT. The +$420K dollar gain comes with a 60% Sharpe
 collapse and 2.5× MaxDD — exactly the noise-monetisation signature
 from the foundation-fix lesson.
@@ -4413,7 +4459,9 @@ formally **closed** — production stays at h=15m.
 ## Stage 31: Live Engine ↔ V2 Backtest Alignment Cycle — Phase A-D (2026-04-26)
 
 The full wiring of the live testnet engine to match the V2 backtest
-preset field-by-field. 12 components delivered across 6 commits;
+preset field-by-field. 12 components delivered across the commit
+chain `32cd0ce` (Phase A foundation) through `730e1b0` (I5 runbook),
+landed across multiple feature commits;
 **187 tests green** at gate. Single biggest cross-stack divergence
 ledger entry pre-this-cycle: live was at V1 defaults while the
 backtester had moved to V2.
@@ -4809,7 +4857,10 @@ shows as 14.967 vs V2's 15 in the I4 alignment diff.
 - **Net diff**: +2,400 / −66 LOC across 25 files
 - **10 new test files**: ~1,200 LOC of tests
 - **6 commits** for E.1, **3 commits** for E.2, **1 commit** for E.3
-- **Final test gate**: 553 green
+- **Final test gate at cycle close**: 553 green (focused regression slice
+  exercised by the cycle gate; deribit_paper alone now collects 479
+  tests as of 2026-05-01, with the wider repo containing ~1,300+
+  collected tests across `tests/` + `deribit_paper/tests/`)
 - All pre-existing 187 tests stay green (no regression)
 
 ### 32.6 The `--allow-stale-aligner` operator escape hatch
@@ -4978,7 +5029,10 @@ As of 2026-05-01, the engine is alive on the homeserver:
 
 Phase 8 paper run is **active** on the homeserver as of 2026-05-01.
 Engine stack:
-- Stage 18 pruned+SVI+HAR-PD LightGBM (44 base + 6 HAR-PD = 50 features)
+- Stage 18 pruned+SVI+HAR-PD LightGBM (verified 2026-05-01 against
+  `expanding_pruned_svi_har_pd_v1/2026-03_features.json`: **50 features
+  total** = 27 pruned base + 16 TransVol embeddings + 1 SVI (`svi_atm_1d`)
+  + 6 HAR-PD path-dependent)
 - SAC v4 DRL hedger with live Binance VPIN stream
 - Per-month aligner β\* (currently March 2026 forward-fill until the
   next refresh cycle on May 5-7)

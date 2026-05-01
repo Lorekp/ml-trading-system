@@ -91,3 +91,29 @@ def test_observed_alone_used_when_sidecar_missing():
     # observed_pct = 0.1; sidecar_pct=0; override_threshold * 0 = 0;
     # observed_pct > 0 → returns observed.
     assert pct == pytest.approx(0.1, abs=1e-4)
+
+
+# ── E.1.9: defensive paths ───────────────────────────────────────────────
+
+
+def test_zero_spot_returns_fallback_not_zero_division():
+    """Pre-E.1.9 a degenerate ticker (spot=0) raised ZeroDivisionError.
+    Now: returns fallback_pct."""
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=0.0, fallback_pct=0.42,
+    )
+    assert pct == 0.42
+
+
+def test_negative_spot_returns_fallback():
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=-100.0, fallback_pct=0.42,
+    )
+    assert pct == 0.42
+
+
+def test_nan_spot_returns_fallback():
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=float("nan"), fallback_pct=0.42,
+    )
+    assert pct == 0.42

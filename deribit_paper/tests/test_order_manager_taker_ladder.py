@@ -97,14 +97,17 @@ async def test_partial_tier1_then_full_tier2_fill():
 
 
 @pytest.mark.asyncio
-async def test_tier1_tier2_zero_fill_falls_through_to_market():
+async def test_tier1_tier2_zero_fill_falls_through_to_bounded_tier3():
+    """E.1.7: tier-3 is now a bounded IOC at 1.5× tier-2 cap, NOT a
+    naked market. Defends against manipulated thin books from filling
+    at any price."""
     rest = AsyncMock()
     rest.get_ticker = AsyncMock(return_value=_ticker_btc())
-    # Tier-1: zero fill. Tier-2: zero fill. Tier-3 market: full fill.
+    # Tier-1 zero, tier-2 zero, tier-3 bounded-IOC fills at the wider cap.
     rest.place_order = AsyncMock(side_effect=[
         _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
         _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
-        _stub_fill(amount=1.0, filled_amount=1.0, price=0.0512),
+        _stub_fill(amount=1.0, filled_amount=1.0, price=0.05038),
     ])
     manager = OrderManager(rest=rest)
 
@@ -115,8 +118,67 @@ async def test_tier1_tier2_zero_fill_falls_through_to_market():
         tiered=True,
     )
     assert result.filled_amount == pytest.approx(1.0)
-    assert result.average_price == pytest.approx(0.0512)
     assert rest.place_order.call_count == 3
+    # Tier-3 was a *limit IOC* not a market — verify by inspecting the
+    # third place_order call.
+    third_call = rest.place_order.call_args_list[2]
+    assert third_call.kwargs["type"] == "limit"
+    assert third_call.kwargs["time_in_force"] == "immediate_or_cancel"
+    # Cap = best × (1 + 1.5 × 0.5%) = 0.05 × 1.0075 = 0.050375 → tick-rounded.
+    assert third_call.kwargs["price"] == pytest.approx(0.0505, abs=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_tier3_skipped_on_small_residual():
+    """E.1.7: residual < 10% of original is dropped, not market-filled."""
+    rest = AsyncMock()
+    rest.get_ticker = AsyncMock(return_value=_ticker_btc())
+    # Tier-1 fills 0.95, tier-2 fills 0.04 → residual 0.01 < 10% × 1.0 → SKIP.
+    rest.place_order = AsyncMock(side_effect=[
+        _stub_fill(amount=1.0, filled_amount=0.95, price=0.0505),
+        _stub_fill(amount=0.05, filled_amount=0.04, price=0.0510),
+    ])
+    manager = OrderManager(rest=rest)
+
+    result = await manager.place_ioc_taker(
+        instrument_name="BTC-OPT",
+        side="buy", amount=1.0,
+        max_slippage_pct=0.5,
+        tiered=True,
+    )
+    # Only 0.99 filled, not 1.0 — by design (the 0.01 residual was
+    # dropped to defend against worst-case fills on the tail).
+    assert result.filled_amount == pytest.approx(0.99)
+    # Tier-3 not called.
+    assert rest.place_order.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tier3_bounded_ioc_cap_at_1_5x_max_slippage():
+    """E.1.7: tier-3 cap = best ± 1.5 × max_slippage_pct, never wider."""
+    rest = AsyncMock()
+    rest.get_ticker = AsyncMock(return_value=_ticker_btc())
+    rest.place_order = AsyncMock(side_effect=[
+        _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
+        _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
+        # Tier-3: zero fill (manipulated book). Don't fall back to market.
+        _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
+    ])
+    manager = OrderManager(rest=rest)
+
+    result = await manager.place_ioc_taker(
+        instrument_name="BTC-OPT",
+        side="buy", amount=1.0,
+        max_slippage_pct=0.5,
+        tiered=True,
+    )
+    # All 3 tiers fired but nothing filled. Result not is_filled but
+    # also crucially NO naked market order was placed.
+    assert rest.place_order.call_count == 3
+    third_call = rest.place_order.call_args_list[2]
+    assert third_call.kwargs["type"] == "limit"
+    # No fourth (market) call.
+    assert result.filled_amount == 0.0
 
 
 @pytest.mark.asyncio

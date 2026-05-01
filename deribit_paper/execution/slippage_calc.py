@@ -66,6 +66,11 @@ def live_slippage_pct(
             the legacy live default of 0.5%.
         floor_pct, cap_pct: Final clip range.
     """
+    # Defensive: degenerate ticker (spot=0 or non-finite) → fallback.
+    # Pre-E.1.9 the helper raised ZeroDivisionError on this path.
+    if spot is None or not math.isfinite(spot) or spot <= 0.0:
+        return fallback_pct
+
     sidecar_valid = (
         slip_usd_per_btc is not None
         and slip_usd_per_btc > 0.0

@@ -503,18 +503,51 @@ class OrderManager:
             # Aggregate filled_amount + average_price across tiers 1+2.
             return _merge_tier_results(r1, r2)
 
-        # ── Tier 3 (market) ──
+        # ── Tier 3 (bounded IOC, never naked market — E.1.7) ──
+        # Pre-E.1.7 this dropped to a naked market order, defeating the
+        # max_slippage_pct boundary the rest of the ladder enforces — a
+        # manipulated thin book could fill the residual at any price.
+        # Now: place a wider IOC at tier-2's cap × 1.5; if THAT misses,
+        # alert the operator and skip the residual rather than ship a
+        # fill at any price. Tail residual <10% of original is dropped
+        # silently because residual is already small relative to
+        # acceptable slippage.
+        if residual2 < 0.1 * amount:
+            logger.warning(
+                "Tiered IOC %s %s tier-3 SKIP (residual=%.4f < 10%% of "
+                "%.4f — tail too small to risk market fill)",
+                side, instrument_name, residual2, amount,
+            )
+            return _merge_tier_results(r1, r2)
+
+        if side == "buy":
+            tier3_cap = round((best * (1.0 + 1.5 * max_slippage_pct / 100.0)) / tick) * tick
+        else:
+            tier3_cap = round((best * (1.0 - 1.5 * max_slippage_pct / 100.0)) / tick) * tick
         logger.info(
-            "Tiered IOC %s %s tier-3 MARKET (residual=%.4f after tier-2)",
-            side, instrument_name, residual2,
+            "Tiered IOC %s %s tier-3 IOC @ %.6f (residual=%.4f after "
+            "tier-2, cap = best ±1.5×%.2f%%)",
+            side, instrument_name, tier3_cap, residual2, max_slippage_pct,
         )
         r3 = await self.place_and_wait(
             instrument_name=instrument_name,
             side=side, amount=residual2,
-            order_type="market",
+            order_type="limit", price=tier3_cap,
+            time_in_force="immediate_or_cancel",
             label=f"{label}_t3", reduce_only=reduce_only,
-            timeout_seconds=30.0,
+            timeout_seconds=10.0,
         )
+        if not r3.is_filled and r3.filled_amount < residual2 - 1e-9:
+            # Tier-3 still not filled at the wider cap. Don't fall back
+            # to naked market — log + return what we have. Operator
+            # alerting happens upstream via the OrderResult.state.
+            logger.error(
+                "Tiered IOC %s %s tier-3 INCOMPLETE: residual=%.4f, "
+                "filled=%.4f at cap %.6f — skipping market fallback "
+                "to defend against manipulated book",
+                side, instrument_name, residual2, r3.filled_amount,
+                tier3_cap,
+            )
         return _merge_tier_results(_merge_tier_results(r1, r2), r3)
 
     async def place_chunked_taker(

@@ -112,6 +112,11 @@ class PaperConfig:
     intra_bar_hedge_ticks: int = 10           # matches backtester's hedge_sim_steps
     order_retry_max: int = 3                  # retry transient errors this many times
     max_slippage_pct: float = 0.5             # IOC cap above best ask / below best bid
+    # E.1.6: when True, all 4 production IOC sites in straddle_flow.py
+    # escalate through the 3-tier ladder
+    # (touch+1tick → cap → bounded-IOC). Off by default to preserve the
+    # legacy ``default`` preset; flipped on by ``with_v2_preset``.
+    use_tiered_taker: bool = False
     sizing_liq_cap: float = 1.5              # max upscale in liquid markets (conservative for live)
     sizing_edge_cap: float = 3.0             # mirrors BacktestConfig: max edge multiplier
     sizing_dd_floor: float = 0.25            # mirrors BacktestConfig: min scale at deep drawdown
@@ -351,6 +356,7 @@ class PaperConfig:
         )
         cfg.kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
         cfg.bar_exec_quality_path = "vol_arb/output/bar_execution_quality.parquet"
+        cfg.use_tiered_taker = True   # E.1.6: 3-tier ladder at all 4 IOC sites
         return cfg
 
     def ensure_dirs(self) -> None:

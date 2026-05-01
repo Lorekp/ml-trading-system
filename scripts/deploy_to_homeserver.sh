@@ -59,6 +59,11 @@ SOURCE_FILES=(
     "vol_arb/sizing.py"
     "vol_arb/sidecars.py"
 
+    # DRL training module — referenced by SAC v4 pickle's _schedule
+    # callable; needs to be importable on the homeserver even though
+    # the live engine doesn't call it directly.
+    "vol_arb/drl_hedging/train_sac.py"
+
     # Live engine — config + entry point
     "deribit_paper/__init__.py"
     "deribit_paper/__main__.py"

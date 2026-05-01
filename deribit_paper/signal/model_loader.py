@@ -210,33 +210,28 @@ def load_model_bundle(
 
     from stable_baselines3 import SAC
 
-    # PyTorch 2.6 changed the default of ``weights_only`` from False to
-    # True. SAC.load() doesn't expose that knob; passing the SB3 zip
-    # through the new strict unpickler refuses (or segfaults) on the
-    # embedded LinearSchedule custom class. Force ``weights_only=False``
-    # for the SB3 load by patching BOTH ``torch.load`` and
-    # ``torch.serialization.load`` (SB3 calls the latter directly in
-    # some code paths). Safe because the .zip files are produced by our
-    # own training code (no untrusted-source concern).
-    import torch as _torch
-    import torch.serialization as _torch_ser
-    _orig_module_load = _torch.load
-    _orig_ser_load = _torch_ser.load
-
-    def _patched_load(*args, **kwargs):
-        kwargs["weights_only"] = False     # force, don't setdefault
-        return _orig_module_load(*args, **kwargs)
+    # The SAC v4 zip embeds a pickled ``LinearSchedule`` whose
+    # ``_schedule`` callable is defined in ``vol_arb/drl_hedging/train_sac.py``.
+    # On certain Python+torch combinations (notably Python 3.12 +
+    # torch 2.10+cpu on the homeserver), invoking that schedule's
+    # ``__call__`` during ``_setup_model._build`` SEGFAULTS even when
+    # the unpickle itself succeeds. The LR schedule is irrelevant at
+    # inference time (the policy never trains here); substitute a
+    # constant-zero callable via SB3's documented ``custom_objects``
+    # parameter. This bypasses the broken schedule entirely without
+    # depending on the homeserver's copy of train_sac._schedule being
+    # binary-compatible with what was pickled at training time.
+    custom_objects = {
+        "lr_schedule": lambda _progress: 0.0,
+        "learning_rate": 0.0,
+    }
 
     drl_policy_path = Path(drl_policy_path)
     if not drl_policy_path.exists():
         raise FileNotFoundError(f"DRL policy not found: {drl_policy_path}")
-    _torch.load = _patched_load
-    _torch_ser.load = _patched_load
-    try:
-        drl_policy = SAC.load(str(drl_policy_path), device="cpu")
-    finally:
-        _torch.load = _orig_module_load
-        _torch_ser.load = _orig_ser_load
+    drl_policy = SAC.load(
+        str(drl_policy_path), device="cpu", custom_objects=custom_objects,
+    )
     logger.info("  DRL policy loaded: %s", drl_policy_path.name)
 
     # Smoke test: one forward pass must succeed (catches cross-platform pickle issues)

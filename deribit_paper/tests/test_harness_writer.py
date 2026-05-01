@@ -95,7 +95,9 @@ def test_row_values_populated():
     )
     assert row["signal"] == 1
     assert row["n_contracts_btc"] == 0.3
+    # E.3.6: holding stored as int-valued float (V2 contract).
     assert row["holding_minutes"] == 15.0
+    assert isinstance(row["holding_minutes"], float)
     assert row["kelly_mult"] == 1.4
     assert row["taker_slippage_pct"] == 0.05
     assert row["term_slope_1w_2w"] == 2.3
@@ -105,6 +107,20 @@ def test_row_values_populated():
     assert row["realized_pnl_usd"] == 120.5
     assert row["index_price_at_entry"] == 60_500.0
     assert row["hedge_ticks_executed"] == 10
+
+
+def test_holding_minutes_floored_to_int():
+    """E.3.6: holding_minutes stored as int-valued float so the V2
+    harness diff doesn't show spurious ~0.03 deltas from sub-minute
+    drift in the live ended_at vs the V2 backtester's bar-aligned hold."""
+    out = _make_outcome()
+    # A trade that took 14:58 (just under 15 minutes).
+    out.ended_at = out.started_at + pd.Timedelta(seconds=14 * 60 + 58)
+    row = _row_from_outcome(
+        out,
+        realized_pnl_usd=0.0,
+    )
+    assert row["holding_minutes"] == 14.0  # floored to int, not 14.967
 
 
 def test_row_handles_missing_exit_legs():

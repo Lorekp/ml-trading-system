@@ -85,11 +85,15 @@ def _row_from_outcome(
     straddle = signal.straddle
     started = outcome.started_at
     ended = outcome.ended_at
-    holding = (
-        (ended - started).total_seconds() / 60.0
-        if (started is not None and ended is not None)
-        else float("nan")
-    )
+    # E.3.6: floor holding to int — V2 trade log stores holding_minutes
+    # as int, and a float of 14.97 vs 15 would show up as a spurious
+    # 0.03 delta in the harness diff. Floor here to match the V2
+    # contract.
+    if started is not None and ended is not None:
+        holding_secs = (ended - started).total_seconds()
+        holding: float = float(int(holding_secs // 60.0))
+    else:
+        holding = float("nan")
 
     def _avg_price(o: Any) -> float:
         return float(o.average_price) if o is not None else float("nan")

@@ -264,16 +264,116 @@ def test_lookup_kelly_at_exact_match(kelly_parquet, target_index):
     assert lookup_kelly_mult_at(ser, target_index[7]) == KELLY_CAP
 
 
-def test_lookup_kelly_at_missing_timestamp_returns_fallback(kelly_parquet):
+def test_lookup_kelly_at_pre_coverage_returns_fallback(kelly_parquet):
+    """Bar timestamp BEFORE first sidecar entry → fallback (1.0)."""
     ser = load_kelly_mult_series(kelly_parquet)
-    # A timestamp not in the sidecar's index → fallback (1.0).
-    miss = pd.Timestamp("2027-01-01 00:00", tz="UTC")
+    miss = pd.Timestamp("2025-12-01 00:00", tz="UTC")
     assert lookup_kelly_mult_at(ser, miss) == KELLY_FALLBACK
+
+
+def test_lookup_kelly_at_post_coverage_uses_last_value(kelly_parquet):
+    """Walk-forward (E.1.5): bar AFTER last sidecar entry uses the last
+    known value (clipped). Pre-E.1.5 this returned the fallback because
+    the lookup used ``series.get(ts, fallback)`` (exact-match)."""
+    ser = load_kelly_mult_series(kelly_parquet)
+    after = pd.Timestamp("2027-01-01 00:00", tz="UTC")
+    # Last sidecar entry is 3.0 → clipped to KELLY_CAP=2.0.
+    assert lookup_kelly_mult_at(ser, after) == KELLY_CAP
+
+
+def test_lookup_kelly_at_between_entries_uses_prior_bar(kelly_parquet, target_index):
+    """Walk-forward semantics on a timestamp BETWEEN sidecar entries: use
+    the most recent at-or-before, never the future one. Mirrors the
+    leakage-safe contract of ``lookup_slip_usd_at``."""
+    ser = load_kelly_mult_series(kelly_parquet)
+    # Sidecar at 00:00, 00:15, 00:30, 00:45, 01:00, 01:15, 01:30, 01:45.
+    # Ask for 00:37 — between bars 2 (00:30, mult=1.0) and 3 (00:45, 1.0).
+    ts = target_index[2] + pd.Timedelta(seconds=30 * 1)  # +30s into bar 2.
+    assert lookup_kelly_mult_at(ser, ts) == 1.0
 
 
 def test_lookup_kelly_at_none_series_returns_fallback():
     ts = pd.Timestamp("2026-01-15", tz="UTC")
     assert lookup_kelly_mult_at(None, ts) == KELLY_FALLBACK
+
+
+def test_lookup_kelly_short_signal_returns_floor(kelly_parquet):
+    """E.1.5 short-side defence: ``signal_direction=-1`` always returns
+    floor (1.0), even when the sidecar contains mult=1.5 at the bar."""
+    ser = load_kelly_mult_series(kelly_parquet)
+    # Bar 4: source = 1.5; long → 1.5, short → 1.0.
+    ts = pd.Timestamp("2026-01-01 01:00", tz="UTC")
+    assert lookup_kelly_mult_at(ser, ts, signal_direction=1) == 1.5
+    assert lookup_kelly_mult_at(ser, ts, signal_direction=-1) == KELLY_FLOOR
+
+
+def test_lookup_kelly_short_returns_floor_even_on_malformed_sidecar(tmp_path):
+    """Even if a future K2/K3 sidecar accidentally writes mult=1.7 at a
+    short bar, the lookup unconditionally returns floor."""
+    idx = pd.date_range("2026-01-01 00:00", periods=2, freq="15min", tz="UTC")
+    df = pd.DataFrame({"size_mult": [1.7, 1.7]}, index=idx)
+    p = tmp_path / "k_bad.parquet"
+    df.to_parquet(p)
+    ser = load_kelly_mult_series(p)
+    assert lookup_kelly_mult_at(ser, idx[0], signal_direction=-1) == KELLY_FLOOR
+
+
+# ── E.1.11: β* range validation + JSON load defense ───────────────────────
+
+
+def test_betas_clipped_to_safety_band(tmp_path):
+    """A tampered JSON with extreme β* values clips to [-0.5, +0.5] rather
+    than crashing or letting the predictor blow up via exp()."""
+    p = tmp_path / "betas.json"
+    p.write_text(json.dumps({
+        "2026-01": 100.0,        # absurd — clip to +0.5
+        "2026-02": -50.0,        # absurd — clip to -0.5
+        "2026-03": 0.05,         # in range — passthrough
+    }))
+    out = load_aligner_betas(p)
+    assert out["2026-01"] == 0.5
+    assert out["2026-02"] == -0.5
+    assert out["2026-03"] == pytest.approx(0.05)
+
+
+def test_betas_malformed_json_returns_empty(tmp_path):
+    """Tampered JSON with a parse error → empty dict, not crash."""
+    p = tmp_path / "betas.json"
+    p.write_text("{not valid json")
+    assert load_aligner_betas(p) == {}
+
+
+def test_betas_non_dict_top_level_returns_empty(tmp_path):
+    """JSON top-level is a list/string/etc → empty dict, not TypeError."""
+    p = tmp_path / "betas.json"
+    p.write_text("[1.0, 2.0]")
+    assert load_aligner_betas(p) == {}
+
+
+def test_betas_skips_non_numeric_values(tmp_path):
+    """Non-numeric values in the JSON dict are skipped, not coerced or
+    crashed."""
+    p = tmp_path / "betas.json"
+    p.write_text(json.dumps({
+        "2026-01": "garbage",
+        "2026-02": None,
+        "2026-03": 0.05,
+    }))
+    out = load_aligner_betas(p)
+    assert out == {"2026-03": pytest.approx(0.05)}
+
+
+def test_betas_non_finite_substituted_with_zero(tmp_path):
+    """Inf / NaN in the JSON → substituted with 0.0 + WARN."""
+    # JSON spec doesn't include inf/nan; Python json.dumps with allow_nan=True
+    # produces "Infinity"/"NaN" tokens. We test the parse path by writing
+    # them manually.
+    p = tmp_path / "betas.json"
+    p.write_text('{"2026-01": Infinity, "2026-02": 0.05}')
+    out = load_aligner_betas(p)
+    # Infinity → 0.0 (non-finite path).
+    assert out["2026-01"] == 0.0
+    assert out["2026-02"] == pytest.approx(0.05)
 
 
 # ── load_bar_exec_slip_series + lookup_slip_usd_at ────────────────────────

@@ -210,6 +210,35 @@ def load_bar_exec_slip(
     return arr
 
 
+# E.1.11 (2026-05-01): hard bounds on aligner β*. Production betas
+# observed in the bias-aligned sidecar fall in [-0.10, +0.20] across
+# 50 months (median +0.052). [-0.5, +0.5] is a generous safety band
+# that catches malformed / tampered JSON without rejecting realistic
+# regime-shift values. Out-of-range entries log WARN and clip rather
+# than crash — the live engine never wants a β* >> realistic range
+# because (a) clip fails closed (bias=0) and (b) crash on every bar
+# halts trading.
+ALIGNER_BETA_MIN: float = -0.5
+ALIGNER_BETA_MAX: float = +0.5
+
+
+def _clip_beta(value: float, *, source: str) -> float:
+    """Clip a single β* into the safety band, logging on out-of-range."""
+    if not np.isfinite(value):
+        logger.warning(
+            "aligner β* non-finite at %s — substituting 0.0", source,
+        )
+        return 0.0
+    if value < ALIGNER_BETA_MIN or value > ALIGNER_BETA_MAX:
+        clipped = float(np.clip(value, ALIGNER_BETA_MIN, ALIGNER_BETA_MAX))
+        logger.warning(
+            "aligner β* %+.4f at %s out of [%+.2f, %+.2f] — clipped to %+.4f",
+            value, source, ALIGNER_BETA_MIN, ALIGNER_BETA_MAX, clipped,
+        )
+        return clipped
+    return float(value)
+
+
 def load_aligner_betas(
     path: str | Path | None,
     *,
@@ -229,6 +258,15 @@ def load_aligner_betas(
     Returns ``{}`` when ``path`` is ``None`` or the file is missing — the
     live engine treats an empty dict as "no bias correction; predictions
     pass through raw".
+
+    Defensive contract (E.1.11 2026-05-01):
+
+    * Malformed JSON (``json.JSONDecodeError``) logs ONLY the path and
+      returns ``{}``. Never logs the bytes — guards against a tampered
+      sidecar exfiltrating credentials by being echoed into log files.
+    * Every β* is clipped to ``[ALIGNER_BETA_MIN, ALIGNER_BETA_MAX]``
+      via :func:`_clip_beta`. Out-of-range values WARN and clip rather
+      than crash so a bad sidecar can't halt trading.
     """
     if path is None:
         return {}
@@ -238,9 +276,34 @@ def load_aligner_betas(
         return {}
 
     if p.suffix.lower() == ".json":
-        with p.open("r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-        return {str(k): float(v) for k, v in raw.items()}
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except json.JSONDecodeError:
+            logger.error(
+                "aligner JSON %s malformed — returning empty dict (β* disabled)",
+                p,                                                    # path only, NEVER bytes
+            )
+            return {}
+        except OSError as exc:
+            logger.error("aligner JSON %s unreadable (%s) — returning empty dict", p, exc)
+            return {}
+        if not isinstance(raw, dict):
+            logger.error(
+                "aligner JSON %s top-level is %s, expected dict — returning empty",
+                p, type(raw).__name__,
+            )
+            return {}
+        out: dict[str, float] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = _clip_beta(float(v), source=f"{p.name}::{k}")
+            except (TypeError, ValueError):
+                logger.warning(
+                    "aligner JSON %s key %r value %r non-numeric — skipped",
+                    p.name, k, v,
+                )
+        return out
 
     df = pd.read_parquet(p)
     if pred_col not in df.columns or raw_col not in df.columns:
@@ -253,7 +316,10 @@ def load_aligner_betas(
     df.index = pd.to_datetime(df.index, utc=True)
     diff = df[pred_col] - df[raw_col]
     monthly = diff.groupby(diff.index.strftime("%Y-%m")).mean()
-    out = {str(k): float(v) for k, v in monthly.items() if not pd.isna(v)}
+    out = {
+        str(k): _clip_beta(float(v), source=f"{p.name}::{k}")
+        for k, v in monthly.items() if not pd.isna(v)
+    }
     logger.info(
         "Loaded aligner betas from %s: %d months, median β=%+.4f, range [%+.4f, %+.4f]",
         p.name, len(out),
@@ -353,23 +419,44 @@ def lookup_kelly_mult_at(
     floor: float = KELLY_FLOOR,
     cap: float = KELLY_CAP,
     fallback: float = KELLY_FALLBACK,
+    signal_direction: int | None = None,
 ) -> float:
     """Return the Kelly multiplier for a single ``timestamp``.
 
-    Walk-forward fallback ladder mirrors the backtester:
+    Walk-forward fallback ladder (E.1.5 2026-05-01) — mirrors the
+    leakage-safe semantics of :func:`lookup_slip_usd_at` exactly:
 
-    1. Exact match on the bar timestamp (most common case).
-    2. NaN / missing → ``fallback`` (1.0 by default; passes through).
+    1. **Walk-forward lookup**: ``index.searchsorted(side="right") - 1``
+       returns the nearest sidecar entry at-or-before ``timestamp``.
+       Pre-E.1.5 this used ``series.get(timestamp, fallback)`` (exact
+       match) which silently disabled Kelly when live bar timestamps
+       didn't equal a sidecar bucket key (clock drift, missed bar).
+    2. NaN / missing / pre-history → ``fallback`` (1.0 default).
     3. Always clipped to ``[floor, cap]`` so a malformed sidecar can't
        produce risk-unbounded sizing.
 
-    ``series`` ``None`` → ``fallback`` (Kelly disabled).
+    Short-side defence-in-depth (E.1.5):
+
+    * When ``signal_direction == -1``, unconditionally returns
+      ``floor`` (1.0 by default) regardless of sidecar contents.
+      Defends against a future K2/K3 sidecar regen that accidentally
+      writes ``mult > 1.0`` on shorts. The size-position layer
+      already short-circuits at ``mult <= 1.0 + 1e-12``, but having
+      the asymmetry enforced at the lookup keeps a single source of
+      truth.
+
+    ``series`` ``None`` → ``fallback`` (Kelly disabled globally).
     """
-    if series is None:
+    if signal_direction == -1:
+        return float(np.clip(floor, floor, cap))
+    if series is None or len(series) == 0:
         return fallback
-    val = series.get(timestamp, fallback)
-    if pd.isna(val):
-        val = fallback
+    idx = series.index.searchsorted(timestamp, side="right") - 1
+    if idx < 0:
+        return fallback
+    val = float(series.iloc[idx])
+    if not np.isfinite(val):
+        return fallback
     return float(np.clip(val, floor, cap))
 
 

@@ -8,12 +8,13 @@ This is a cryptocurrency volatility arbitrage system that predicts short-term re
 **Time horizon**: 15-minute prediction windows
 **Date range**: January 2021 to March 2026 (63 months, 183,065 windows)
 **Core edge**: Model-predicted RV vs market IV, exploiting the Variance Risk Premium
-**Prediction models**: TransVol V4 (test QLIKE 0.299) + Hybrid LightGBM (51 monthly expanding models)
-**Position sizing**: 9 pluggable strategies (baseline, edge, kelly, dd, composite, liq, cost_edge, composite_v2)
-**Execution model**: Per-bar realistic taker cost from Deribit trade tape + IOC protection + liquidity-conditioned sizing
-**Best backtest (compound)**: Sharpe 20.86, $25.6M PnL, -4.1% MaxDD on $100K (composite_v2, long_thresh=30, IOC 2x, 51 months OOS)
-**Best backtest (non-compound)**: NC Sharpe 6.22, NC PnL $965K, NC MaxDD -5.0% on $200K (Stage 18 pruned+SVI, composite_v2, threshold=25/30, realistic_taker, 51 months OOS)
-**Production config**: predictions_path=BTCUSDT_pruned_svi_predictions.parquet (Stage 18 T2.1), drl_policy_path=production_sac_v4_final.zip (W5, true VPIN), entry_threshold=25/30 (short/long), sizing=composite_v2, realistic_taker, IOC 2x
+**Prediction models**: TransVol V4 (test QLIKE 0.299) + Hybrid LightGBM (51 monthly expanding models, T2.1 pruned + svi_atm_1d) + HAR-PD path-dependent features (Session C add-on, 6 extra features) + per-month aligner β\* bias correction (QLIKE-optimal scalar shift)
+**Position sizing**: composite_v2 chain — `equity × dvol_scale × edge_scale × dd_scale × liq_scale × profit_scale × kelly_mult`, with 6 multiplicative scales bounded by per-bar dynamic_btc_cap re-clip after each step
+**Execution model**: Per-bar realistic taker cost from Deribit trade tape + 3-tier IOC ladder (touch+1tick → cap → bounded-IOC at 1.5×cap) + liquidity-conditioned sizing + observed-spread override
+**Best backtest (compound)**: Sharpe 5.15, $18.71M PnL, -5.03% MaxDD on $100K (V2 production: thr_L=12, util=0.15, contango filter, profit_scaling, Kelly K1 + bias-aligned predictions, realistic_taker, 51 months OOS)
+**Best backtest (non-compound)**: NC PnL **$960K**, NC Sharpe 6.29, NC MaxDD -4.65% on $200K (V2 production preset, post Kelly-K1 adoption 2026-04-21)
+**Production config (offline)**: `BacktestConfig.with_btc_production_filters_v2()` — predictions_path=`BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet`, kelly_mult_path=`BTC_v2_kelly_mult_K1.parquet`, drl_policy_path=`production_sac_v4_final.zip`, entry_threshold=22 (short) / 12 (long), skip_long_if_term_slope_gt=0.0 (contango filter), target_margin_utilization=0.15, holding_minutes=15, use_profit_scaling=True (floor=0.3), sizing=composite_v2, realistic_taker, IOC 2x
+**Production config (live)**: `PaperConfig.with_v2_preset()` — field-by-field cross-checked against the backtest preset (`test_v2_preset_matches_backtest_v2`), enabled via `--config-preset v2`. As of 2026-05-01, paper-trading on Deribit testnet with all V2 invariants armed (β\*, Kelly K1, realistic_taker slip, contango filter, profit_scaling, 3-tier IOC ladder, latency kill-switch).
 
 **Multi-TF threshold sweeps**: See [`TF_SWEEP_RESULTS.md`](TF_SWEEP_RESULTS.md) for full
 threshold sweep results across all trained timeframes (5m, 30m, 60m, 240m, 480m, 720m).
@@ -3876,7 +3877,7 @@ tests in `test_straddle_flow.py` (DVOL scaling, edge scale, dd scale, dd boundar
 
 ---
 
-## Current Status (as of 2026-04-13)
+## Status snapshot — 2026-04-13
 
 | Wave | Work | Status |
 |------|------|--------|
@@ -3886,20 +3887,1121 @@ tests in `test_straddle_flow.py` (DVOL scaling, edge scale, dd scale, dd boundar
 | W2.1 | RND recalibration + wiring | DONE |
 | W2.2 | RND backtest validation (54-config sweep, armed but silent) | DONE |
 | W3.1 | Live engine upgrade (Stage 18 models) | DONE |
-| W3.2 | Phase 8 unattended testnet paper run | **ACTIVE** |
+| W3.2 | Phase 8 unattended testnet paper run | ACTIVE |
 | W4.1 | Directional classifier (honest negative, hooked-but-disabled) | DONE |
 | W5 | True VPIN + SAC v4 (statistically significant A/B) | DONE |
-| -- | Backtester-live 7-gap parity audit + fixes (Stage 23) | DONE |
+| — | Backtester-live 7-gap parity audit + fixes (Stage 23) | DONE |
 
-**Production exit checklist: 13/15 gates passed.**
-Remaining: D3 (Phase 8 paper run completes >=7 days) + live NC Sharpe >= 3.0.
+**Production exit checklist at this snapshot: 13/15 gates passed.**
+Remaining: D3 (Phase 8 paper run completes ≥7 days) + live NC Sharpe ≥ 3.0.
 
-Phase 8 paper run: live on testnet (homeserver, tmux `deribit` session).
-Engine stack: Stage 18 pruned+SVI LightGBM + SAC v4 DRL + live VPIN (Binance WS) +
-all 7 parity fixes active. Telegram heartbeat every 60 min.
+The next ~3 weeks of work (Stages 24-33 below) focus on (a) shipping a
+materially better V2 production preset on the **offline** side, (b)
+investigating and bounding the V2 drawdown profile, (c) post-hoc edge
+discovery with rigorous leakage controls, (d) prediction-quality
+upgrades via per-month aligner β\* and Kelly shrinkage K1, (e) closing
+out the cross-horizon ledger by formally rejecting h=5m and h=60m, then
+(f) wiring the live engine to fully match the V2 backtest, (g) shipping
+a 3-phase audit-driven remediation cycle (E.1/E.2/E.3 = 27 P0/P1/P2
+items across security, execution, risk, and observability), and finally
+(h) operationalising the monthly aligner refresh so the engine no
+longer needs an `--allow-stale-aligner` override past the first month.
+
+---
+
+## Stage 24: BTC Production V2 Preset (2026-04-16)
+
+The first big leap on top of the Stage 18+19+20 production stack. Five
+mutually-reinforcing levers compound to roughly **+135% NC PnL** over
+the V1 preset on the same 51-month OOS window, **without lifting the
+risk envelope** — drawdown actually improves slightly because the
+contango filter and profit-scaling subtract the worst tail trades.
+
+### 24.1 The five levers
+
+1. **`entry_threshold_long=12`** (was 30): structurally lower long
+   floor. The contango filter (#5) already removes the bad-regime
+   longs, so surviving long candidates have positive expected edge —
+   raising the floor was just leaving money on the table.
+
+2. **`target_margin_utilization=0.15`** (was 0.05): 3× leverage on the
+   same edge. Compound PnL scales near-linearly within this band; the
+   capital-scale change is the single largest dollar driver.
+
+3. **`holding_minutes=30`** (was 15, then **reverted to 15** in
+   Stage 25 — the foundation fix). Initial intuition: longer hold
+   captures more vega-time. Empirical reality: the model only forecasts
+   `[D, D+15m]`, so the second 15-min bar is un-forecast vega-time ×
+   mean reversion — see Stage 25 for the full audit.
+
+4. **`use_profit_scaling=True`** with `profit_scaling_floor=0.3`:
+   empirical-Bayes shrinkage on rolling realised gross-PnL-per-BTC vs
+   a theoretical edge×vega prior. Per-bar profit_scale ∈ [0.3, 1.0]
+   multiplies into N AFTER edge×dd×liq and BEFORE Kelly. Mean ~0.70
+   in production, distributed [0.30, 0.97]. Suppresses positions when
+   the cost-adjusted expected gross looks unfavourable.
+
+5. **`skip_long_if_term_slope_gt=0.0`** (the contango filter): drops
+   long-straddle candidates when `svi_atm_2w - svi_atm_1w > 0` (IV
+   contango regimes). Long volatility under contango is asymmetrically
+   risky because the term structure tells you the market is already
+   pricing in a regime change — buying convexity into that print
+   typically pays late or not at all.
+
+### 24.2 Configuration entry points
+
+```python
+from vol_arb.backtester import BacktestConfig
+cfg = BacktestConfig().with_btc_production_filters_v2()
+# OR via CLI: --btc-production-v2
+```
+
+Adds 5 invariants on top of `with_btc_production_filters()` (V1):
+`entry_threshold_long`, `target_margin_utilization`, `use_profit_scaling`,
+`profit_scaling_floor`, `skip_long_if_term_slope_gt`.
+
+### 24.3 Headline results (51-month OOS, $100K initial equity, V2 preset)
+
+| Metric | V1 production | **V2 production** | Δ |
+|---|---|---|---|
+| NC PnL | $309K | **$726K** | +135% |
+| Compound PnL | $5.42M | **$12.0M** | 121× on $100K |
+| NC Sharpe (trade) | 7.06 | **12.56** | +78% |
+| Compound MDD | -7.1% | -9.91% | slightly worse |
+| Trades | 14,582 | 8,112 | -44% (much more selective) |
+
+**OOS Sharpe across 3 splits**: 10.7 / 12.8 / 12.0 — robust across
+regime divisions. 23 regression tests in `test_btc_production_v2.py`
+lock the field-by-field invariant set; BTC defaults are byte-identical
+to pre-cycle master so no surprise behaviour leaks into legacy callers.
+
+**Always quote NC Sharpe first** (scale-invariant, interpretable as
+risk-adjusted edge per trade); compound Sharpe drifts with equity and
+is misleading for capital-scaling decisions. See `feedback_noncompound_truth.md`
+in the memory index for the canonical framing.
+
+---
+
+## Stage 25: Foundation Fix — `holding_minutes=15` (2026-04-17)
+
+The single most important post-V2 finding. The V2 backtester held each
+straddle for **30 minutes** while the model only forecasts **15
+minutes**. The second 15-min bar's PnL was un-forecast vega-time × mean
+reversion — i.e., we were monetising noise.
+
+### 25.1 The audit chain
+
+1. **Symptom**: V2 NC PnL of $726K vs. expected $575K from a
+   plausibility-check model showed a ~$150K gap.
+2. **Hypothesis 1 (rejected)**: predictions are nowcasts, not
+   forecasts. Killed by the **distribution-compression artifact**: the
+   y_pred MSE-vs-offset test misled because compressed predictions
+   trivially have lower MSE further out. Don't trust MSE-vs-offset.
+3. **Hypothesis 2 (confirmed)**: model targets `[D, D+15m]` exactly.
+   Definitive check: `y_true` exact-match to TSRV at offset +15
+   minutes = **99.82%**. Predictions are forecasts of the next bar's
+   realised vol, not nowcasts.
+4. **Conclusion**: holding 30 min instead of 15 min was throwing away
+   half the information. The first bar = forecast horizon. The second
+   bar = mean reversion + theta × extra time + zero edge.
+
+### 25.2 The fix
+
+```python
+# In BacktestConfig.with_btc_production_filters_v2:
+holding_minutes = 15           # was 30 pre-2026-04-17
+```
+
+No retrain needed (model already targeted T+15m). Saved predictions
+are unchanged; only the backtester's hold loop changed.
+
+### 25.3 Post-fix headline numbers
+
+| Metric | Pre-fix (hold=30) | **Post-fix (hold=15)** | Δ |
+|---|---|---|---|
+| NC PnL | $726K | **$575K** | -21% |
+| NC Trade Sharpe | 53 | 51 | essentially same |
+| NC MDD | -4.65% | -4.65% | unchanged |
+
+The $150K we lost wasn't real edge — it was un-forecast vega-time noise.
+Trade-only Sharpe of 51 (vs 53) shows the **signal quality** is
+unchanged; the dollar reduction is purely the noise we stop
+monetising. Locked via `tests/test_backtester_config.py::test_v2_preset_horizon_matches_holding_minutes`
+which parametrises over `[15, 5, 30, 60]` and asserts horizon == hold.
+
+**Generalised invariant**: any future re-horizon (h=5, h=60, etc.) must
+use `with_btc_production_for_horizon(N)` which constructs the
+horizon-correct preset. Pairing `holding_minutes` with a non-matching
+predictions parquet re-introduces the foundation-fix failure mode.
+
+### 25.4 Auditable backups
+
+- `vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md` — full forensic
+  reconstruction of how the bug got introduced.
+- `backups/2026-04-17_foundation_fix/` — pre-fix backtester + config
+  snapshot for replay.
+
+---
+
+## Stage 26: Walk-Forward Prediction Aligner (2026-04-20)
+
+User-flagged finding: HAR-PD predictions show systematic per-month
+QLIKE asymmetry (over-shooting in some regimes, under-shooting in
+others). Solution: a post-hoc **walk-forward calibrator** that fits a
+per-month scalar bias on trailing OOS data and adds it to fresh
+predictions. Implemented as `vol_model/prediction_aligner.py`.
+
+### 26.1 Mathematical formulation
+
+The QLIKE-optimal scalar bias for log-vol predictions is:
+
+```
+β*_QLIKE  =  ½ × log(mean(exp(2 × residual)))   // residual = y_true - y_pred_raw
+         ≈  μ + σ²                              // Gaussian residuals approximation
+```
+
+The **σ² term is the safety margin QLIKE demands**. The MSE-optimal
+choice (β = μ) actually **increases** test QLIKE — a counter-intuitive
+result that took several iterations to get right. Two methods shipped:
+
+- **bias** (default): scalar β* per month, QLIKE-optimal closed form.
+- **mz**: 2-param Mincer-Zarnowitz `α + β × y_pred_raw`, Nelder-Mead
+  on QLIKE. Worse in production (α=0.99 noise overfits the cal slice).
+
+### 26.2 Walk-forward fitting
+
+For each calendar month T:
+
+1. Use trailing 3 months (T-3, T-2, T-1) of OOS predictions + y_true
+   as the **calibration slice** (strictly before T — no leakage).
+2. Fit β* on that calibration slice via the closed-form QLIKE-optimal
+   shift.
+3. Apply β* to month T's predictions: `y_pred = y_pred_raw + β*_T`.
+
+Tested via `tests/test_prediction_aligner.py` (17 tests including
+**leakage-mutation probes**: shifting the residual window into T
+intentionally breaks the test, proving the no-lookahead contract).
+
+### 26.3 Production measurement
+
+- **β* median: +0.047** (POSITIVE — HAR-PD UNDER-predicts log-vol by
+  ~5% OOS, contradicting the naive "QLIKE over-predicts" intuition).
+- 49/50 months calibrated; one month skipped due to insufficient
+  trailing history.
+- Per-month QLIKE improvement: **-0.78% row-weighted** (35/49 months
+  improve). With `cal_months=12` it improves to **-1.0%**.
+
+### 26.4 Adoption decision (updated 2026-04-20 late)
+
+Initial decision was "ship as optional sidecar, do NOT flip default" —
+because the Sharpe drop (-0.41 NC) failed the pre-registered gate. The
+user **explicitly overrode** the gate, accepting the Sharpe-for-PnL
+tradeoff:
+
+| Metric | Pre-aligner | **Aligner-bias default** | Δ |
+|---|---|---|---|
+| Compound PnL | $14.92M | **$15.87M** | +$949K (+6.4%) |
+| NC PnL | $815K | **$845K** | +$30K (+3.7%) |
+| Compound Sharpe | 4.35 | 3.82 | -0.53 |
+| NC Sharpe | 6.62 | 6.21 | -0.41 |
+
+**Mechanism**: +5% y_pred shift rebalances the long/short mix:
+longs +18.5% (1,913 → 2,267), shorts -17.0% (6,199 → 5,150). Long
+straddles are ~3× more profitable per trade but more volatile → higher
+dollar PnL, lower Sharpe. Not a "pure prediction-quality" win — it's a
+**directional shift toward long-straddle concentration**.
+
+The default `BacktestConfig.predictions_path` was flipped to
+`BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet`. Locked
+via `tests/test_backtester_config.py::test_default_predictions_path_is_aligned_bias`.
+
+### 26.5 Per-month β\* JSON sidecar
+
+For the live engine (which produces predictions in real time and
+cannot consume the aligned parquet directly), `scripts/extract_aligner_betas.py`
+reads the diff between `y_pred` and `y_pred_raw` columns of the
+production parquet and emits `vol_model/output/aligner_betas_by_month.json`
+keyed `{"YYYY-MM": float}`. The live predictor adds the appropriate β*
+per current calendar month with **most-recent-prior fallback** (handled
+by `vol_arb.sidecars.lookup_beta_for_month`). Range-clipped to
+`[-0.5, +0.5]` at load time (Stage 32 / E.1.11 hardening).
+
+---
+
+## Stage 27: P&L Throttle — V2 Drawdown Spike Investigation (2026-04-20)
+
+User flag: V2 shows extreme intraday drawdowns (-7.9% MaxDD,
+-5.4% worst day) despite the strong overall Sharpe. Investigation
+falsified the obvious hypothesis (concurrent positions piling up) and
+landed on a **temporal-clustering** explanation that supports a
+single-day-reactive throttle.
+
+### 27.1 The concurrency hypothesis is FALSE by construction
+
+`holding_minutes=15` + `bar_minutes=15` ⇒ a position closes before the
+next bar's signal fires. **Maximum concurrent positions = 0** at any
+instant. The drawdowns aren't from stacked positions — they're from a
+single very-large losing trade or a clustered run of losers.
+
+### 27.2 The real mechanism — autocorrelation
+
+Daily P&L autocorrelation at lag-1: **+0.392 (p < 1e-43)**. Losses
+cluster temporally. Two distinct loss-cluster regimes:
+
+- **High-vega single-day blowups** (e.g. Nov 2024): one trade with
+  vega ~90, blowing up on a fast vol move.
+- **Slow-grind loss runs** (e.g. Aug 2024, Sep 2024): many small-vega
+  shorts losing in succession over multiple days, each ~$200-500.
+
+Both produce the same DD signature but require different mitigations.
+
+### 27.3 The throttle (`vol_arb/pnl_throttle.py`)
+
+After any day with NC P&L < `threshold_usd`, scale next `K` days'
+sizes by `factor_f`. Three pre-committed first-principles parameters:
+
+```python
+ThrottleParams(
+    threshold_usd = -1000,    # 1% of $100K capital
+    scale_factor  = 0.5,      # half size after a bad day
+    duration_days = 2,        # autocorrelation half-life
+)
+```
+
+### 27.4 Results (in-sample, 51-month OOS)
+
+| Config | MaxDD | Worst day | NC PnL | NC Sharpe | Gates |
+|---|---|---|---|---|---|
+| Baseline V2 | -$7,711 | -$5,441 | $815K | 7.65 | — |
+| Throttle 0.5/2 | -$5,341 (-31%) | -$2,921 (-46%) | -2.1% | 7.65 (=) | 3/4 (DD marginal) |
+| **Throttle 0.0/2** | -$4,873 (-37%) | — | -4.3% | **7.73** (+0.08) | **4/4 PASS** |
+
+The full-pause variant (factor=0.0) actually **improves** Sharpe
+slightly while cutting tail risk by ~37%.
+
+### 27.5 Walk-forward validation
+
+Trailing 12-month parameter selection passed only 2/4 gates (Sharpe,
+PnL) on the full 51-month replay. Aug 2024's MaxDD spike was
+unforeseeable from the trailing calm year — **static first-principles
+params beat walk-forward for tail-risk** because tail events are rare
+relative to the calibration window.
+
+### 27.6 Adoption
+
+Shipped as **OPTIONAL post-processor**. Baseline V2 default unchanged
+(same policy as the aligner — keep risk-adjusted-return defaults
+clean, let users opt in when they specifically want tail protection):
+
+```python
+from vol_arb.pnl_throttle import apply_throttle, ThrottleParams
+tl = apply_throttle(trade_log, ThrottleParams(-1000, 0.5, 2))
+# Or use the pre-generated sidecar:
+# vol_arb/output/BTC_v2_trade_log_throttled_static.parquet
+```
+
+13 tests including a no-lookahead mutation probe.
+**Rejected variants**: concurrency cap (structurally inapplicable),
+per-trade vega cap (only helps Event 1, not the grind events),
+Thursday-Friday calendar filter (stat-sig in-sample but no
+crypto-market mechanism — 24/7 trading has no weekend dynamic).
+
+---
+
+## Stage 28: DFL Head — Decision-Focused W/L Filter (2026-04-20)
+
+User pivot: **"research newest methodologies, test separately from
+backtest, no leakage"**. Built a Wen et al. AAAI 2025-style
+**Decision-Focused Forecasting (DFF) head** on top of the frozen
+HAR-PD backbone. First positive-Sharpe overlay of the cycle.
+
+### 28.1 Phase 1 — QLIKE is economically near-random
+
+Before building anything, audited whether the existing QLIKE objective
+even correlates with trade-level economic outcomes:
+
+- **Spearman(QLIKE, |trade PnL|) = -0.014** across 46 months
+- Mann-Whitney W/L p = 0.10
+- Cliff's δ = -0.02 (negligible)
+
+A predictor that's better at QLIKE is **not** demonstrably better at
+trade economics. This is the foundational motivation for DFF.
+
+### 28.2 Phase 2 — Walk-forward DFF head
+
+Trained a binary win classifier on the 10-feature decision-centric
+panel (`iv_used`, `recent_resid`, `past_vol`, `pred_edge`,
+`pred_edge_z`, …) only on bars where the regressor fired a trade.
+Walk-forward year-folded (2022, 2023, 2024, 2025) so each year's
+classifier sees only prior years.
+
+**Top-10% PnL capture**: 2.10× the regressor-only baseline (bootstrap
+95% CI [1.71, 2.62], permutation p < 0.001).
+
+### 28.3 Phase 3 — Five pre-committed strategies, ONE backtest run
+
+To avoid researcher degrees-of-freedom, **pre-committed** 5 strategies
+before the backtest sweep:
+
+| Strategy | Logic | Result |
+|---|---|---|
+| A1 `filter25` | Drop bottom-25% P(win) | **PASS** — dSharpe +0.22, dPnL -8.4%, MaxDD -25% |
+| A2 `filter10` | Drop bottom-10% P(win) | PASS — +0.14, -6.2% |
+| B1 `size_linear` | Scale size by P(win) | REJECT — neg Sharpe |
+| B2 `size_concave` | Scale by sqrt(P(win)) | REJECT |
+| B3 `size_threshold` | 1× above q70, 0× below | REJECT |
+
+**Structural finding**: filters dominate sizing. The classifier is
+much better at *identifying likely losers to drop* than at *ranking
+winners to grow*.
+
+### 28.4 Adoption
+
+Ship A1 as **optional sidecar** (same policy as aligner + P&L
+throttle). V2 default unchanged. Available via:
+
+```python
+# Pre-generated sidecar:
+# vol_arb/output/BTC_v2_trade_log_dfl_A1_filter25.parquet
+```
+
+**A1 headline**: dSharpe +0.22, dPnL -8.4%, **MaxDD reduced 25%**
+($7,711 → $5,810), worst day cut 46% ($5,441 → $2,921). 8 tests
+including no-lookahead mutation probe. All leakage-safe by walk-
+forward year folding + `shift(1).rolling(...)` features.
+
+### 28.5 Cross-finding: CRPS gain from QRS is real but uncalibrated
+
+Phase 0 also evaluated **Quantile Regression Spline (QRS)**
+distributional wrapper: ΔCRPS = -10.31% (sharper than Gaussian, real
+and consistent across all 8 months). But PIT KS p > 0.05 in 0/8
+months — distribution **calibration** fails. Useful for **relative
+sizing** (not absolute probability statements). Deferred as a future
+post-hoc sidecar option.
+
+---
+
+## Stage 29: Kelly K1 Adopted as V2 Default (2026-04-21)
+
+Long-side asymmetric upside-only Kelly multiplier (Rising-Wyner
+shrinkage on `|pred_edge| / σ²`, walk-forward, cap=2.0×). Added to the
+V2 sizing chain AFTER profit_scale and BEFORE the dynamic_btc_cap
+re-clip.
+
+### 29.1 Mathematical formulation
+
+For each long-side bar:
+
+```
+k_raw    =  pred_edge_pct / σ²(rolling 12mo)
+k_shrunk =  k_raw × λ_RW                            # Rising-Wyner shrinkage
+k_clipped = clip(k_shrunk, floor=1.0, cap=2.0)      # upside-only by construction
+```
+
+Walk-forward fit across 12 trailing months. Generated by
+`scripts/phase1_kelly_shrinkage_offline.py`. Three variants:
+
+- **K1**: pure Rising-Wyner shrinkage, mean-mult on longs ~1.165
+- K2: λ-bounded variant (rejected)
+- K3: per-regime variant (rejected — no statistically significant
+  gain over K1)
+
+### 29.2 Phase 1 offline validation gates
+
+- Bootstrap 95% LCL: **+$72K**
+- Permutation p: 0.000
+- Jackknife: 100% positive (every leave-one-month-out fold ≥ 0)
+- Baseline cross-check: sign-match on direction
+
+### 29.3 Phase 2 — full backtest replay
+
+| Metric | Pre-K1 (V2 + aligner) | **V2 + Kelly K1 (NEW DEFAULT)** | Δ |
+|---|---|---|---|
+| NC PnL | $845K | **$960K** | +$115K (+13.5%) |
+| Compound PnL | $15.87M | **$18.71M** | +$2.84M (+17.9%) |
+| Compound MDD | -5.65% | **-5.03%** | -0.62 pp (better) |
+| Compound Sharpe | 5.35 | 5.15 | -0.20 |
+| NC Sharpe | 6.29 | 7.23 → 6.29 | -0.94 |
+
+### 29.4 Pre-committed reject gate triggered, user override
+
+Pre-committed gate: **NC Sharpe drop > 0.7 → REJECT**. Drop was -0.94,
+gate triggered. User explicitly overrode ("apply, worth it") — same
+template as the aligner adoption. Worth noting: $/Sharpe ratio of K1
+is **1.7× better** than the aligner ($121K per Sharpe-pt vs. $71K) —
+i.e. you give up Sharpe more efficiently for PnL with Kelly than with
+the aligner.
+
+### 29.5 Sidecar mechanics
+
+```python
+# In with_btc_production_filters_v2:
+kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+```
+
+Per-bar parquet indexed on the 15-min UTC timestamp. Loaded at
+backtester startup via `vol_arb/sidecars.py::load_kelly_mult` (the
+shared module that also serves the live engine). Bare `BacktestConfig()`
+without the V2 preset stays Kelly-off (default `kelly_mult_path=""`).
+
+40 tests including:
+- No-lookahead mutation probe.
+- **Upside-only sidecar enforcement**: bars where the sidecar
+  accidentally writes `mult > 1.0` for shorts must produce `mult = 1.0`
+  at lookup time (Stage 32 / E.1.5 added the `signal_direction=-1`
+  short-side defence-in-depth on top).
+
+---
+
+## Stage 30: h=5m Audit — Cross-Horizon Ledger Closed (2026-04-26)
+
+Pre-hypothesis: shorter horizon → more bars → higher Sharpe. Tested
+h=5m end-to-end and **rejected** it on a strict gate. The audit
+process exposed two latent pipeline bugs and produced a partial-but-
+honest finding (longs-only h=5m has a meaningful per-trade PnL
+advantage but fails the Sharpe-DD floor).
+
+### 30.1 Headline numbers
+
+| Metric | h=15m (production) | h=5m | gate | verdict |
+|---|---|---|---|---|
+| NC PnL | $960K | $1.38M (+$420K) | — | win for h=5 |
+| NC Sharpe | 7.23 | 3.61 (-2.68) | ≥6.0 | **FAIL** |
+| NC MDD | -$8.5K | -$21.4K (-$12.9K) | ≥-$15K | **FAIL** |
+
+Strict-gate REJECT. The +$420K dollar gain comes with a 60% Sharpe
+collapse and 2.5× MaxDD — exactly the noise-monetisation signature
+from the foundation-fix lesson.
+
+### 30.2 Pipeline bugs caught en route
+
+1. **Embargo undersized in `train_purged_cv` research-path**: the
+   cross-validation embargo was set in number of bars, not time
+   intervals. At h=5m that's 3× tighter than at h=15m. Fixed.
+2. **SAC v4 trained at h=15 used at h=5**: the manifest check from
+   Stage 32 / E.2.2 came directly out of this finding. Without the
+   manifest, a re-horizon + forgot-to-retrain combo silently produces
+   broken hedges. The Phase B ablation showed the DRL transfer is
+   actually graceful (-2.75% NC PnL, not catastrophic) — but the
+   silent-failure mode is structurally bad and now caught at startup.
+
+### 30.3 Phase D deep-dive — partial-positive findings
+
+- **Longs-only h=5m: +$561K dPnL, 50/50 monthly jackknife positive**
+  — vs shorts-only -$141K, 0/50. Fine-horizon signal **structurally
+  favours long entries**.
+- Aligner β at h=5 is **4.2× weaker** than h=15 (0.035 vs 0.148),
+  confirming that 5-min log-vol carries less per-bar SNR.
+- Markowitz walk-forward: picked w_5 = 0 every month at correlation
+  ρ = 0.843 (h=5 noise dominates the optimum).
+
+### 30.4 Ledger as of 2026-04-26
+
+| Horizon | Status |
+|---|---|
+| h=15m | Production |
+| h=60m | REJECT (prior cycle) |
+| h=5m | REJECT (this cycle) |
+| h=30m | Trained but not backtested |
+
+**Side-asymmetric variant** (h=5 longs + h=15 shorts) and HL L2 OFI
+features deferred to next-cycle backlog. The cross-horizon ledger is
+formally **closed** — production stays at h=15m.
+
+---
+
+## Stage 31: Live Engine ↔ V2 Backtest Alignment Cycle — Phase A-D (2026-04-26)
+
+The full wiring of the live testnet engine to match the V2 backtest
+preset field-by-field. 12 components delivered across 6 commits;
+**187 tests green** at gate. Single biggest cross-stack divergence
+ledger entry pre-this-cycle: live was at V1 defaults while the
+backtester had moved to V2.
+
+### 31.1 Cross-stack divergence ledger (pre-cycle)
+
+| Flag | Live (pre) | V2 (target) | Component |
+|---|---|---|---|
+| `entry_threshold_long` | 30.0 | 12.0 | C1 |
+| Contango filter | absent | 0.0 | C2 |
+| `target_margin_utilization` | 0.05 | 0.15 | C1 |
+| `kelly_mult_path` | not loaded | K1 sidecar | C3 |
+| β\* bias correction | none | per-month | C2 |
+| Slippage cap | 0.5% flat | per-bar empirical | C4 |
+| Live regression locks | none | 14 V2-parity tests | C5 |
+
+### 31.2 Phase A — Foundation (1 commit, 32cd0ce)
+
+- **R2**: `vol_arb/sidecars.py` — single source for Kelly K1,
+  realistic_taker slip, aligner β\* loaders. Backtester refactored to
+  use these (byte-identical to pre-refactor master verified
+  $973,302 = $973,302). Canonical on-disk trade log was off by $13.7K
+  (separate spawned task — bisect of `cb55123`, `26648f7`, `83d68c4`).
+- **C1**: `deribit_paper/config.py` adds 5 V2 fields +
+  `with_v2_preset()` classmethod. `cli.py` adds `--config-preset
+  {default, v2}` flag.
+- **C5**: `test_config_v2_parity.py::test_v2_preset_matches_backtest_v2`
+  — the authoritative cross-check. 8 invariants asserted equal between
+  `PaperConfig.with_v2_preset()` and
+  `BacktestConfig.with_btc_production_filters_v2()`.
+
+### 31.3 Phase B — Sidecar wiring (6 commits, 641b003 … 7f65269)
+
+- **C2**: Per-month β\* JSON extracted from the V2 aligned-bias
+  parquet (50 months, median +0.052) and applied in `Predictor.predict()`
+  between raw LGBM output and `exp()`. Contango filter
+  (`skip_long_if_term_slope_gt`) wired via a new
+  `_compute_term_slope_1w_2w` helper that derives the slope from
+  `LiveSVICalibrator.atm_vol_at_dte`.
+- **C3**: `BTC_v2_kelly_mult_K1.parquet` loaded via
+  `load_kelly_mult_series` at engine startup; per-bar
+  `lookup_kelly_mult_at` lookup at signal-fire time threads
+  `kelly_mult` into `StraddleFlow.size_position`.
+- **C4**: `bar_execution_quality.parquet` loaded as a Series; per-bar
+  empirical slip USD/BTC (forward-fill walk-forward) →
+  `live_slippage_pct` helper converts to `max_slippage_pct` cap with a
+  1.5× observed-spread override.
+- **C6**: `HarnessWriter` appends one V2-schema row per closed trade
+  to `vol_arb/output/live_trades_harness.parquet`. 23 cols matching
+  the V2 trade-log contract.
+
+### 31.4 Phase C — Polish (2 commits, 1a86884 + 25bc2d4)
+
+- **I3**: `OrderResult` carries `submit_to_ack_ms`,
+  `ack_to_terminal_ms`, `total_ms` populated via `time.perf_counter_ns()`.
+  Latency telemetry on every order; >2000 ms triggers a warning.
+- **I1**: `place_ioc_taker(tiered=True)` → 3-tier ladder: tier-1 IOC
+  at touch+1tick, tier-2 IOC at sidecar-derived cap, tier-3 market on
+  residual. `_merge_tier_results` weighted-averages prices and sums
+  latency across tiers. **Note**: the `tiered=True` flag itself was
+  unreached from production until Stage 32 / E.1.6.
+
+### 31.5 Phase D — Validation (4 commits)
+
+- **I6**: `scripts/refresh_live_sidecars.py` — bootstrap-mode monthly
+  refresh; gates on ≥3m / ≥12m + ≥100 long fires. Real refresh logic
+  deferred until live trades clear thresholds (Stage 32 / E.2.9
+  shipped a partial Stage-B slip refresh).
+- **I4**: `scripts/h15_alignment_harness.py` — Stage A diff between
+  `live_trades_harness.parquet` and `BTC_v2_trade_log.parquet`.
+  Bucketed attribution (config drift / price drift / PnL residual /
+  strike rounding budget). Stage B (feature-staleness isolation)
+  deferred until live log has y_true.
+- **I5**: `deribit_paper/RUNBOOK_PAPER_V2.md` — operator runbook with
+  pre-flight checks, launch command, monitor commands, mid-run + EOW
+  alignment checks, kill criteria. The 5 acceptance gates from the
+  plan are quoted verbatim.
+
+### 31.6 Phase A-D acceptance gates
+
+- Phase A: 177 backtester regression tests green; R2-refactored
+  backtester byte-identical to pre-refactor master.
+- Phase B: stub trade end-to-end produces a harness-shaped row with
+  non-null β\*, Kelly mult, slippage values.
+- Phase C: ladder works through 3 synthetic test cases; latency
+  telemetry visible on every OrderResult.
+- Phase D: harness runs end-to-end on synthetic + empty inputs;
+  report markdown produced.
+
+---
+
+## Stage 32: Phase E Remediation — Audit-Driven P0/P1/P2 Hardening (2026-05-01)
+
+Three opus-level audits ran in parallel after the Phase A-D shipping
+(bug-hunt, improvement scout, security). They surfaced 60+ findings
+across bugs, gaps, and exploits. Triaged into three remediation tiers
+delivered as 10 commits across one work cycle. **27 items shipped,
+553 tests green**, working tree clean.
+
+### 32.1 Tier-1 framing
+
+| Phase | Tier | Item count | Gating window | Test gate |
+|---|---|---|---|---|
+| **E.1** | P0 blockers | 15 | Before testnet paper run | 187 → 501 |
+| **E.2** | P1 mainnet pre-reqs | 13 | Before mainnet bring-up | 501 → 531 |
+| **E.3** | P2 follow-ons | 6 | Track but not blocking | 531 → 553 |
+
+The full audit-driven plan lives at
+`C:\Users\laure\.claude\plans\starry-rolling-rabin.md` and ledgers
+each fix to a `B#`/`I#`/`S#` audit tag.
+
+### 32.2 E.1 — P0 blockers (15 items)
+
+**E.1.1 (B1): Wire `use_profit_scaling` into the live sizing chain.**
+Pre-fix, `PaperConfig.with_v2_preset` set the field but
+`StraddleFlow.size_position` never read it — meaning live skipped the
+~30% mean size-shrink that V2 backtest applies. New module
+`deribit_paper/execution/profit_scale.py` ports the backtester's
+empirical-Bayes shrinkage estimator (`backtester.py:1966-1994`).
+`ProfitScaleEstimator` blends realised gross USD-per-BTC EMA with a
+theoretical edge×vega prior via `λ = n / (n+τ)` (τ=200). Vega computed
+inline via `bsm_vega_per_vol_pt` BSM helper. New `profit_scale` kwarg
+threads through `size_position` → `execute` → `_execute_and_persist`,
+applied AFTER edge×dd×liq and BEFORE Kelly. After each closed trade,
+`update_realized` folds gross PnL + hedge cost into the EMAs.
+
+**E.1.2 (B2/B3/I5): Fix harness column map + live-fired-V2-flat bucket.**
+Pre-fix the Stage A harness's `_NUMERIC_COLS_LIVE_TO_V2` map referenced
+V2 columns that **don't exist** in the on-disk trade log (`size_btc`,
+`edge_vp`, `size_mult`, all four leg prices). The diff loop's
+`if v2_col in v2.columns else NaN` branch silently produced all-NaN
+deltas — the reproduction harness was a no-op. Fix: map to the real V2
+schema (`signal`, `N_contracts`, `rv_pred_pct`, `iv_used`, `edge`,
+`net_pnl_nc`); drop per-leg price comparisons (V2 has no leg prices,
+only aggregate `net_pnl_nc`); filter V2 to `signal != 0` BEFORE the
+inner-join; add a `live_fired_v2_flat_count` bucket counting bars
+where live fired but V2 stayed flat (most diagnostic-rich misalignment).
+New regression test loads the real V2 trade log schema and asserts
+every `v2_col` in the map exists.
+
+**E.1.3 (B4/I6/S6): HarnessWriter race + atomic write.**
+Pre-fix `consolidate_and_write` did read-modify-write of the parquet
+with no synchronisation. Two concurrent `_execute_and_persist` tasks
+could race and silently lose a row; a crash mid-write corrupted the
+parquet (no atomic rename). Fix: per-instance `asyncio.Lock`,
+async signature, atomic write via tmp + `os.replace`. New tests:
+2 concurrent appends produce a 2-row parquet (pre-fix lost rows); no
+orphan tmp files after success.
+
+**E.1.4 (B5): Track + await fire-and-forget trade tasks at shutdown.**
+Pre-fix `engine.py` spawned `asyncio.create_task(_execute_and_persist(...))`
+without appending to any tracked list. `engine.shutdown()` cancelled
+only the four named services — orphan trade tasks died with positions
+still open on Deribit but no record locally. Fix: dedicated
+`self._trade_tasks` list, appended in `process_bar`, reaped per-spawn
+so the list doesn't grow without bound. `shutdown()` awaits all
+in-flight trade tasks for up to `holding_minutes + 60s` before
+cancelling stragglers. Test: trade task that completes within the
+window is awaited rather than cancelled.
+
+**E.1.5 (B6/B7/I9): Kelly walk-forward semantics + short-side enforcement.**
+Pre-fix `lookup_kelly_mult_at` used `series.get(timestamp, fallback)`
+(exact-match) while its sibling `lookup_slip_usd_at` used walk-forward
+`searchsorted(side="right") - 1`. Live bar timestamps that didn't
+exactly equal a sidecar key (clock drift, missed bar) silently
+disabled Kelly. Fix: replace with walk-forward identical to the slip
+helper. Add `signal_direction: int` kwarg; on `signal_direction == -1`
+unconditionally returns `floor` (1.0). Defends against future K2/K3
+sidecar regen accidentally writing `mult > 1.0` on shorts.
+
+**E.1.6 (B9/I1): Pass `tiered=True` from production IOC sites.**
+The 3-tier IOC ladder shipped in Phase C / I1 was implemented but
+**never used** — all 4 production IOC sites in `StraddleFlow.execute`
+called `place_ioc_taker(...)` without the `tiered=` kwarg, taking the
+default `False`. Fix: new `PaperConfig.use_tiered_taker` field
+(`with_v2_preset` flips it to True), threaded through to
+`StraddleFlow`, all 4 entry/exit IOC sites now pass
+`tiered=self._use_tiered_taker`. Test: parametrised mock confirms all
+4 call sites propagate the kwarg correctly.
+
+**E.1.7 (S8): Cap tier-3 market order in the ladder.**
+Tier-3 of the I1 ladder fell back to a naked **market order** — on a
+manipulated thin book it could fill at any price, defeating the
+`max_slippage_pct` boundary the rest of the ladder enforces. Fix:
+tier-3 is now a **bounded IOC at `best ± 1.5 × max_slippage_pct`**.
+If THAT also misses, log ERROR and return what we have rather than
+fall through to a naked market. When the tier-2 residual is < 10% of
+the original amount, skip tier-3 entirely (the tail isn't worth the
+worst-case fill risk). Tests: bounded cap, small-residual skip,
+no-fill-no-market on a manipulated synthetic book.
+
+**E.1.8 (B10/I17): Cache `term_slope_1w_2w` on Signal at predict time.**
+Pre-fix `engine.py` called `self.predictor._compute_term_slope_1w_2w()`
+*after* the 15-min hold completed — slope sampled at trade-close,
+not at signal-fire time, plus reaching into a private method. Fix:
+new `Signal.term_slope_1w_2w` field populated inside
+`Predictor.predict` where the slope is already computed for the
+contango filter. Engine reads `outcome.signal.term_slope_1w_2w` for
+the harness row.
+
+**E.1.9 (I2/B15): Plumb observed spread to slippage calc + spot=0 guard.**
+Pre-fix `engine.py:931` hardcoded `observed_spread_usd=None` at the
+`live_slippage_pct` call site, making the override clause inside the
+helper unreachable. Fix: move per-bar slip computation OUT of
+`engine.process_bar` and INTO `StraddleFlow.execute`, where the
+ticker fetch (already present for `liq_scale`) supplies a fresh
+observed spread. Pass the resulting override pct into all 4 IOC sites.
+Defensive: `live_slippage_pct` returns `fallback_pct` on zero/non-finite
+spot rather than raising `ZeroDivisionError`. Tests: zero/negative/NaN
+spot returns fallback; observed spread on a wide ticker triggers the
+override.
+
+**E.1.10 (I5/I12): `realized_pnl_usd` includes hedge PnL + fees.**
+Pre-fix live `realized_pnl_usd` was option-premium-only — hedge PnL
+and fees were silently dropped, biasing the equity tracker (used by
+drawdown / kill-switch / sizing's DD floor) and the harness diff vs
+V2's `net_pnl_nc`. Fix: new `HedgeRunSummary.realized_pnl_usd` field;
+`PerpHedger.run` tracks running mark-to-market on the perp inventory
+across the bar (`inventory_btc × (this_spot - last_spot)` per tick).
+Engine recipe rewritten to mirror V2 backtester's `net_pnl_nc`:
+`net = option_pnl + hedge_pnl - option_fees - hedge_fees` (option fee
+= 4 fills × index × `option_maker_fee` × N; hedge fee =
+`perp_taker_fee` × `total_usd_traded`). New tests on the recipe with
+known-quantity short / long / missing-legs cases.
+
+**E.1.11 (S3/S4/S5/B26): Validate β\* range and wrap JSON load.**
+Pre-fix `vol_arb/sidecars.py::load_aligner_betas` had no range guard
+or JSON-parse defence. Fix: hard bounds `[-0.5, +0.5]` enforced by
+new `_clip_beta` (out-of-range values WARN and clip). `json.JSONDecodeError`
+and `OSError` caught explicitly; only the path is logged (never the
+bytes — guards against tampered sidecar exfiltrating credentials via
+log capture). Non-dict top-level / non-numeric values logged + skipped.
+Defence-in-depth in `Predictor.predict`: non-finite β\* bypasses the
+addition (logs ERROR); non-finite `pred_ln` returns flat signal
+rather than poisoning `exp()` downstream.
+
+**E.1.12 (S1): Remove the `--venue=testnet` carve-out for `--live`.**
+Pre-fix `cli.py` had `if args.venue == "testnet": skip passphrase`
+for `--live`. Eroded the `--live` invariant: an operator forgetting
+the venue flag could enable live testnet orders without seeing the
+passphrase prompt. Fix: always require `_confirm_live()` for `--live`,
+regardless of venue. Coupling `--live` with `--venue` was the bug.
+
+**E.1.13 (S2): Replace deterministic order labels with random suffix.**
+Pre-fix order labels were built deterministically from
+`bar.timestamp.value` — predictable to nanosecond precision by a
+network observer who sees the bar tick. Fix: append
+`secrets.token_hex(8)` (64 bits of randomness) to every
+client-generated order label across `straddle_flow.py`, `engine.py`,
+and the resume / orphan / emergency paths. Human-readable
+timestamp / trade_id prefix preserved for log forensics. Test:
+2 concurrent trades' 8 IOC labels (2 × 4 sites) all unique.
+
+**E.1.14 (B27): `lookup_beta_for_month` empty-dict signaling.**
+Pre-fix an empty `aligner_betas` dict silently bypassed β\* every bar.
+Under V2 preset that signals a configuration failure, not "β\*
+disabled". Fix: new `Predictor.require_aligner` kwarg. V2 preset
+wires `require_aligner=True`; init raises `RuntimeError` on empty
+dict, failing fast rather than silently degrading.
+
+**E.1.15 (B18): `index_price` fallback removal.**
+Pre-fix `engine.py` had `index = ... if outcome.signal.straddle else
+60_000.0` — silently masked ETH or other-asset misconfiguration via
+a hardcoded $60K. Fix: reject degenerate trade context (no straddle,
+zero/NaN index) at the top of the PnL recipe. Log ERROR and skip the
+equity update; the engine's reconcile path catches any drift later.
+
+### 32.3 E.2 — P1 mainnet pre-reqs (13 items)
+
+**E.2.1 (I3): Live-side bar-frequency invariant test.**
+Mirror of `tests/test_backtester_config.py::test_v2_preset_horizon_matches_holding_minutes`
+on the live side. Loads `aligned_predictions_parquet`, infers spacing
+from the index, asserts `bar_seconds == holding_minutes × 60`.
+Catches a foundation-fix-style mismatch (h=15 hold vs h=5 parquet)
+at test time.
+
+**E.2.2 (I4): DRL hedger horizon manifest + WARN at startup.**
+The SAC bundle ships a sibling `<policy>.manifest.json` carrying
+`bar_minutes`. Engine reads it at startup and WARNs when it doesn't
+match `cfg.bar_minutes`. The manifest also ships in the deploy script.
+Critical because Stage 30 / h=5m audit caught the silent failure: a
+15m-trained policy on 5m bars produces broken hedges, no error.
+
+**E.2.3 (I8): β\* staleness alert + soft refusal.**
+Aligner sidecar staleness check at engine startup. Stale > 1 month
+→ WARN; stale > 2 months under V2 preset → refuse to start
+(`RuntimeError`). Operator can override via `--allow-stale-aligner`
+(operator-explicit acknowledgement; predictions fall back to
+most-recent-prior via `lookup_beta_for_month`).
+
+**E.2.4 (I11): Numerical equivalence test for term-slope.**
+Synthetic 3-slice SVI surfaces (normal contango, backwardation, flat
+term). Asserts `LiveSVICalibrator.atm_vol_at_dte(7) - atm_vol_at_dte(14)`
+equals `_constant_maturity_features['svi_term_slope_1w_2w']` to
+within 1e-6.
+
+**E.2.5 (B8): `_merge_tier_results` wall-clock latency.**
+Pre-fix `_merge_tier_results` summed `submit_to_ack + ack_to_terminal`
+across tiers and the nested merge double-counted tier-1+tier-2's
+already-summed pair — inflating the kill-switch latency reading. Fix:
+`_place_tiered_taker` captures a single `perf_counter_ns` before
+tier-1, stamps wall-clock total on every return path. Per-tier
+latencies remain on individual results.
+
+**E.2.6 (B21): Re-clip Kelly-boosted size against `dynamic_btc_cap`.**
+Pre-fix `StraddleFlow.size_position` re-clipped only against the
+static `max_trade_size_btc` after Kelly multiplication — Kelly could
+push N past the bar's dynamic margin envelope. Fix: capture
+`dynamic_btc_cap` (DVOL-scaled margin envelope) BEFORE multipliers
+and re-clip after profit_scale and after Kelly. Mirrors backtester at
+`backtester.py:1994 + 2005`.
+
+**E.2.7 (B25): Avg-price NaN propagation.**
+Pre-fix `_merge_tier_results` returned `avg_px = 0.0` when
+`total_filled == 0`, propagating as a fake fill price into
+HarnessWriter._avg_price + the realized-PnL recipe. Fix: return NaN
+on zero-fill — downstream consumers already handle NaN correctly.
+
+**E.2.8 (I13): Wire latency kill-switch + correct memory note.**
+The I3 memory note claimed the latency kill-switch threshold was
+"plumbed but disabled on testnet". Pre-fix it was only logging a WARN
+at >2000ms — not actually wired to the kill switch. Fix: new
+`KillSwitch.on_latency_breach` treats consecutive breaches identically
+to consecutive execution errors — same 3-strike trip rule.
+`OrderManager` accepts an `on_latency_breach` callback (engine wires
+to KillSwitch) and a `latency_threshold_ms` (cfg default `inf` =
+disabled, mainnet operators set ~3000ms).
+
+**E.2.9 (I7): Slip refresh from observed live fills (partial Stage B).**
+The full Stage B refresh requires y_true backfill which isn't yet
+emitted by the live engine. But a **partial slip refresh** is
+buildable today: `_refresh_slip_sidecar` consumes the harness log's
+`taker_slippage_pct × index_price_at_entry` per bar, filters extreme
+outliers (>1% slip), aggregates median per bar, writes
+`vol_arb/output/bar_execution_quality_live.parquet`. Threshold ≥30
+fired trades.
+
+**E.2.10 (I10): β\* numerical equivalence test.**
+Closed-form round-trip — synthesise a (raw, aligned) parquet,
+extract β\* via `load_aligner_betas`, run the predictor with that β\*
+on the raw input, assert the resulting `rv_pred_pct` matches the
+aligned value to within 1e-4. Locks the aligner's end-to-end formula
+contract.
+
+**E.2.11 (B11): `load_kelly_mult` UTC normalisation.**
+`load_bar_exec_slip` and `load_kelly_mult_series` did
+`pd.to_datetime(df.index, utc=True)`; `load_kelly_mult` was missing
+it. A tz-naive sidecar would silently fail to reindex against a
+tz-aware target index. Defensive symmetry across the loader trio.
+
+**E.2.12 (B12): Contango filter zero-IV protection.**
+A degenerate SVI calibration with `atm_1w = 0` and `atm_2w = 70`
+produced a +70vp slope that incorrectly tripped the contango filter
+on every long candidate. Fix: any leg ≤ 0 or non-finite returns None,
+treating the situation as warmup-equivalent.
+
+**E.2.13 (B17): `refresh_live_sidecars` defensive parquet read.**
+`_load_live_trades` wraps `pd.read_parquet` and column-existence
+check in defensive try/except. A corrupt or schema-drifted parquet
+returns an empty DataFrame instead of crashing the monthly refresh
+job.
+
+### 32.4 E.3 — P2 follow-ons (6 items)
+
+**E.3.1 (B16)**: `lookup_beta_for_month` filters keys against
+`\d{4}-\d{2}` regex before the lex comparison. Pre-fix a key like
+`2026-1` (no zero-pad) would sort BEFORE `2026-02` and corrupt the
+walk-forward fallback.
+
+**E.3.2 (B19)**: `_t0_submit_ns` re-stamped at the top of EACH retry
+attempt in `place_and_wait` so `submit_to_ack_ms` reflects only the
+latest attempt's network round-trip — not the sum of retries plus
+backoff sleeps.
+
+**E.3.3 (B22)**: Unified `_SCALE_EPS = 1e-9` constant in
+`straddle_flow.py` replacing scattered `1e-12` literals.
+
+**E.3.4 (B29)**: Regression test confirming `load_aligner_betas`
+localizes tz-naive parquet indices to UTC.
+
+**E.3.5 (I16)**: `_consecutive_empty_bars` increments on zero-trade
+AND low-volume bars together; resets only on a fully-tradeable bar.
+Pre-fix a venue outputting 1 trade per bar (below
+`min_perp_trades_per_bar`) silently reset the counter every bar even
+though no signal could fire.
+
+**E.3.6 (I18)**: Harness `holding_minutes` floored to int-valued
+float to match the V2 trade-log contract. A 14:58 hold no longer
+shows as 14.967 vs V2's 15 in the I4 alignment diff.
+
+### 32.5 Cycle stats
+
+- **Net diff**: +2,400 / −66 LOC across 25 files
+- **10 new test files**: ~1,200 LOC of tests
+- **6 commits** for E.1, **3 commits** for E.2, **1 commit** for E.3
+- **Final test gate**: 553 green
+- All pre-existing 187 tests stay green (no regression)
+
+### 32.6 The `--allow-stale-aligner` operator escape hatch
+
+Per the E.2.3 plan wording ("refuse to start OR require an
+`--allow-stale-aligner` override"), this CLI flag is the legitimate
+escape hatch for testnet smoke runs when a refreshed sidecar isn't
+available yet. New `PaperConfig.allow_stale_aligner` field (default
+False); engine startup downgrades the V2 stale-≥2-months refusal to
+a WARN when the override is set. Predictions fall back to
+most-recent-prior via `lookup_beta_for_month` (the existing safety
+belt). Test confirms the override path doesn't raise.
+
+---
+
+## Stage 33: Monthly Aligner Refresh Orchestrator + Ops Hardening (2026-05-01)
+
+Two flagged-issue follow-ups from the testnet paper-run launch.
+Operationalises the monthly aligner refresh so the engine no longer
+needs `--allow-stale-aligner` past the first month, and brings
+`scripts/deploy_to_homeserver.sh` up to current scope.
+
+### 33.1 `scripts/refresh_aligner_monthly.py` — single-command orchestrator
+
+Replaces the manual multi-step procedure (run vol_arb pipeline → run
+LightGBM walk-forward → run aligner → extract JSON → validate → swap)
+with a single command. Cron-runnable on the 5th of each month
+(Binance Vision typically publishes prior-month aggTrades by day 3-5).
+
+**Phases**:
+
+1. **Data availability gates**: Binance Vision monthly aggTrades
+   published (HTTP HEAD probe to S3), Deribit option trades ≥ 80%
+   calendar coverage, DVOL extends through target month-end.
+   Refuses cleanly if any source is incomplete — e.g. running today
+   (May 1) for April auto-fails because the Binance monthly archive
+   is still 404.
+2. **Features rebuild**: delegates to `vol_arb/run_pipeline.py`.
+3. **LightGBM single-month walk-forward**: delegates to
+   `vol_model.run_walkforward_pruned_svi_har_pd` with `--start <ym>
+   --end <ym>` brackets, faster preset (`--max-trials 50 --patience
+   15`) for monthly increments.
+4. **Aligner**: delegates to `vol_model.run_walkforward_aligner
+   --method bias`.
+5. **β\* JSON extraction**: re-runs `scripts/extract_aligner_betas.py`
+   to a tmp path.
+6. **Sanity gate**: target month must be in `[-0.5, +0.5]` AND new
+   JSON cannot drop historical months (no silent coverage regression).
+7. **Atomic swap**: tmp + `os.replace` into the live sidecar with
+   timestamped backup of the old JSON beside it. Mirrors the
+   `HarnessWriter._atomic_write` pattern.
+
+10 tests covering the gating + sanity contracts. Verified March
+(data complete) gates all OK in dry-run; April correctly refuses
+because monthly aggTrades aren't published yet.
+
+**CLI**:
+
+```sh
+PYTHONPATH=. python scripts/refresh_aligner_monthly.py             # auto-pick prior month
+PYTHONPATH=. python scripts/refresh_aligner_monthly.py --month 2026-04
+PYTHONPATH=. python scripts/refresh_aligner_monthly.py --dry-run    # plan + checks, no write
+PYTHONPATH=. python scripts/refresh_aligner_monthly.py --skip-data-check  # only when data is in
+```
+
+**Cron template** (Linux):
+
+```cron
+30 6 5 * * cd /path/to/ml-trading-system && PYTHONPATH=. python3 scripts/refresh_aligner_monthly.py >> logs/aligner_refresh.log 2>&1
+```
+
+After a successful refresh, the operator drops `--allow-stale-aligner`
+from the launch command and restarts the engine.
+
+### 33.2 `scripts/deploy_to_homeserver.sh` — full E.1+E.2+E.3 surface
+
+Pre-this-cycle the script synced ~9 files. With the cycle-E commits
+the actual file count is ~35. New manifest organised into source /
+model / data buckets:
+
+- **Source files**: 30+ files across `vol_arb/`, `deribit_paper/`
+  (cli, config, engine, execution, signal, features, risk,
+  monitoring), `scripts/`. Always synced; small + frequently-changed.
+- **Model files**: 3 (SAC v4 zip, vecnormalize pkl, manifest.json).
+- **Data + sidecars**: 5 (aligner JSON, Kelly K1, bar_execution_quality,
+  svi_surface_params, aligned predictions). Toggleable via
+  `--skip-data` flag for code-only fast iterations.
+
+**Remote validation extended** to exercise the new V2 invariants:
+ProfitScaleEstimator cold-start sanity, Kelly walk-forward + short
+defence, DRL manifest contents, V2 preset wires all 6 invariants.
+
+**SAC.load() removed from validation**: observed to segfault in
+standalone-process contexts even when the running engine loads
+cleanly. The engine's startup self-test is the authoritative load
+check.
+
+**New flags**:
+
+```sh
+bash scripts/deploy_to_homeserver.sh                # full sync + tests
+bash scripts/deploy_to_homeserver.sh --skip-tests   # skip pytest gate
+bash scripts/deploy_to_homeserver.sh --skip-data    # skip large parquets
+```
+
+### 33.3 Runbook updates (`deribit_paper/RUNBOOK_PAPER_V2.md`)
+
+Added section "Monthly aligner β\* refresh" between the pre-flight and
+launch sections. Documents:
+
+- Cadence (5th of each month).
+- The single-command refresh.
+- What it does (phases 1-7).
+- After-refresh procedure (drop `--allow-stale-aligner`, redeploy,
+  restart).
+- Cron template for auto-scheduling.
+
+### 33.4 Live testnet engine status
+
+As of 2026-05-01, the engine is alive on the homeserver:
+
+- **Host**: `monitor` (192.168.178.41), `/hdd/ml-trading-system`,
+  tmux session `deribit`.
+- **Mode**: dry-run, `--config-preset v2 --venue testnet
+  --duration-minutes 0 --allow-stale-aligner`.
+- **All V2 invariants armed at startup**:
+  - Aligner β\* loaded (50 months, 2022-02..2026-03; 2-month gap
+    acknowledged via override; lookup falls back to 2026-03 per
+    walk-forward semantics).
+  - Kelly K1 sidecar loaded (145041 bars, 1046 with mult>1.0,
+    max=2.0).
+  - bar_execution_quality slip series loaded (175258 bars, median
+    $9.83/BTC).
+  - ProfitScaleEstimator enabled (floor=0.30, edge_disc=0.5, tau=200).
+  - DRL policy manifest confirms bar_minutes=15.
+  - LiveVPIN stream warm-started (VPIN=0.1520, Binance WS connected).
+  - Telegram heartbeat live (cold-start announcement sent).
+  - Bar clock running on 15-min boundary, SVI recalibrating hourly.
+
+---
+
+## Current Status (as of 2026-05-01)
+
+| Wave | Work | Status |
+|------|------|--------|
+| W1.1-W2.2 | RND + metrics migration | DONE |
+| W3.1 | Live engine upgrade (Stage 18 models) | DONE |
+| W3.2 | Phase 8 unattended testnet paper run | ACTIVE |
+| W4.1 | Directional classifier | DONE (rejected) |
+| W5 | True VPIN + SAC v4 | DONE |
+| — | Backtester-live 7-gap parity audit (Stage 23) | DONE |
+| — | BTC V2 production preset (Stage 24) | DONE |
+| — | Foundation fix `holding=15` (Stage 25) | DONE |
+| — | Walk-forward prediction aligner (Stage 26) | DONE (sidecar default) |
+| — | P&L throttle (Stage 27) | DONE (optional sidecar) |
+| — | DFL Head W/L filter (Stage 28) | DONE (optional sidecar) |
+| — | Kelly K1 V2 default (Stage 29) | DONE |
+| — | h=5m audit (Stage 30) | DONE (REJECT) |
+| — | Live engine V2 alignment cycle Phase A-D (Stage 31) | DONE |
+| — | Phase E remediation E.1-3 (Stage 32) | DONE |
+| — | Monthly aligner refresh + ops hardening (Stage 33) | DONE |
+
+**Production exit checklist**: 13/15 gates passed. Remaining:
+- D3: Phase 8 paper run completes ≥7 days of live testnet trading.
+- Live NC Sharpe ≥ 3.0 measured on the I4 Stage A harness diff.
+
+Phase 8 paper run is **active** on the homeserver as of 2026-05-01.
+Engine stack:
+- Stage 18 pruned+SVI+HAR-PD LightGBM (44 base + 6 HAR-PD = 50 features)
+- SAC v4 DRL hedger with live Binance VPIN stream
+- Per-month aligner β\* (currently March 2026 forward-fill until the
+  next refresh cycle on May 5-7)
+- Kelly K1 per-bar sidecar
+- realistic_taker per-bar empirical slip
+- 3-tier IOC ladder (touch+1tick → cap → bounded-IOC at 1.5×cap)
+- Empirical-Bayes profit_scale shrinkage
+- Latency kill-switch (configurable `latency_threshold_ms`, default
+  `inf` = disabled on testnet)
+- Telegram heartbeat every 60 min
 
 Pending research (optional):
-- W4.2: Per-regime model (C2) -- requires regime labeling
-- W4.3: Target construction experiments (C3)
-- Multi-TF backtest sweeps: `scripts/sweep_all_tfs.py` (5m, 60m, 240m, 480m, 720m)
-  See `TF_SWEEP_RESULTS.md` for results as they complete.
+- Side-asymmetric horizon: h=5m longs + h=15m shorts (deferred from
+  Stage 30 deep-dive based on +$561K longs-only finding)
+- Hyperliquid L2 OFI features (research rank 1 from Session H scan,
+  ~2 days infra work)
+- Alternative data: CME-Binance basis, cross-exchange funding flow
+- Stage B harness implementation (requires y_true backfill into the
+  live trade log; pairs with the next live-feature audit)
+- Mainnet bring-up (separate cycle; pre-reqs: Stage B harness +
+  ≥7 days of stable testnet alignment numbers from W3.2)
+
+Multi-TF backtest sweeps (`scripts/sweep_all_tfs.py`): 5m, 60m, 240m,
+480m, 720m. See `TF_SWEEP_RESULTS.md` for results as they complete.
+The cross-horizon ledger (Stage 30) formally rejects h=5m and h=60m;
+h=30m trained but not backtested (low priority post-Stage 30).

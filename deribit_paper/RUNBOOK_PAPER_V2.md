@@ -41,6 +41,55 @@ testnet credentials in `.env`.
    ls -la vol_arb/output/BTC_v2_trade_log.parquet   # ~84MB, 145041 rows
    ```
 
+## Monthly aligner β\* refresh
+
+The aligner β\* sidecar (`vol_model/output/aligner_betas_by_month.json`)
+must be regenerated each calendar month. Engine startup (E.2.3) refuses
+to start under `--config-preset v2` when the sidecar is ≥ 2 months stale,
+unless `--allow-stale-aligner` is passed.
+
+**When**: run on the 5th of each month (Binance Vision typically
+publishes the prior month's aggTrades by day 3-5).
+
+**Command**:
+```sh
+cd C:/Claude/ml-trading-system
+PYTHONPATH=. python scripts/refresh_aligner_monthly.py
+# Auto-picks the most recent complete month. Override with --month 2026-04.
+```
+
+**What it does** (orchestrates existing tooling — see the script header
+for full details):
+
+1. Phase 1: gates on data availability (BTCUSDT aggTrades, Deribit
+   option trades ≥ 80% calendar coverage, DVOL extending into the
+   target month). Refuses cleanly if any input is missing.
+2. Phase 2-4: rebuilds features, runs single-month LightGBM walk-
+   forward, runs the aligner.
+3. Phase 5: re-extracts the β\* JSON to a tmp path.
+4. Phase 6: sanity gate — refuses to ship when the new month's β\* is
+   outside `[-0.5, +0.5]` or when the new JSON drops historical months.
+5. Phase 7: atomic swap (tmp + `os.replace`) into the live sidecar
+   path; backs up the old JSON beside it.
+
+**After a successful refresh**: redeploy + restart the engine, and
+**drop** the `--allow-stale-aligner` flag from the launch command:
+
+```sh
+bash scripts/deploy_to_homeserver.sh --skip-tests
+ssh monitor "tmux kill-session -t deribit; \
+    tmux new-session -d -s deribit -c /hdd/ml-trading-system \
+    'PYTHONPATH=. python3 -m deribit_paper --run-paper \
+       --config-preset v2 --venue testnet --duration-minutes 0 \
+       --log-level INFO 2>&1 | tee deribit_paper/logs/paper_v2_\$(date +%Y%m%d_%H%M).log'"
+```
+
+**Cron template** (Linux):
+```cron
+# 06:30 UTC on the 5th of each month
+30 6 5 * * cd /path/to/ml-trading-system && PYTHONPATH=. python3 scripts/refresh_aligner_monthly.py >> logs/aligner_refresh.log 2>&1
+```
+
 ## Launch (testnet, dry-run)
 
 ```sh

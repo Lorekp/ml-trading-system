@@ -58,19 +58,22 @@ STAGE_A_PARQUET = OUTPUT_DIR / "harness_stage_a.parquet"
 
 
 # ── Per-column diff contract ──────────────────────────────────────────────
+#
+# Verified against the on-disk schema of
+# ``vol_arb/output/BTC_v2_trade_log.parquet`` (Apr 21 build, 145041 rows,
+# 127 columns). The V2 trade log does NOT carry per-leg prices — option
+# fills are aggregated into ``net_pnl_nc`` (net non-compound PnL) along
+# with hedge & fees. The diff therefore runs at trade-aggregate level,
+# not per-leg, and the live engine's leg prices are written to the
+# harness parquet for diagnostics but NOT compared here.
 
 _NUMERIC_COLS_LIVE_TO_V2: list[tuple[str, str]] = [
-    # (live column, v2 column)
+    # (live column, v2 column) — both in V2 trade log's actual schema.
     ("signal",                "signal"),
-    ("n_contracts_btc",       "size_btc"),
+    ("n_contracts_btc",       "N_contracts"),
     ("y_pred_pct",            "rv_pred_pct"),
-    ("iv_used_pct",           "iv_used_pct"),
-    ("edge_vol_pts",          "edge_vp"),
-    ("kelly_mult",            "size_mult"),
-    ("entry_call_price",      "entry_call_price"),
-    ("entry_put_price",       "entry_put_price"),
-    ("exit_call_price",       "exit_call_price"),
-    ("exit_put_price",        "exit_put_price"),
+    ("iv_used_pct",           "iv_used"),       # V2 column lacks _pct suffix
+    ("edge_vol_pts",          "edge"),
     ("realized_pnl_usd",      "net_pnl_nc"),
 ]
 
@@ -88,8 +91,19 @@ def _load_or_empty(path: Path, name: str) -> pd.DataFrame:
 # ── Stage A diff ─────────────────────────────────────────────────────────
 
 def _stage_a_diff(live: pd.DataFrame, v2: pd.DataFrame) -> pd.DataFrame:
-    """Per-trade diff. ``v2`` is reset_index → started_at → matched on
-    that timestamp. ``live.started_at`` is parsed to UTC."""
+    """Per-trade diff between live and V2 trade logs.
+
+    ``v2`` is the **full** V2 trade log including bars where the
+    backtester chose flat (``signal == 0``). Only V2 rows where
+    ``signal != 0`` are considered for the inner-join — those are the
+    bars the backtester actually traded. Bars where live fired but V2
+    was flat go into the ``live_fired_v2_flat`` bucket (see
+    ``_summarise``) — those are the most diagnostic-rich misalignment
+    cases (config drift on threshold or contango filter).
+
+    ``live.started_at`` is parsed to UTC. Output is indexed on the
+    matched timestamps with ``d_<col>`` delta columns.
+    """
     if live.empty:
         return pd.DataFrame()
 
@@ -101,8 +115,9 @@ def _stage_a_diff(live: pd.DataFrame, v2: pd.DataFrame) -> pd.DataFrame:
     if v2.empty:
         logger.warning("V2 backtest trade log is empty — Stage A produces NaN columns.")
         diff = live.copy()
-        for live_col, v2_col in _NUMERIC_COLS_LIVE_TO_V2:
+        for live_col, _v2_col in _NUMERIC_COLS_LIVE_TO_V2:
             diff[f"d_{live_col}"] = np.nan
+        diff.attrs["live_fired_v2_flat_count"] = 0
         return diff
 
     # V2 trade log is already DatetimeIndex (per the backtester contract).
@@ -110,14 +125,36 @@ def _stage_a_diff(live: pd.DataFrame, v2: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(v2.index, pd.DatetimeIndex):
         v2.index = pd.to_datetime(v2.index, utc=True)
 
-    # Inner-join on timestamp: only diff trades that exist in both stacks.
-    common = live.index.intersection(v2.index)
+    # ── Live-fired-but-V2-flat bucket (config-drift diagnostic) ──
+    # Compare against the full V2 (signal in {-1, 0, +1}) to detect bars
+    # where live decided to trade but V2 didn't. These are typically
+    # caused by (a) entry_threshold mismatch, (b) contango filter
+    # drift, or (c) the V2 backtester's RND / DRL gating differing.
+    live_idx = live.index
+    v2_full_signal = (
+        v2["signal"].reindex(live_idx, fill_value=0)
+        if "signal" in v2.columns else pd.Series(0, index=live_idx)
+    )
+    live_fired = live["signal"].abs() > 0.5
+    v2_flat_at_live_fire = v2_full_signal.abs() < 0.5
+    live_fired_v2_flat = int((live_fired & v2_flat_at_live_fire).sum())
+
+    # Inner-join on timestamps where BOTH sides fired (signal != 0).
+    if "signal" in v2.columns:
+        v2_fired = v2[v2["signal"] != 0]
+    else:
+        v2_fired = v2
+    common = live.index.intersection(v2_fired.index)
     logger.info(
-        "Stage A: live=%d trades, v2=%d trades, common=%d",
-        len(live), len(v2), len(common),
+        "Stage A: live=%d (fired=%d), v2=%d (fired=%d), common=%d, "
+        "live_fired_v2_flat=%d",
+        len(live), int(live_fired.sum()),
+        len(v2), len(v2_fired), len(common), live_fired_v2_flat,
     )
     if len(common) == 0:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs["live_fired_v2_flat_count"] = live_fired_v2_flat
+        return empty
 
     out = live.loc[common].copy()
     for live_col, v2_col in _NUMERIC_COLS_LIVE_TO_V2:
@@ -125,18 +162,22 @@ def _stage_a_diff(live: pd.DataFrame, v2: pd.DataFrame) -> pd.DataFrame:
             continue
         live_vals = live.loc[common, live_col].to_numpy(dtype=float, na_value=np.nan)
         v2_vals = (
-            v2.loc[common, v2_col].to_numpy(dtype=float, na_value=np.nan)
-            if v2_col in v2.columns else np.full(len(common), np.nan)
+            v2_fired.loc[common, v2_col].to_numpy(dtype=float, na_value=np.nan)
+            if v2_col in v2_fired.columns else np.full(len(common), np.nan)
         )
         out[f"d_{live_col}"] = live_vals - v2_vals
+    out.attrs["live_fired_v2_flat_count"] = live_fired_v2_flat
     return out
 
 
 def _summarise(diff: pd.DataFrame) -> dict:
     """Compute per-bucket summary for the markdown report."""
-    summary = {
+    summary: dict = {
         "n_trades_total": int(len(diff)),
         "buckets": {},
+        "live_fired_v2_flat_count": int(
+            diff.attrs.get("live_fired_v2_flat_count", 0)
+        ),
     }
     if diff.empty:
         return summary
@@ -146,25 +187,12 @@ def _summarise(diff: pd.DataFrame) -> dict:
         n_sig_diff = int((diff["d_signal"].abs() > 0.5).sum())
         summary["buckets"]["config_drift_signal_mismatch"] = n_sig_diff
     if "d_n_contracts_btc" in diff.columns:
-        ratio = diff["d_n_contracts_btc"].abs() / np.maximum(
-            np.abs(diff["d_n_contracts_btc"].abs()) + 1e-9, 0.1,
-        )
         summary["buckets"]["config_drift_size_med_abs_delta_btc"] = float(
             np.nanmedian(diff["d_n_contracts_btc"].abs())
         )
 
-    # price drift
-    for col in ("d_entry_call_price", "d_entry_put_price",
-                "d_exit_call_price", "d_exit_put_price"):
-        if col in diff.columns:
-            summary["buckets"][f"price_drift_{col}_p50"] = float(
-                np.nanmedian(diff[col].abs())
-            )
-            summary["buckets"][f"price_drift_{col}_p90"] = float(
-                np.nanpercentile(diff[col].abs().dropna(), 90)
-            ) if diff[col].notna().any() else float("nan")
-
-    # PnL residual
+    # PnL residual (the headline diagnostic — V2 has no leg prices, so
+    # this is the only price-side comparison we can make)
     if "d_realized_pnl_usd" in diff.columns and diff["d_realized_pnl_usd"].notna().any():
         summary["buckets"]["pnl_med_abs_diff_usd"] = float(
             np.nanmedian(diff["d_realized_pnl_usd"].abs())
@@ -173,13 +201,35 @@ def _summarise(diff: pd.DataFrame) -> dict:
             np.nanpercentile(diff["d_realized_pnl_usd"].abs().dropna(), 90)
         )
 
+    # Predictor-side drift (y_pred & iv): non-zero deltas indicate
+    # feature-staleness drift, captured in Stage A as a leading indicator
+    # for Stage B (which requires y_true backfill).
+    for live_col in ("d_y_pred_pct", "d_iv_used_pct", "d_edge_vol_pts"):
+        if live_col in diff.columns and diff[live_col].notna().any():
+            summary["buckets"][f"feature_drift_{live_col}_p50_abs"] = float(
+                np.nanmedian(diff[live_col].abs())
+            )
+
     return summary
 
 
 def _format_report(summary: dict, out_md: Path) -> None:
     lines: list[str] = []
     lines.append("# H=15m Live↔V2 Alignment Report (Stage A)\n")
-    lines.append(f"**Trades compared:** {summary['n_trades_total']}\n")
+    lines.append(
+        f"**Trades compared (both fired):** {summary['n_trades_total']}\n"
+    )
+    lfvf = summary.get("live_fired_v2_flat_count", 0)
+    lines.append(
+        f"**Live-fired-but-V2-flat (config-drift bucket):** {lfvf}\n"
+    )
+    lines.append("")
+    lines.append(
+        "_The V2 trade log carries no per-leg prices; the diff therefore "
+        "compares aggregate trade-level fields (signal, size, y_pred, "
+        "iv_used, edge, net_pnl_nc). Live leg prices are written to the "
+        "harness parquet for diagnostics but not differentiated here._\n"
+    )
     lines.append("")
     if summary["n_trades_total"] == 0:
         lines.append(
@@ -203,11 +253,11 @@ def _format_report(summary: dict, out_md: Path) -> None:
 
     lines.append("## Notes\n")
     lines.append(
-        "* **Strike rounding budget**: per "
-        "`03-research-sidecars-slippage.md`, ATM moneyness offset has "
-        "p50 ≈ 0.47% (typical IV diff 2-3 vol pts), p90 ≈ 2.48% (8-10 "
-        "vol pts). Treat that as the irreducible portion of the price-"
-        "drift bucket.\n"
+        "* **live-fired-V2-flat**: live engine traded but V2 backtester "
+        "stayed flat at the same bar — typically caused by "
+        "`entry_threshold` mismatch, contango filter drift, or a V2 "
+        "reject (RND tail probability, etc.) that the live engine does "
+        "not enforce identically.\n"
     )
     lines.append(
         "* **Stage B (feature-drift attribution)**: deferred — requires "

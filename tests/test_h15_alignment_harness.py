@@ -50,7 +50,11 @@ def test_format_report_empty(tmp_path):
 
 
 def test_stage_a_single_match():
-    """One live + one V2 trade at same timestamp → 1-row diff."""
+    """One live + one V2 trade at same timestamp → 1-row diff.
+
+    Uses the REAL V2 schema (``signal``, ``N_contracts``, ``rv_pred_pct``,
+    ``iv_used``, ``edge``, ``net_pnl_nc``) — no leg-price columns.
+    """
     ts = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
     live = pd.DataFrame([{
         "started_at": ts.isoformat(),
@@ -59,25 +63,15 @@ def test_stage_a_single_match():
         "y_pred_pct": 72.0,
         "iv_used_pct": 60.0,
         "edge_vol_pts": 12.0,
-        "kelly_mult": 1.0,
-        "entry_call_price": 0.05,
-        "entry_put_price": 0.05,
-        "exit_call_price": 0.06,
-        "exit_put_price": 0.04,
         "realized_pnl_usd": 100.0,
     }])
     v2 = pd.DataFrame(
         [{
             "signal": 1,
-            "size_btc": 0.4,
+            "N_contracts": 0.4,
             "rv_pred_pct": 70.0,
-            "iv_used_pct": 60.0,
-            "edge_vp": 10.0,
-            "size_mult": 1.0,
-            "entry_call_price": 0.045,
-            "entry_put_price": 0.05,
-            "exit_call_price": 0.055,
-            "exit_put_price": 0.04,
+            "iv_used": 60.0,
+            "edge": 10.0,
             "net_pnl_nc": 80.0,
         }],
         index=[ts],
@@ -101,17 +95,12 @@ def test_stage_a_disjoint_timestamps_returns_empty():
         "y_pred_pct": 72.0,
         "iv_used_pct": 60.0,
         "edge_vol_pts": 12.0,
-        "kelly_mult": 1.0,
-        "entry_call_price": 0.05,
-        "entry_put_price": 0.05,
-        "exit_call_price": 0.06,
-        "exit_put_price": 0.04,
         "realized_pnl_usd": 100.0,
     }])
     v2 = pd.DataFrame(
         [{
             "signal": 1,
-            "size_btc": 0.4,
+            "N_contracts": 0.4,
             "rv_pred_pct": 70.0,
         }],
         index=[pd.Timestamp("2026-05-15 12:00:00", tz="UTC")],
@@ -128,10 +117,9 @@ def test_summarise_populates_buckets_on_real_diff():
         [{
             "d_signal": 0.0,
             "d_n_contracts_btc": -0.1,
-            "d_entry_call_price": 0.005,
-            "d_entry_put_price": 0.0,
-            "d_exit_call_price": 0.005,
-            "d_exit_put_price": 0.0,
+            "d_y_pred_pct": 2.0,
+            "d_iv_used_pct": 0.0,
+            "d_edge_vol_pts": 2.0,
             "d_realized_pnl_usd": 20.0,
         }],
         index=[ts],
@@ -140,3 +128,52 @@ def test_summarise_populates_buckets_on_real_diff():
     assert summary["n_trades_total"] == 1
     assert "config_drift_signal_mismatch" in summary["buckets"]
     assert "pnl_med_abs_diff_usd" in summary["buckets"]
+
+
+# ─── E.1.2: real-schema sanity + live-fired-V2-flat bucket ──────────────
+
+
+def test_v2_column_names_in_real_trade_log():
+    """The right-hand side of ``_NUMERIC_COLS_LIVE_TO_V2`` must reference
+    columns that actually exist in the V2 trade log. This is the test
+    that would have caught B2 (the previous map referenced ``size_btc``,
+    ``edge_vp``, ``size_mult``, etc. — none of which are in the parquet)."""
+    v2_path = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_trade_log.parquet"
+    if not v2_path.exists():
+        pytest.skip(f"{v2_path} not on disk — skipping schema check")
+    cols = set(pd.read_parquet(v2_path, columns=None).columns)
+    for live_col, v2_col in _harness._NUMERIC_COLS_LIVE_TO_V2:
+        assert v2_col in cols, (
+            f"V2 column {v2_col!r} (mapped from live {live_col!r}) not in trade log."
+        )
+
+
+def test_live_fired_v2_flat_bucket_counted():
+    """Bar where live fired but V2 was flat → in the diagnostic bucket,
+    NOT in the diff (diff only inner-joins fired-on-both)."""
+    ts1 = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
+    ts2 = pd.Timestamp("2026-04-15 12:15:00", tz="UTC")
+    live = pd.DataFrame([
+        {"started_at": ts1.isoformat(), "signal": 1, "n_contracts_btc": 0.3,
+         "y_pred_pct": 72.0, "iv_used_pct": 60.0, "edge_vol_pts": 12.0,
+         "realized_pnl_usd": 100.0},
+        {"started_at": ts2.isoformat(), "signal": 1, "n_contracts_btc": 0.3,
+         "y_pred_pct": 65.0, "iv_used_pct": 60.0, "edge_vol_pts": 5.0,
+         "realized_pnl_usd": 0.0},
+    ])
+    v2 = pd.DataFrame(
+        [
+            {"signal": 1, "N_contracts": 0.3, "rv_pred_pct": 72.0,
+             "iv_used": 60.0, "edge": 12.0, "net_pnl_nc": 100.0},
+            {"signal": 0, "N_contracts": 0.0, "rv_pred_pct": 65.0,
+             "iv_used": 60.0, "edge": 5.0, "net_pnl_nc": 0.0},
+        ],
+        index=[ts1, ts2],
+    )
+
+    diff = _harness._stage_a_diff(live, v2)
+    # Only ts1 ends up in the diff (V2 flat at ts2 excludes it).
+    assert len(diff) == 1
+    assert diff.attrs["live_fired_v2_flat_count"] == 1
+    summary = _harness._summarise(diff)
+    assert summary["live_fired_v2_flat_count"] == 1

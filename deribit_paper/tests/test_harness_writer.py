@@ -119,16 +119,19 @@ def test_row_handles_missing_exit_legs():
 
 # ── Append + round-trip ───────────────────────────────────────────────────
 
+import asyncio  # noqa: E402
+
+
 def test_append_creates_parquet(tmp_path: Path):
     out = _make_outcome()
     writer = HarnessWriter(tmp_path / "harness.parquet")
-    writer.consolidate_and_write(
+    asyncio.run(writer.consolidate_and_write(
         out,
         realized_pnl_usd=100.0,
         kelly_mult=1.0,
         taker_slippage_pct=0.5,
         config_preset="default",
-    )
+    ))
     df = pd.read_parquet(tmp_path / "harness.parquet")
     assert list(df.columns) == _HARNESS_COLUMNS
     assert len(df) == 1
@@ -141,8 +144,12 @@ def test_append_preserves_existing_rows(tmp_path: Path):
     out2 = _make_outcome()
     out2.trade_id = "t-002"
     writer = HarnessWriter(tmp_path / "harness.parquet")
-    writer.consolidate_and_write(out1, realized_pnl_usd=100.0)
-    writer.consolidate_and_write(out2, realized_pnl_usd=-50.0)
+
+    async def _go() -> None:
+        await writer.consolidate_and_write(out1, realized_pnl_usd=100.0)
+        await writer.consolidate_and_write(out2, realized_pnl_usd=-50.0)
+
+    asyncio.run(_go())
 
     df = pd.read_parquet(tmp_path / "harness.parquet")
     assert len(df) == 2
@@ -155,12 +162,53 @@ def test_append_preserves_existing_rows(tmp_path: Path):
 def test_consolidate_with_none_outcome_silent(tmp_path: Path):
     writer = HarnessWriter(tmp_path / "harness.parquet")
     # Should not raise.
-    writer.consolidate_and_write(None, realized_pnl_usd=None)
+    asyncio.run(writer.consolidate_and_write(None, realized_pnl_usd=None))
     assert not (tmp_path / "harness.parquet").exists()
 
 
 def test_consolidate_with_none_signal_silent(tmp_path: Path):
     out = SimpleNamespace(signal=None)
     writer = HarnessWriter(tmp_path / "harness.parquet")
-    writer.consolidate_and_write(out, realized_pnl_usd=None)
+    asyncio.run(writer.consolidate_and_write(out, realized_pnl_usd=None))
     assert not (tmp_path / "harness.parquet").exists()
+
+
+# ── E.1.3: concurrency + atomic write ────────────────────────────────────
+
+
+def test_concurrent_appends_no_row_loss(tmp_path: Path):
+    """Two simultaneous tasks → both rows present in the final parquet.
+
+    Pre-E.1.3, the read-modify-write pattern raced on this exact case:
+    both tasks would read the empty parquet, build a 1-row frame, and
+    both write — keeping only the second writer's row. The lock + atomic
+    rename keeps both rows.
+    """
+    out1 = _make_outcome()
+    out2 = _make_outcome()
+    out2.trade_id = "t-002"
+    out2.started_at = pd.Timestamp("2026-04-15 12:01:00", tz="UTC")
+    out2.ended_at = pd.Timestamp("2026-04-15 12:16:00", tz="UTC")
+    writer = HarnessWriter(tmp_path / "harness.parquet")
+
+    async def _go() -> None:
+        await asyncio.gather(
+            writer.consolidate_and_write(out1, realized_pnl_usd=100.0),
+            writer.consolidate_and_write(out2, realized_pnl_usd=200.0),
+        )
+
+    asyncio.run(_go())
+
+    df = pd.read_parquet(tmp_path / "harness.parquet")
+    assert len(df) == 2
+    assert set(df["trade_id"]) == {"t-001", "t-002"}
+    assert set(df["realized_pnl_usd"]) == {100.0, 200.0}
+
+
+def test_atomic_write_leaves_no_tmp_on_success(tmp_path: Path):
+    """After a successful write, no ``.tmp.*`` files remain."""
+    out = _make_outcome()
+    writer = HarnessWriter(tmp_path / "harness.parquet")
+    asyncio.run(writer.consolidate_and_write(out, realized_pnl_usd=10.0))
+    leftovers = list(tmp_path.glob("*.tmp*"))
+    assert leftovers == []

@@ -64,6 +64,13 @@ class HedgeRunSummary:
     n_ticks_skipped_dust: int
     total_usd_traded: float
     final_inventory_btc: float
+    # E.1.10 (2026-05-01): mark-to-market PnL on the perp inventory
+    # accumulated across the bar. Computed as the running sum of
+    # ``inventory_btc × (this_spot - last_spot)`` per tick, so the
+    # value reflects the delta-hedge contribution to the trade's
+    # net PnL. Mirrors the backtester's ``delta_hedge_pnl_btc`` term
+    # in ``vol_arb/backtester.py`` (modulo unit conversion to USD).
+    realized_pnl_usd: float = 0.0
     per_tick: list[HedgeTickResult] = field(default_factory=list)
 
 
@@ -131,6 +138,9 @@ class PerpHedger:
             final_inventory_btc=0.0,
         )
         tracked_inventory_btc = 0.0
+        # E.1.10: running mark-to-market on the perp inventory.
+        # Updated each tick as inventory_btc * (this_spot - prev_spot).
+        last_spot: float | None = None
 
         for tick in range(1, self._n_ticks + 1):
             # Wait until this tick's wall-clock time
@@ -150,6 +160,15 @@ class PerpHedger:
                     trade_id, tick, exc,
                 )
                 continue
+
+            # E.1.10: MTM the existing inventory across this bar segment
+            # BEFORE trading on this tick. Any new fill below is recorded
+            # at this tick's spot, so it accrues PnL on the NEXT tick.
+            if last_spot is not None and tracked_inventory_btc != 0.0:
+                summary.realized_pnl_usd += (
+                    tracked_inventory_btc * (spot - last_spot)
+                )
+            last_spot = spot
 
             try:
                 target_inventory = self._drl.step(trade_id, current_spot=spot)

@@ -263,3 +263,97 @@ def test_filter_passes_through_when_atm_dte_returns_nan():
     bar = _make_bar()
     sig = p.predict(bar, _make_tsrv(), straddle=_make_straddle())
     assert sig.direction == 1
+
+
+# ── E.1.8: term_slope cached on Signal at predict time ───────────────────
+
+
+def test_term_slope_cached_on_signal():
+    """The Signal carries the term_slope value sampled at predict time,
+    not at trade-close time. Pre-E.1.8 the engine called the predictor's
+    private ``_compute_term_slope_1w_2w`` 15 minutes later — different
+    SVI state, different slope."""
+    p = _make_predictor(
+        rv_pred_pct_target=85.0, iv_used_pct=60.0,
+        atm_1w_pct=70.0, atm_2w_pct=72.0,
+    )
+    bar = _make_bar()
+    sig = p.predict(bar, _make_tsrv(), straddle=_make_straddle())
+    assert sig.term_slope_1w_2w == pytest.approx(2.0)  # 72 - 70
+
+
+def test_term_slope_none_when_svi_uncalibrated():
+    """Uncalibrated SVI → ``term_slope_1w_2w`` is None on the Signal."""
+    p = _make_predictor(
+        rv_pred_pct_target=85.0, iv_used_pct=60.0,
+        atm_1w_pct=70.0, atm_2w_pct=72.0,
+    )
+    p._svi.has_params = False
+    bar = _make_bar()
+    # has_params=False short-circuits _lookup_iv → flat. term_slope still
+    # populated from the predict-time computation, but here also None
+    # because the slope helper bails on uncalibrated SVI.
+    sig = p.predict(bar, _make_tsrv(), straddle=_make_straddle())
+    assert sig.term_slope_1w_2w is None
+
+
+# ── E.1.14: require_aligner fail-fast on empty dict ──────────────────────
+
+
+def test_require_aligner_raises_on_empty_dict():
+    """V2 preset wires ``require_aligner=True``; empty β* dict at init
+    raises rather than silently bypassing β* every bar."""
+    from deribit_paper.signal.predictor import Predictor
+
+    bundle = MagicMock()
+    bundle.lgbm_model = MagicMock()
+    assembler = MagicMock()
+    assembler._bundle = bundle
+    svi = MagicMock()
+    svi.has_params = True
+
+    with pytest.raises(RuntimeError, match="aligner"):
+        Predictor(
+            feature_assembler=assembler,
+            svi_calibrator=svi,
+            aligner_betas={},
+            require_aligner=True,
+        )
+
+
+def test_require_aligner_passes_with_populated_dict():
+    """Populated dict + require_aligner=True → no error."""
+    from deribit_paper.signal.predictor import Predictor
+
+    bundle = MagicMock()
+    bundle.lgbm_model = MagicMock()
+    assembler = MagicMock()
+    assembler._bundle = bundle
+    svi = MagicMock()
+    svi.has_params = True
+
+    Predictor(
+        feature_assembler=assembler,
+        svi_calibrator=svi,
+        aligner_betas={"2026-01": 0.05},
+        require_aligner=True,
+    )
+
+
+def test_require_aligner_default_false_allows_empty():
+    """Default preset (require_aligner=False) accepts empty dict."""
+    from deribit_paper.signal.predictor import Predictor
+
+    bundle = MagicMock()
+    bundle.lgbm_model = MagicMock()
+    assembler = MagicMock()
+    assembler._bundle = bundle
+    svi = MagicMock()
+    svi.has_params = True
+
+    Predictor(
+        feature_assembler=assembler,
+        svi_calibrator=svi,
+        aligner_betas={},
+        require_aligner=False,
+    )

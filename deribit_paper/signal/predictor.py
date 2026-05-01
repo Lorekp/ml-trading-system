@@ -48,6 +48,12 @@ class Signal:
     rv_pred_pct: float                # model's forecast (annualised vol, %)
     iv_used_pct: float                # SVI IV at the ATM strike (%)
     bar_tsrv: BarTSRV
+    # E.1.8 (2026-05-01): SVI 1w-2w term slope at signal time, used by
+    # the V2 contango filter and emitted into the harness row. Cached
+    # here so the harness writer doesn't have to re-call a private
+    # predictor method 15 minutes later (when the slope has changed).
+    # ``None`` when SVI is uncalibrated.
+    term_slope_1w_2w: float | None = None
     # Execution context (populated only when direction != 0 — else None)
     straddle: StraddleSelection | None = None
     reason: str = ""                   # human-readable explanation
@@ -82,6 +88,7 @@ class Predictor:
         max_jump_fraction_for_shorts: float = 0.15,
         skip_long_if_term_slope_gt: float | None = None,
         aligner_betas: dict[str, float] | None = None,
+        require_aligner: bool = False,
         log_every_bar: bool = False,
     ):
         self._assembler = feature_assembler
@@ -95,6 +102,16 @@ class Predictor:
         self._skip_long_if_term_slope_gt = skip_long_if_term_slope_gt
         self._aligner_betas: dict[str, float] = dict(aligner_betas or {})
         self._log_every_bar = log_every_bar
+        # E.1.14 (2026-05-01): under V2 preset, an empty aligner_betas
+        # dict signals a configuration failure (sidecar JSON missing or
+        # malformed), NOT a deliberate "β* disabled" choice. Fail fast
+        # at startup rather than silently bypass β* every bar.
+        if require_aligner and not self._aligner_betas:
+            raise RuntimeError(
+                "Predictor: ``require_aligner=True`` (V2 preset) but no "
+                "β* sidecar loaded. Confirm aligner_betas_json exists, "
+                "is valid JSON, and contains numeric per-month betas."
+            )
 
     def predict(
         self,
@@ -142,9 +159,33 @@ class Predictor:
             beta_star = lookup_beta_for_month(
                 self._aligner_betas, bar.timestamp, fallback_zero_warn=False,
             )
-            pred_ln = pred_ln_raw + beta_star
+            # E.1.11: defence-in-depth — even though load_aligner_betas
+            # already clips to [-0.5, +0.5], a non-finite β* here would
+            # produce inf or NaN through exp(), poisoning every signal
+            # downstream. Bypass on non-finite + log ERROR so the
+            # operator notices.
+            if not math.isfinite(beta_star):
+                logger.error(
+                    "Predictor: non-finite β* at %s — bypassing β* (raw "
+                    "prediction used). Investigate sidecar corruption.",
+                    bar.timestamp,
+                )
+                pred_ln = pred_ln_raw
+            else:
+                pred_ln = pred_ln_raw + beta_star
         else:
             pred_ln = pred_ln_raw
+        if not math.isfinite(pred_ln):
+            logger.error(
+                "Predictor: non-finite pred_ln at %s (raw=%s β=%s) — "
+                "returning flat signal",
+                bar.timestamp, pred_ln_raw,
+                beta_star if self._aligner_betas else "n/a",
+            )
+            return self._flat_signal(
+                bar, bar_tsrv, 0.0,
+                reason="non-finite prediction (β* corruption?)",
+            )
         rv_pred_decimal = math.exp(pred_ln)
         rv_pred_pct = rv_pred_decimal * 100.0
 
@@ -167,6 +208,11 @@ class Predictor:
         jf = max(0.0, min(1.0, jf))
         half_spread = self._base_spread_iv * math.exp(self._spread_jump_k * jf) / 2.0
 
+        # E.1.8: compute the 1w-2w term slope ONCE at predict time and
+        # cache on the Signal so downstream code (harness, audits) sees
+        # the slope at signal-fire time, NOT at trade-close time.
+        term_slope = self._compute_term_slope_1w_2w()
+
         edge = rv_pred_pct - iv_used_pct
         direction = 0
         effective_long = half_spread + self._entry_threshold_long
@@ -181,12 +227,11 @@ class Predictor:
             # V2 contango filter (Phase C.5 2026-04-16): drop LONG signals
             # in IV contango regimes where the 1w-2w term slope is positive.
             if self._skip_long_if_term_slope_gt is not None:
-                slope = self._compute_term_slope_1w_2w()
-                if slope is not None and slope > self._skip_long_if_term_slope_gt:
+                if term_slope is not None and term_slope > self._skip_long_if_term_slope_gt:
                     direction = 0
                     reason = (
                         f"FLAT (V2 contango filter) — term_slope_1w_2w "
-                        f"{slope:+.3f} > {self._skip_long_if_term_slope_gt:.2f}; "
+                        f"{term_slope:+.3f} > {self._skip_long_if_term_slope_gt:.2f}; "
                         f"LONG candidate edge={edge:+.3f}vp suppressed"
                     )
         elif edge < -effective_short:
@@ -222,6 +267,7 @@ class Predictor:
             rv_pred_pct=float(rv_pred_pct),
             iv_used_pct=float(iv_used_pct),
             bar_tsrv=bar_tsrv,
+            term_slope_1w_2w=term_slope,
             straddle=straddle if direction != 0 else None,
             reason=reason,
         )

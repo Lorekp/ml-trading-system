@@ -502,6 +502,21 @@ class BacktestConfig(BaseModel):
           v2 (post-foundation-fix, hold=15m, current): numbers land
               after regen of BTC_v2_trade_log.parquet; see
               ``vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md``.
+
+        Canonical regen recipe (so the headline numbers reproduce):
+
+          ``BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()``
+
+        i.e. the V2 preset is *composed with* :meth:`with_realistic_costs`
+        when generating ``vol_arb/output/BTC_v2_trade_log.parquet`` and the
+        adoption-record numbers in ``memory/project_kelly_sizing_2026_04_21.md``
+        ($959,571 NC PnL, 7,417 trades, NC Sharpe 6.29). The preset itself
+        does NOT bake realistic costs in — the tight-quote view (bare
+        ``with_btc_production_filters_v2()`` without ``with_realistic_costs()``)
+        produces $973,302 NC PnL / 7,623 trades, which is the optimistic
+        lower-cost baseline. Equivalently from the CLI:
+        ``--btc-production-v2 --realistic`` reproduces canonical;
+        ``--btc-production-v2`` alone reproduces the tight-quote view.
         """
         return self.with_btc_production_filters().model_copy(update=dict(
             **self._v2_horizon_invariants(),

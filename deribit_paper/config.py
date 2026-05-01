@@ -128,6 +128,11 @@ class PaperConfig:
     max_single_trade_btc: float = 2.0
     kill_switch_daily_dd_pct: float = 2.0     # halt if daily DD > this (% of peak equity)
     kill_switch_consecutive_errors: int = 3
+    # E.2.8: per-order latency above this threshold is treated as a soft
+    # execution error and feeds the consecutive-error counter. Default
+    # disabled (inf) on testnet because testnet latency varies wildly;
+    # mainnet operators should set ~3000ms.
+    kill_switch_latency_ms: float = float("inf")
     network_outage_seconds: int = 120         # halt if no WS messages for this long
     max_consecutive_empty_bars: int = 3       # trip kill switch after N bars with zero trades
     min_perp_trades_per_bar: int = 5          # skip signal if bar has fewer perp trades

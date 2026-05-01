@@ -22,6 +22,7 @@ When tripped, the engine:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Callable
 
@@ -140,6 +141,38 @@ class KillSwitch:
                     f"{self._consecutive_errors} consecutive execution errors "
                     f"(threshold {self.max_consecutive_errors})",
                 )
+
+    def on_latency_breach(
+        self,
+        *,
+        total_ms: float,
+        threshold_ms: float,
+        instrument_name: str = "",
+    ) -> None:
+        """Record a latency breach. Trips the kill switch on consecutive
+        breaches above ``max_consecutive_errors`` (we treat latency
+        breaches identically to execution errors — both signal venue
+        degradation that warrants halting). Single isolated breaches
+        WARN but don't trip — the venue can hiccup for a single order
+        without indicating systemic failure.
+
+        E.2.8 in plan ``starry-rolling-rabin.md``.
+        """
+        if not (math.isfinite(total_ms) and total_ms > threshold_ms):
+            return
+        # Treat as a soft error — feeds into the consecutive-error path.
+        self._consecutive_errors += 1
+        logger.warning(
+            "Latency breach: %s took %.0fms (threshold %.0fms) — "
+            "consecutive=%d/%d",
+            instrument_name or "order", total_ms, threshold_ms,
+            self._consecutive_errors, self.max_consecutive_errors,
+        )
+        if self._consecutive_errors >= self.max_consecutive_errors:
+            self.trip(
+                f"{self._consecutive_errors} consecutive latency breaches "
+                f"(latest {total_ms:.0f}ms > {threshold_ms:.0f}ms)",
+            )
 
     def trip(
         self,

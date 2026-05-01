@@ -51,6 +51,13 @@ from deribit_paper.signal.predictor import Signal
 
 logger = logging.getLogger(__name__)
 
+# E.3.3 (2026-05-01): single source of truth for the "is this scale
+# meaningfully > 1.0 / != 0.0" epsilon used across the sizing chain.
+# Previously: 1e-9 in some clamps, 1e-12 in others, 1e-6 in slip helper.
+# Unifying at 1e-9 is enough to filter floating-point comparison noise
+# without rejecting legitimately-tight sizing values.
+_SCALE_EPS: float = 1e-9
+
 
 @dataclass
 class TradeOutcome:
@@ -182,6 +189,16 @@ class StraddleFlow:
 
         n = equity * dynamic_margin / (self._im_fraction * spot)
 
+        # Per-bar dynamic BTC cap (E.2.6 2026-05-01) — captured BEFORE
+        # any multiplier so we can re-clip after profit_scale and after
+        # Kelly. Mirrors backtester at ``vol_arb/backtester.py:1994 +
+        # 2005`` where N is re-clipped against ``dynamic_btc_cap[i]``
+        # at each Kelly / profit_scaling step. Pre-E.2.6 the live
+        # engine only re-clipped against ``self._max_trade_size``
+        # (static cap) — Kelly could push N past the bar's dynamic
+        # margin envelope.
+        dynamic_btc_cap = float(n)
+
         # Participation cap (skipped if volume unknown)
         if trailing_1h_volume_btc is not None and trailing_1h_volume_btc > 0:
             cap = trailing_1h_volume_btc * self._max_participation
@@ -213,20 +230,23 @@ class StraddleFlow:
         # Caller passes 1.0 when ``use_profit_scaling`` is off, so the
         # default preset is byte-id with the pre-E.1.1 behaviour. Clip
         # defensively to a safe band even though the estimator already
-        # bounds its output.
-        if 0.0 < profit_scale < 1.0 - 1e-12:
+        # bounds its output. Re-clip against dynamic_btc_cap (E.2.6).
+        if 0.0 < profit_scale < 1.0 - _SCALE_EPS:
             n *= float(np.clip(profit_scale, 0.05, 1.0))
+            n = min(n, dynamic_btc_cap)
 
         # 6. Kelly K1 multiplier (upside-only, applied AFTER edge/dd/liq
         # /profit_scale). Caller passes 1.0 when the sidecar is missing
         # / signal is short / bar timestamp falls outside sidecar
         # coverage. The backtester short-circuits on ``km > 1.0`` so the
         # size_mult arithmetic is a no-op at floor=1.0; we mirror that
-        # exactly.
-        if kelly_mult > 1.0 + 1e-12:
+        # exactly. Re-clip against dynamic_btc_cap so Kelly can never
+        # breach the bar's margin envelope (E.2.6).
+        if kelly_mult > 1.0 + _SCALE_EPS:
             n *= kelly_mult
+            n = min(n, dynamic_btc_cap)
 
-        # Hard cap
+        # Hard cap (static — final risk envelope)
         n = min(n, self._max_trade_size)
 
         # Quantise to option increment

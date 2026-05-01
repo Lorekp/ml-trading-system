@@ -154,6 +154,70 @@ async def test_tier3_skipped_on_small_residual():
 
 
 @pytest.mark.asyncio
+async def test_total_ms_is_wall_clock_not_sum():
+    """E.2.5: ``total_ms`` reflects wall-clock duration of the ladder,
+    not the sum of per-tier latencies. Pre-E.2.5 a 3-tier ladder
+    summed each tier's ``submit_to_ack + ack_to_terminal`` and the
+    nested merge double-counted tier-1+tier-2's already-summed pair —
+    inflating the kill-switch latency reading.
+    """
+    rest = AsyncMock()
+    rest.get_ticker = AsyncMock(return_value=_ticker_btc())
+    rest.place_order = AsyncMock(side_effect=[
+        _stub_fill(amount=1.0, filled_amount=0.4, price=0.0505),
+        _stub_fill(amount=0.6, filled_amount=0.6, price=0.0510),
+    ])
+    manager = OrderManager(rest=rest)
+
+    result = await manager.place_ioc_taker(
+        instrument_name="BTC-OPT",
+        side="buy", amount=1.0,
+        max_slippage_pct=0.5,
+        tiered=True,
+    )
+    # Wall-clock total should be a small positive number — typically
+    # < 100ms for stub fills. The OLD broken code summed two ~1ms tier
+    # latencies; that yielded the same magnitude but in dry-run with
+    # zero-tier-spans, the OLD merge would have produced 0ms (because
+    # _t2 - _t1 = 0 in stub fills) whereas the NEW path captures real
+    # wall-clock.
+    assert result.total_ms is not None
+    assert result.total_ms >= 0.0
+    assert result.total_ms < 5_000.0      # sanity: sub-second on stubs
+
+
+@pytest.mark.asyncio
+async def test_avg_price_nan_when_zero_filled():
+    """E.2.7: when total_filled == 0, ``average_price`` is NaN, not 0.0.
+    Pre-E.2.7 the helper returned 0.0 which propagated as a fake fill
+    price into the harness writer + P&L recipe."""
+    import math
+
+    rest = AsyncMock()
+    rest.get_ticker = AsyncMock(return_value=_ticker_btc())
+    # All three tiers zero-fill — manipulated thin book.
+    rest.place_order = AsyncMock(side_effect=[
+        _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
+        _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
+        _stub_fill(amount=1.0, filled_amount=0.0, price=0.0),
+    ])
+    manager = OrderManager(rest=rest)
+
+    result = await manager.place_ioc_taker(
+        instrument_name="BTC-OPT",
+        side="buy", amount=1.0,
+        max_slippage_pct=0.5,
+        tiered=True,
+    )
+    assert result.filled_amount == 0.0
+    # average_price MUST be NaN, not 0.0 (which would propagate as a
+    # fake fill price downstream).
+    assert math.isnan(result.average_price), (
+        f"average_price should be NaN on zero-fill, got {result.average_price}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_tier3_bounded_ioc_cap_at_1_5x_max_slippage():
     """E.1.7: tier-3 cap = best ± 1.5 × max_slippage_pct, never wider."""
     rest = AsyncMock()

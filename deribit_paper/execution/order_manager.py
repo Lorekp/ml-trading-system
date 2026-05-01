@@ -27,7 +27,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from deribit_paper.client.errors import (
     DeribitError,
@@ -56,8 +56,15 @@ def _merge_tier_results(a: "OrderResult", b: "OrderResult") -> "OrderResult":
     Returns a fresh :class:`OrderResult` whose ``client_order_id``,
     ``order_id`` and ``state`` come from ``b`` (the latest tier);
     ``filled_amount`` is the sum, ``average_price`` is the size-weighted
-    mean, and the latency fields reflect the SUM of both tiers'
-    ``total_ms``. Used by ``_place_tiered_taker``.
+    mean.
+
+    Latency contract (E.2.5 2026-05-01): per-tier ``submit_to_ack_ms``
+    and ``ack_to_terminal_ms`` reflect the LAST tier's call (``b``).
+    The aggregate ``total_ms`` is set to ``None`` here — the wall-clock
+    total is stamped by ``_place_tiered_taker`` from a single
+    ``perf_counter_ns`` captured before tier-1 starts. Pre-E.2.5 this
+    summed across tiers and a nested merge double-counted, producing
+    misleading kill-switch numbers.
     """
     total_filled = a.filled_amount + b.filled_amount
     if total_filled > 0:
@@ -65,14 +72,11 @@ def _merge_tier_results(a: "OrderResult", b: "OrderResult") -> "OrderResult":
             a.average_price * a.filled_amount + b.average_price * b.filled_amount
         ) / total_filled
     else:
-        avg_px = 0.0
-    submit_to_ack = (
-        (a.submit_to_ack_ms or 0.0) + (b.submit_to_ack_ms or 0.0)
-    )
-    ack_to_term = (
-        (a.ack_to_terminal_ms or 0.0) + (b.ack_to_terminal_ms or 0.0)
-    )
-    total_ms = (a.total_ms or 0.0) + (b.total_ms or 0.0)
+        # Pre-E.2.7: returned 0.0 here, propagating a fake fill price
+        # downstream. NaN is the unambiguous "no fill" signal that
+        # downstream consumers (HarnessWriter._avg_price, P&L recipe)
+        # already handle via NaN checks.
+        avg_px = float("nan")
     return OrderResult(
         client_order_id=b.client_order_id,
         order_id=b.order_id,
@@ -85,9 +89,9 @@ def _merge_tier_results(a: "OrderResult", b: "OrderResult") -> "OrderResult":
         is_dry_run=a.is_dry_run or b.is_dry_run,
         error=b.error if b.state not in {"filled"} else None,
         raw=b.raw,
-        submit_to_ack_ms=submit_to_ack,
-        ack_to_terminal_ms=ack_to_term,
-        total_ms=total_ms,
+        submit_to_ack_ms=b.submit_to_ack_ms,
+        ack_to_terminal_ms=b.ack_to_terminal_ms,
+        total_ms=None,                  # set by _place_tiered_taker post-merge
     )
 
 
@@ -135,12 +139,20 @@ class OrderManager:
         fill_poll_seconds: float = 1.5,
         max_rejection_retries: int = 2,
         retry_backoff_seconds: float = 2.0,
+        latency_threshold_ms: float = float("inf"),
+        on_latency_breach: "Callable[[float, float, str], None] | None" = None,
     ):
         self._rest = rest
         self._guard = idempotency_guard or IdempotencyGuard()
         self._fill_poll_seconds = fill_poll_seconds
         self._max_rejection_retries = max_rejection_retries
         self._retry_backoff_seconds = retry_backoff_seconds
+        # E.2.8: optional latency-breach callback. Engine wires this to
+        # ``KillSwitch.on_latency_breach``; OrderManager calls it with
+        # ``(total_ms, threshold_ms, instrument_name)`` after each order
+        # whose ``total_ms`` exceeds the threshold.
+        self._latency_threshold_ms = float(latency_threshold_ms)
+        self._on_latency_breach = on_latency_breach
 
     async def place_and_wait(
         self,
@@ -171,9 +183,12 @@ class OrderManager:
 
         # ── Latency telemetry start (V2 wiring, I3 2026-04-26) ──
         # Capture wall-clock submit-to-ack and total latencies on every
-        # order. Useful for diagnosing live-vs-backtest fill drift and
-        # for the kill-switch threshold (plumbed but disabled on
-        # testnet — testnet latency is meaningless).
+        # order. Used by the kill-switch latency threshold (E.2.8
+        # 2026-05-01): when ``total_ms > cfg.kill_switch_latency_ms``,
+        # ``self._on_latency_breach`` calls ``KillSwitch.on_latency_breach``
+        # which feeds the consecutive-error counter. Testnet ships
+        # ``kill_switch_latency_ms=inf`` (effectively disabled because
+        # testnet latency varies wildly); mainnet operators set ~3000ms.
         _t0_submit_ns = time.perf_counter_ns()
 
         # Idempotency check — don't double-send the same label
@@ -200,6 +215,14 @@ class OrderManager:
         last_error: str | None = None
         while attempt <= self._max_rejection_retries:
             attempt += 1
+            # E.3.2 (2026-05-01): re-stamp ``_t0_submit_ns`` BEFORE
+            # each retry attempt so ``submit_to_ack_ms`` reflects only
+            # the latest attempt's network round-trip — not the sum of
+            # all retries plus their backoff sleeps. Pre-E.3.2 a
+            # rejected order with 2× retries inflated the latency
+            # number by ~4-6 seconds of sleep, drowning the real
+            # network signal under retry-delay noise.
+            _t0_submit_ns = time.perf_counter_ns()
             try:
                 submit_result = await self._rest.place_order(
                     instrument_name=instrument_name,
@@ -304,6 +327,16 @@ class OrderManager:
                 "Deribit congestion / network",
                 label, result.submit_to_ack_ms,
             )
+        # E.2.8: latency-breach callback (engine wires to KillSwitch).
+        if (self._on_latency_breach is not None
+                and result.total_ms is not None
+                and result.total_ms > self._latency_threshold_ms):
+            try:
+                self._on_latency_breach(
+                    result.total_ms, self._latency_threshold_ms, instrument_name,
+                )
+            except Exception:                  # noqa: BLE001 - callback non-critical
+                logger.exception("on_latency_breach callback raised")
         return result
 
     # ── Smart taker execution ─────────────────────────────────
@@ -429,6 +462,15 @@ class OrderManager:
         if label is None:
             label = new_client_order_id()
 
+        # E.2.5: capture wall-clock start so the merged total_ms reflects
+        # actual elapsed time across all tiers, not the sum of per-tier
+        # spans (which double-counted on nested merges).
+        _ladder_t0_ns = time.perf_counter_ns()
+
+        def _stamp_total(result: OrderResult) -> OrderResult:
+            result.total_ms = (time.perf_counter_ns() - _ladder_t0_ns) / 1e6
+            return result
+
         # Lookup the current touch + spread for tier-1 / tier-2 caps.
         try:
             ticker = await self._rest.get_ticker(instrument_name)
@@ -437,13 +479,13 @@ class OrderManager:
                 "Tiered IOC: get_ticker(%s) failed (%s) -- jumping to market",
                 instrument_name, exc,
             )
-            return await self.place_and_wait(
+            return _stamp_total(await self.place_and_wait(
                 instrument_name=instrument_name,
                 side=side, amount=amount,
                 order_type="market",
                 label=label, reduce_only=reduce_only,
                 timeout_seconds=30.0,
-            )
+            ))
 
         tick = 0.0005   # Deribit option tick size in BTC.
         if side == "buy":
@@ -460,13 +502,13 @@ class OrderManager:
                 "Tiered IOC: no valid quote for %s -- jumping to market",
                 instrument_name,
             )
-            return await self.place_and_wait(
+            return _stamp_total(await self.place_and_wait(
                 instrument_name=instrument_name,
                 side=side, amount=amount,
                 order_type="market",
                 label=label, reduce_only=reduce_only,
                 timeout_seconds=30.0,
-            )
+            ))
 
         # ── Tier 1 ──
         logger.info(
@@ -483,7 +525,7 @@ class OrderManager:
         )
         residual = amount - r1.filled_amount
         if residual <= 1e-9:
-            return r1
+            return _stamp_total(r1)
 
         # ── Tier 2 ──
         logger.info(
@@ -501,7 +543,7 @@ class OrderManager:
         residual2 = residual - r2.filled_amount
         if residual2 <= 1e-9:
             # Aggregate filled_amount + average_price across tiers 1+2.
-            return _merge_tier_results(r1, r2)
+            return _stamp_total(_merge_tier_results(r1, r2))
 
         # ── Tier 3 (bounded IOC, never naked market — E.1.7) ──
         # Pre-E.1.7 this dropped to a naked market order, defeating the
@@ -518,7 +560,7 @@ class OrderManager:
                 "%.4f — tail too small to risk market fill)",
                 side, instrument_name, residual2, amount,
             )
-            return _merge_tier_results(r1, r2)
+            return _stamp_total(_merge_tier_results(r1, r2))
 
         if side == "buy":
             tier3_cap = round((best * (1.0 + 1.5 * max_slippage_pct / 100.0)) / tick) * tick
@@ -548,7 +590,7 @@ class OrderManager:
                 side, instrument_name, residual2, r3.filled_amount,
                 tier3_cap,
             )
-        return _merge_tier_results(_merge_tier_results(r1, r2), r3)
+        return _stamp_total(_merge_tier_results(_merge_tier_results(r1, r2), r3))
 
     async def place_chunked_taker(
         self,

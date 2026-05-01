@@ -39,7 +39,12 @@ def _make_flow(*, max_trade_size: float = 2.0) -> StraddleFlow:
 
 @pytest.fixture
 def base_args() -> dict:
-    """Sizing inputs that yield a baseline notional well below the hard cap."""
+    """Sizing inputs that yield a baseline notional well below the
+    dynamic_btc_cap envelope. ``edge_scale=0.5`` (edge_vp half the
+    rolling median) leaves Kelly room to grow within the envelope —
+    necessary post-E.2.6 since Kelly is now re-clipped against
+    dynamic_btc_cap so it can never breach the bar's margin envelope.
+    """
     return dict(
         equity=100_000.0,            # USD
         signal_direction=1,           # LONG
@@ -47,8 +52,8 @@ def base_args() -> dict:
         trailing_1h_volume_btc=None,  # no participation cap
         liq_scale=1.0,
         dvol_pct=50.0,                # baseline DVOL → dynamic_margin = target_margin
-        edge_vp=10.0,
-        rolling_median_edge=10.0,     # edge_scale = 1.0
+        edge_vp=5.0,                  # half rolling median → edge_scale = 0.5
+        rolling_median_edge=10.0,
         peak_equity=100_000.0,        # no DD
     )
 
@@ -163,3 +168,34 @@ def test_profit_scale_clipped_safety_band(base_args):
     # Either way, never negative or NaN.
     assert n >= 0.0
     assert np.isfinite(n)
+
+
+# ── E.2.6: Kelly re-clip against dynamic_btc_cap ─────────────────────────
+
+
+def test_kelly_cannot_exceed_dynamic_btc_cap(base_args):
+    """A high edge_scale could push N above the bar's dynamic margin
+    envelope; Kelly on top would compound the breach. The dynamic cap
+    re-clip at the Kelly step keeps N within the envelope.
+    """
+    flow = _make_flow(max_trade_size=100.0)         # high static cap
+    # Compute the dynamic envelope manually: equity*0.15/0.20/spot
+    # for default V2 leverage (target_margin_util=0.15, im=0.20).
+    spot = base_args["spot"]
+    equity = base_args["equity"]
+    expected_envelope = equity * 0.15 / 0.20 / spot
+    # Now boost with high edge + Kelly together.
+    high_edge_args = {
+        **base_args,
+        "edge_vp": 30.0,           # 3× rolling median → edge_scale=3
+        "rolling_median_edge": 10.0,
+    }
+    n_kelly_boosted = flow.size_position(
+        **high_edge_args, kelly_mult=2.0,
+    )
+    # Kelly (2.0) × edge_scale (3.0) = 6× pre-cap. Without dynamic
+    # re-clip, would be ~6× envelope; with re-clip, capped at envelope.
+    assert n_kelly_boosted <= expected_envelope + 0.1, (
+        f"Kelly+edge product n={n_kelly_boosted:.3f} BTC exceeded "
+        f"dynamic envelope {expected_envelope:.3f} BTC."
+    )

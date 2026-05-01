@@ -279,12 +279,27 @@ class Predictor:
         ``svi_term_slope_1w_2w = svi_atm_2w - svi_atm_1w``. Both legs in
         percent. Returns ``None`` when SVI hasn't calibrated yet so the
         caller can pass through (don't suppress signals during warmup).
+
+        E.2.12 (2026-05-01): also returns ``None`` when either leg is
+        exactly zero — a degenerate calibration that produces a
+        spurious large-magnitude slope (e.g. zero 1w + 70 2w → +70vp
+        slope incorrectly tripping the contango filter). Treat as
+        warmup-equivalent and pass through.
         """
         if not self._svi.has_params:
             return None
-        atm_1w = self._svi.atm_vol_at_dte(7.0)
-        atm_2w = self._svi.atm_vol_at_dte(14.0)
+        try:
+            atm_1w = float(self._svi.atm_vol_at_dte(7.0))
+            atm_2w = float(self._svi.atm_vol_at_dte(14.0))
+        except (TypeError, ValueError):
+            return None
         if not (math.isfinite(atm_1w) and math.isfinite(atm_2w)):
+            return None
+        if atm_1w <= 0.0 or atm_2w <= 0.0:
+            logger.warning(
+                "SVI atm_vol degenerate (1w=%s 2w=%s) — bypassing slope",
+                atm_1w, atm_2w,
+            )
             return None
         return float(atm_2w - atm_1w)
 

@@ -241,6 +241,23 @@ def test_lookup_empty_dict_returns_zero():
     assert lookup_beta_for_month({}, ts, fallback_zero_warn=False) == 0.0
 
 
+def test_lookup_skips_malformed_keys():
+    """E.3.1: malformed keys (no zero-pad) sort wrong via lex; skip them.
+
+    ``2026-1`` (1-digit month) would otherwise sort BEFORE ``2026-02``
+    via the simple lex comparator. The validated regex skips it so the
+    lookup still finds ``2026-02`` for a March query.
+    """
+    betas = {
+        "2026-1": 0.99,           # malformed — skip
+        "2026-02": 0.05,          # valid
+        "garbage": -1.0,          # malformed — skip
+    }
+    ts = pd.Timestamp("2026-03-15", tz="UTC")
+    # Walk-forward: most-recent valid ≤ 2026-03 is 2026-02.
+    assert lookup_beta_for_month(betas, ts, fallback_zero_warn=False) == pytest.approx(0.05)
+
+
 # ── load_kelly_mult_series + lookup_kelly_mult_at ────────────────────────
 
 def test_kelly_mult_series_returns_none_for_missing(target_index):
@@ -361,6 +378,39 @@ def test_betas_skips_non_numeric_values(tmp_path):
     }))
     out = load_aligner_betas(p)
     assert out == {"2026-03": pytest.approx(0.05)}
+
+
+def test_load_aligner_betas_handles_tz_naive_parquet(tmp_path):
+    """E.3.4: tz-naive parquet → load_aligner_betas localizes to UTC.
+    Locks the contract that ``df.index = pd.to_datetime(df.index, utc=True)``
+    applies even when the source is naive (``utc=True`` forces UTC).
+    """
+    naive_idx = pd.date_range("2026-01-01", periods=3, freq="15D")
+    df = pd.DataFrame(
+        {"y_pred": [-1.95, -1.95, -1.95], "y_pred_raw": [-2.0, -2.0, -2.0]},
+        index=naive_idx,
+    )
+    p = tmp_path / "naive.parquet"
+    df.to_parquet(p)
+    out = load_aligner_betas(p)
+    # Expect at least one month entry, no crash, all values in band.
+    assert out
+    for k, v in out.items():
+        assert -0.5 <= v <= 0.5
+
+
+def test_load_kelly_mult_handles_tz_naive_sidecar(tmp_path, target_index):
+    """E.2.11: defensive UTC normalisation. A sidecar saved with a
+    tz-naive index would silently fail to reindex against tz-aware
+    target_index pre-fix; now it normalises before reindex."""
+    naive_idx = pd.date_range("2026-01-01 00:00", periods=8, freq="15min")
+    df = pd.DataFrame({"size_mult": [1.5] * 8}, index=naive_idx)
+    p = tmp_path / "k_naive.parquet"
+    df.to_parquet(p)
+
+    arr = load_kelly_mult(p, target_index)
+    assert arr is not None
+    np.testing.assert_array_equal(arr, [1.5] * 8)
 
 
 def test_betas_non_finite_substituted_with_zero(tmp_path):

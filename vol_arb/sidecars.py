@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -82,6 +83,11 @@ def load_kelly_mult(
         return None
 
     df = pd.read_parquet(p)
+    # E.2.11: defensive UTC normalisation. ``load_bar_exec_slip`` and
+    # ``load_kelly_mult_series`` both do this; the array-aligned
+    # ``load_kelly_mult`` was missing it, so a tz-naive sidecar would
+    # silently fail to reindex against a tz-aware ``target_index``.
+    df.index = pd.to_datetime(df.index, utc=True)
     if "size_mult" in df.columns:
         ser = df["size_mult"]
     else:
@@ -330,6 +336,9 @@ def load_aligner_betas(
     return out
 
 
+_YYYY_MM_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
 def lookup_beta_for_month(
     betas: dict[str, float],
     timestamp: pd.Timestamp,
@@ -346,29 +355,43 @@ def lookup_beta_for_month(
        where the sidecar lags real time by a month or two.
     3. Otherwise, return ``0.0`` (no correction). Logs a warning unless
        ``fallback_zero_warn`` is False.
+
+    E.3.1 (2026-05-01): keys are validated against ``\\d{4}-\\d{2}``
+    before the lex comparison. A malformed key like ``2026-1`` (no
+    zero-pad) would sort incorrectly via the simple lex comparator.
+    Bad keys are skipped + logged at WARN.
     """
     if not betas:
         if fallback_zero_warn:
             logger.warning("aligner betas dict empty — returning β*=0.0")
         return 0.0
 
-    key = timestamp.strftime("%Y-%m")
-    if key in betas:
-        return float(betas[key])
+    # Filter to only valid YYYY-MM keys for the comparison.
+    valid_betas = {k: v for k, v in betas.items() if _YYYY_MM_RE.match(k)}
+    if len(valid_betas) != len(betas):
+        bad = set(betas) - set(valid_betas)
+        logger.warning(
+            "aligner β* dict contains %d malformed keys %s — skipped",
+            len(bad), sorted(bad)[:5],
+        )
 
-    earlier = sorted(k for k in betas if k <= key)
+    key = timestamp.strftime("%Y-%m")
+    if key in valid_betas:
+        return float(valid_betas[key])
+
+    earlier = sorted(k for k in valid_betas if k <= key)
     if earlier:
         chosen = earlier[-1]
         logger.info(
             "aligner β* fallback: %s not in sidecar, using nearest prior %s (β=%+.4f)",
-            key, chosen, betas[chosen],
+            key, chosen, valid_betas[chosen],
         )
-        return float(betas[chosen])
+        return float(valid_betas[chosen])
 
     if fallback_zero_warn:
         logger.warning(
             "aligner β* fallback exhausted for %s (sidecar starts at %s) — β*=0.0",
-            key, min(betas.keys()),
+            key, min(valid_betas.keys()) if valid_betas else "<none>",
         )
     return 0.0
 

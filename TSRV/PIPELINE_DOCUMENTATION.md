@@ -21,6 +21,32 @@ threshold sweep results across all trained timeframes (5m, 30m, 60m, 240m, 480m,
 Best NC Sharpe per TF, optimal threshold, trade count, drawdown, and profit factor for
 each timeframe. Unified sweep script: `scripts/sweep_all_tfs.py`.
 
+### Metric definitions used throughout this doc
+
+The same Sharpe-style number appears across stages with different
+scales — sometimes labelled the same way. Disambiguating up front:
+
+* **Daily Sharpe** = `mean(daily_pnl) / std(daily_pnl) × √252`. Standard
+  finance convention. Computed by `vol_arb/metrics.py:813::daily_sharpe`.
+  Used in compound P&L tearsheets (Stage 13.3, Stage 18.3, Stage 24.3
+  headline numbers when "Compound Sharpe" is referenced).
+* **NC Trade Sharpe** = `mean(per_trade_pnl) / std × √(n_trades / years)`.
+  Annualised per-trade Sharpe. Computed by
+  `vol_arb/metrics.py:809::trade_sharpe`. This is the canonical "NC
+  Sharpe" used in Stages 18-29 result tables (e.g. Stage 24's "NC
+  Sharpe (trade) 12.56", Stage 29's "NC Sharpe 7.23 → 6.29").
+  Numerically: for ~8000 trades / 4.25 years, the √(n/years) annualiser
+  is ~43, so a per-trade z-score of ~0.29 produces ~12.5.
+* **"Trade-only Sharpe"** as cited in some 2026-04 audit-era memory
+  entries (e.g. Stage 25's "53 → 51") is a DIFFERENT computation done
+  in an audit notebook, not via the canonical metrics path. It uses a
+  finer-grained normalisation that produces a much larger number; do
+  NOT directly compare it to the metrics.py `trade_sharpe` values.
+  When you see "53 → 51" in Stage 25, read it as "essentially same
+  signal quality" — that's all the audit was claiming.
+* **Sortino, Calmar, Profit Factor, MDD** all match the standard
+  conventions as implemented in `vol_arb/metrics.py`.
+
 ---
 
 ## Stage 1: Data Ingestion
@@ -4058,8 +4084,18 @@ are unchanged; only the backtester's hold loop changed.
 | Metric | Pre-fix (hold=30) | **Post-fix (hold=15)** | Δ |
 |---|---|---|---|
 | NC PnL | $726K | **$575K** | -21% |
-| NC Trade Sharpe | 53 | 51 | essentially same |
+| NC Trade Sharpe<sup>†</sup> | 53 | 51 | essentially same |
 | NC MDD | -4.65% | -4.65% | unchanged |
+
+<sup>†</sup> The "53 → 51" numbers come from the foundation-fix
+audit notebook, NOT the canonical
+`vol_arb/metrics.py:trade_sharpe` formula used elsewhere in this
+doc (e.g. Stage 24's "12.56", Stage 29's "7.23 → 6.29"). The audit
+script's normalisation is finer-grained and produces a substantially
+larger number; the only valid reading is "essentially same signal
+quality" — do NOT directly compare to the canonical NC Trade Sharpe.
+See "Metric definitions used throughout this doc" in the System
+Overview for full disambiguation.
 
 The $150K we lost wasn't real edge — it was un-forecast vega-time noise.
 Trade-only Sharpe of 51 (vs 53) shows the **signal quality** is

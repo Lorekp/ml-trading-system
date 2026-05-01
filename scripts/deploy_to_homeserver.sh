@@ -91,8 +91,27 @@ SOURCE_FILES=(
     "deribit_paper/features/svi_live.py"
     "deribit_paper/features/tsrv_live.py"
     "deribit_paper/features/straddle.py"
-    "deribit_paper/features/strike_picker.py"
     "deribit_paper/features/vpin_live.py"
+
+    # Live engine — Deribit client (REST + WS + auth)
+    "deribit_paper/client/__init__.py"
+    "deribit_paper/client/auth.py"
+    "deribit_paper/client/errors.py"
+    "deribit_paper/client/rest.py"
+    "deribit_paper/client/ws.py"
+
+    # Live engine — market data (bar clock, aggregator, buffers, subscriber)
+    "deribit_paper/market_data/__init__.py"
+    "deribit_paper/market_data/aggregator.py"
+    "deribit_paper/market_data/bar_clock.py"
+    "deribit_paper/market_data/buffer.py"
+    "deribit_paper/market_data/subscriber.py"
+
+    # Live engine — position state (equity, store, tracker)
+    "deribit_paper/position/__init__.py"
+    "deribit_paper/position/equity.py"
+    "deribit_paper/position/store.py"
+    "deribit_paper/position/tracker.py"
 
     # Live engine — risk + monitoring
     "deribit_paper/risk/__init__.py"
@@ -103,8 +122,12 @@ SOURCE_FILES=(
     "deribit_paper/monitoring/__init__.py"
     "deribit_paper/monitoring/harness_writer.py"        # C6 + E.1.3
     "deribit_paper/monitoring/logger.py"
-    "deribit_paper/monitoring/metrics.py"
+    "deribit_paper/monitoring/metrics_sink.py"
     "deribit_paper/monitoring/telegram.py"
+
+    # Live engine — engine-internal scripts
+    "deribit_paper/scripts/__init__.py"
+    "deribit_paper/scripts/validate_dry_run.py"
 
     # Scripts (sidecar refresh + harness + beta extract)
     "scripts/extract_aligner_betas.py"                 # C2

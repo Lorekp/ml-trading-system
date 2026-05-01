@@ -1,0 +1,8 @@
+{
+  "policy": "production_sac_v4_final.zip",
+  "bar_minutes": 15,
+  "n_steps_per_episode": 10,
+  "trained_on": "BTCUSDT 15m bars, 5M training steps",
+  "adopted": "2026-04-12 (W5 v4 promotion)",
+  "notes": "If you re-train at a different bar interval, copy this manifest and update bar_minutes; engine.py will WARN at startup if bar_minutes != cfg.bar_minutes."
+}

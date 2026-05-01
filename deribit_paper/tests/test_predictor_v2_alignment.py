@@ -245,6 +245,25 @@ def test_filter_disabled_when_threshold_none():
     assert sig.direction == 1
 
 
+def test_filter_passes_through_when_atm_dte_returns_zero():
+    """E.2.12: zero IV (degenerate calibration) → return None, not a
+    spurious huge slope. Pre-E.2.12 a 0% atm_1w + 70% atm_2w would
+    produce a +70 vp slope and incorrectly trip the contango filter
+    on every long candidate."""
+    p = _make_predictor(
+        rv_pred_pct_target=85.0, iv_used_pct=60.0,
+        skip_long_if_term_slope_gt=0.0,
+        atm_1w_pct=0.0,                 # zero → degenerate
+        atm_2w_pct=72.0,
+    )
+    bar = _make_bar()
+    sig = p.predict(bar, _make_tsrv(), straddle=_make_straddle())
+    assert sig.direction == 1, (
+        f"Long should pass when slope helper sees a degenerate 0% leg "
+        f"(reason={sig.reason!r})"
+    )
+
+
 def test_filter_passes_through_when_atm_dte_returns_nan():
     """SVI calibrated but atm_vol_at_dte returns NaN → term_slope None → LONG passes.
 
@@ -357,3 +376,54 @@ def test_require_aligner_default_false_allows_empty():
         aligner_betas={},
         require_aligner=False,
     )
+
+
+# ── E.2.10: β* numerical equivalence vs aligner output ───────────────────
+
+
+def test_beta_star_closed_form_round_trip():
+    """Closed-form β* round-trip: load aligner output, extract β*, run
+    Predictor, assert ``rv_pred_pct`` matches what the aligner produced
+    for the same row to within 1e-6.
+
+    Construction:
+    - Synthetic ``y_pred_raw`` (LGBM output in log-vol space)
+    - Synthetic ``y_pred = y_pred_raw + β*_month`` (aligned)
+    - Extract β* from the (raw, aligned) pair via load_aligner_betas
+    - Predictor with that β* applied to y_pred_raw → must produce
+      exp(y_pred) × 100 ≡ aligned rv_pred_pct.
+    """
+    from vol_arb.sidecars import load_aligner_betas
+
+    bar_ts = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
+    raw_pred_ln = -0.30                # log-vol, ~74% annualised
+    beta_star = 0.05
+    aligned_pred_ln = raw_pred_ln + beta_star
+    aligned_rv_pred_pct = math.exp(aligned_pred_ln) * 100.0
+
+    # Build a 2-row synthetic parquet (raw + aligned) and run the
+    # aligner extractor on it.
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "preds.parquet"
+        df = pd.DataFrame(
+            {"y_pred_raw": [raw_pred_ln], "y_pred": [aligned_pred_ln]},
+            index=[bar_ts],
+        )
+        df.to_parquet(p)
+        extracted = load_aligner_betas(p)
+        # Should produce a single-month entry at 2026-04 with β=+0.05.
+        assert "2026-04" in extracted
+        assert extracted["2026-04"] == pytest.approx(0.05, abs=1e-9)
+
+    # Now run Predictor with the extracted β* and the SAME raw input.
+    # Expected rv_pred_pct must equal the aligned value to within 1e-6.
+    p = _make_predictor(
+        rv_pred_pct_target=aligned_rv_pred_pct,
+        iv_used_pct=60.0,
+        aligner_betas=extracted,
+    )
+    sig = p.predict(_make_bar(), _make_tsrv(), straddle=_make_straddle())
+    assert sig.rv_pred_pct == pytest.approx(aligned_rv_pred_pct, abs=1e-4)

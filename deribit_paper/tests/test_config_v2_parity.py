@@ -156,3 +156,44 @@ def test_v2_preset_predictions_path_matches_backtest_default(v2_paper, v2_backte
     backtester's predictions_path (both consume the same aligner output).
     """
     assert v2_paper.aligned_predictions_parquet == v2_backtest.predictions_path
+
+
+# ── E.2.1: predictions parquet bar frequency matches holding_minutes ──────
+
+
+def test_aligned_predictions_bar_frequency_matches_holding_minutes(v2_paper):
+    """Foundation-fix invariant on the LIVE side. Mirrors
+    ``tests/test_backtester_config.py::test_v2_preset_horizon_matches_holding_minutes``
+    but loads the parquet and infers bar frequency from the index.
+
+    A 5-min predictions parquet paired with ``holding_minutes=15`` would
+    silently throw away two-thirds of the predictor's information.
+    Catching at startup is much cheaper than the ~$150K loss the
+    foundation-fix fixed in 2026-04-17 (memory:project_foundation_fix).
+    """
+    from pathlib import Path
+
+    import pandas as pd
+    import pytest as _pt
+
+    p = Path(v2_paper.aligned_predictions_parquet)
+    if not p.exists():
+        _pt.skip(f"{p} not on disk in this checkout — skipping runtime check")
+
+    df = pd.read_parquet(p, columns=[])  # index only — fast
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df) < 100:
+        _pt.skip(
+            f"{p} index is not a DatetimeIndex or too short — skipping check"
+        )
+
+    # Sample the first 500 spacing diffs; mode is the bar duration.
+    diffs = df.index[1:501] - df.index[:500]
+    seconds = diffs.total_seconds().astype(int)
+    bar_seconds_inferred = int(pd.Series(seconds).mode().iloc[0])
+    expected_bar_seconds = v2_paper.holding_minutes * 60
+    assert bar_seconds_inferred == expected_bar_seconds, (
+        f"Predictions parquet at {p.name} has bar spacing "
+        f"{bar_seconds_inferred}s != holding_minutes×60 = "
+        f"{expected_bar_seconds}s. Re-introduces the foundation-fix "
+        f"failure mode (model-horizon != backtester-hold)."
+    )

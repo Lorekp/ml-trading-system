@@ -323,6 +323,43 @@ class TradingEngine:
                 len(aligner_betas),
                 min(aligner_betas.keys()), max(aligner_betas.keys()),
             )
+            # ── E.2.3: staleness alert + soft refusal ──
+            # The aligner sidecar is regenerated monthly. Stale > 1
+            # month → WARN (degraded but trading continues). Stale > 2
+            # months under V2 preset → refuse to start (the live engine
+            # is silently using a β* that hasn't seen recent regime
+            # data; better to halt than to ship biased predictions).
+            try:
+                latest_month_str = max(aligner_betas.keys())
+                latest_month = pd.Period(latest_month_str, freq="M")
+                now_month = pd.Period(
+                    pd.Timestamp.now(tz="UTC"), freq="M",
+                )
+                gap_months = (now_month - latest_month).n
+                if gap_months >= 2 and cfg.config_preset == "v2":
+                    msg = (
+                        f"Aligner β* sidecar stale by {gap_months} months "
+                        f"(latest={latest_month_str}, now={now_month}). "
+                        f"Under V2 preset this is a refusal to start — "
+                        f"refresh via scripts/extract_aligner_betas.py + "
+                        f"scripts/refresh_live_sidecars.py before "
+                        f"launching."
+                    )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+                if gap_months >= 1:
+                    logger.warning(
+                        "Aligner β* sidecar stale by %d month(s) "
+                        "(latest=%s) — predictions remain biased toward "
+                        "older regime",
+                        gap_months, latest_month_str,
+                    )
+            except RuntimeError:
+                raise
+            except Exception:  # noqa: BLE001 - parse failure non-fatal
+                logger.exception(
+                    "Aligner β* staleness check failed (advisory only)"
+                )
         self._kelly_mult_series = (
             _load_kelly(cfg.kelly_mult_path) if cfg.kelly_mult_path else None
         )
@@ -367,6 +404,52 @@ class TradingEngine:
             bar_minutes=cfg.bar_minutes,
         )
 
+        # ── E.2.2: DRL policy bar-minutes manifest check ──
+        # The SAC bundle carries no metadata for the training horizon.
+        # We sit a sibling ``<policy>.manifest.json`` next to the .zip
+        # with {"bar_minutes": N}. WARN at startup when it doesn't match
+        # ``cfg.bar_minutes`` — using a 15m-trained policy on 5m bars
+        # produces silently-broken hedges.
+        try:
+            import json as _json
+            manifest_path = Path(cfg.drl_policy_path).with_suffix(".manifest.json")
+            if not manifest_path.exists():
+                # Fallback for the .zip suffix: try alongside-replacement.
+                manifest_path = (
+                    Path(cfg.drl_policy_path).parent
+                    / (Path(cfg.drl_policy_path).stem + ".manifest.json")
+                )
+            if manifest_path.exists():
+                manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+                trained_bar_minutes = int(manifest.get("bar_minutes", 0))
+                if trained_bar_minutes != cfg.bar_minutes:
+                    msg = (
+                        f"DRL policy {cfg.drl_policy_path!r} trained at "
+                        f"bar_minutes={trained_bar_minutes} but engine is "
+                        f"configured for cfg.bar_minutes={cfg.bar_minutes}. "
+                        f"Hedges will be silently broken. Re-train or "
+                        f"point cfg.drl_policy_path at a horizon-matched "
+                        f"bundle."
+                    )
+                    logger.warning(msg)
+                    if self.telegram is not None:
+                        self.telegram.send("error", msg)
+                else:
+                    logger.info(
+                        "DRL policy %s manifest confirms bar_minutes=%d",
+                        Path(cfg.drl_policy_path).name, trained_bar_minutes,
+                    )
+            else:
+                logger.warning(
+                    "DRL policy %s has no manifest.json — assuming "
+                    "bar_minutes=%d (cfg). Add %s with "
+                    "{\"bar_minutes\": N} to silence this warning.",
+                    Path(cfg.drl_policy_path).name, cfg.bar_minutes,
+                    manifest_path.name,
+                )
+        except Exception as exc:  # noqa: BLE001 - manifest is advisory
+            logger.warning("DRL manifest check failed (advisory only): %s", exc)
+
         # ── Phase 4b: Live VPIN stream ──
         from deribit_paper.features.vpin_live import LiveVPINStream
         if cfg.vpin_state_path:
@@ -383,10 +466,22 @@ class TradingEngine:
             logger.info("LiveVPINStream disabled (vpin_state_path empty)")
 
         # ── Phase 5: Execution ──
+        # E.2.8: latency-breach callback. Wired AFTER kill_switch is
+        # constructed below; we capture it via a local closure so this
+        # can be passed at OrderManager construction time.
+        def _latency_breach(total_ms: float, threshold: float, instrument: str) -> None:
+            if self.kill_switch is not None:
+                self.kill_switch.on_latency_breach(
+                    total_ms=total_ms, threshold_ms=threshold,
+                    instrument_name=instrument,
+                )
+
         self.order_manager = OrderManager(
             rest=self.rest,
             idempotency_guard=IdempotencyGuard(ttl_seconds=60.0),
             fill_poll_seconds=1.5,
+            latency_threshold_ms=cfg.kill_switch_latency_ms,
+            on_latency_breach=_latency_breach,
         )
         self.straddle_flow = StraddleFlow(
             order_manager=self.order_manager,
@@ -799,12 +894,23 @@ class TradingEngine:
             bar_seconds=float(self.config.bar_seconds),
         )
 
-        # 1b. Stale-data guard — refuse to signal on empty/stale bars
-        if bar.n_perp_trades == 0 and bar.n_option_trades == 0:
+        # 1b. Stale-data guard — refuse to signal on bars where we
+        # couldn't trade. E.3.5 (2026-05-01): treat low-volume AND
+        # zero-trade bars as untradeable for kill-switch purposes —
+        # counter resets only on a fully-tradeable bar. Pre-E.3.5 a
+        # venue outputting 1 trade per bar (below low-volume threshold)
+        # would silently reset the counter every bar even though no
+        # signal could fire.
+        is_empty = bar.n_perp_trades == 0 and bar.n_option_trades == 0
+        is_low_volume = bar.n_perp_trades < self.config.min_perp_trades_per_bar
+        if is_empty or is_low_volume:
             self._consecutive_empty_bars += 1
+            kind = "empty" if is_empty else "low-volume"
             logger.warning(
-                "Bar %s has no trade data (empty bar %d/%d), skipping signal",
-                bar.timestamp, self._consecutive_empty_bars,
+                "Bar %s %s (perp=%d opt=%d, count %d/%d), skipping signal",
+                bar.timestamp, kind,
+                bar.n_perp_trades, bar.n_option_trades,
+                self._consecutive_empty_bars,
                 self.config.max_consecutive_empty_bars,
             )
             if (
@@ -812,22 +918,15 @@ class TradingEngine:
                 and not self.kill_switch.is_halted()
             ):
                 reason = (
-                    f"data stale: {self._consecutive_empty_bars} consecutive empty bars "
-                    f"(threshold {self.config.max_consecutive_empty_bars})"
+                    f"data stale: {self._consecutive_empty_bars} consecutive "
+                    f"untradeable bars (threshold "
+                    f"{self.config.max_consecutive_empty_bars})"
                 )
                 self.kill_switch.trip(reason)
             return
-        else:
-            self._consecutive_empty_bars = 0
 
-        # 1c. Low-volume guard — skip signal if insufficient perp data for features
-        if bar.n_perp_trades < self.config.min_perp_trades_per_bar:
-            logger.warning(
-                "Bar %s has only %d perp trades (min %d), skipping signal",
-                bar.timestamp, bar.n_perp_trades,
-                self.config.min_perp_trades_per_bar,
-            )
-            return
+        # Bar is fully tradeable — reset the counter.
+        self._consecutive_empty_bars = 0
 
         # 2. Kill switch gating
         if self.kill_switch.check_before_signal(now=bar.timestamp):

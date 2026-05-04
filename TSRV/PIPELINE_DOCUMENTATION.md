@@ -5038,6 +5038,192 @@ As of 2026-05-01, the engine is alive on the homeserver:
 
 ---
 
+## Stage 34: V2 Tail-Risk Audit — Tier A (2026-05-01)
+
+Empirical audit of seven tail-risk dimensions against the canonical V2
+trade log (`vol_arb/output/BTC_v2_trade_log.parquet`,
+`with_btc_production_filters_v2().with_realistic_costs()`,
+$959,571 NC PnL / 7,417 trades / 5y).
+
+**Plan**: `C:\Users\laure\.claude\plans\now-check-empirically-from-eager-bird.md`
+
+**Methodology**: López de Prado AFML Ch. 7 (purged CV / embargo as
+anti-leakage primitives), Ch. 11 (storytelling-bias guard — bar-OPEN
+IV only for stress flags), Ch. 12 (CPCV; deferred to Tier C),
+Bailey & López de Prado 2014 (Deflated Sharpe Ratio; deferred to
+Tier C). Deribit PME ±17.5% main-table BTC spot shock + IM/MM = 1.3.
+
+**Deliverables shipped**:
+- `scripts/forensic/audit_v2_tail_risks.py` — 6 leakage-safe probes
+  (R1+R7 / R2 / R3 / R4 / R5 / R6) producing
+  `vol_arb/output/V2_TAIL_RISK_AUDIT.md`
+- `tests/test_audit_v2_tail_risks.py` — 15 tests including
+  `probe_causality_by_mutation` regression check on the intrabar-DD
+  computation (verifies mutating `minute_atm_iv` POST-T does not
+  change per-trade peak DD at any t' < T)
+
+**Pre-committed parameters** (locked in plan; never tuned post-hoc):
+- Materiality: $ exposure ≥ 1.0% of cumulative NC PnL ($9,596) OR
+  worst-day exposure ≥ max(5× median, $3,200 floor) → $3,200 binds
+- OOS-validation quarantine: 2022-06-13 (Celsius), 2022-11-08 (FTX),
+  2024-08-05 (JPY carry unwind), 2025-01-20 (Trump inauguration) —
+  excluded from any future Tier-C parameter selection
+- IS-investigation only (motivating days, no parameter fitting):
+  2024-07-26, 2024-11-05
+
+**Findings**:
+
+| Risk | Material | $ Exposure | Worst Non-OOS | Worst OOS |
+|------|---|---:|---|---|
+| R1+R7 short-gamma intrabar DD | **YES** | -$10,042,744 | -$483K (2024-11-05 IS) | **-$55,916 (2025-01-20)** |
+| R2 liquidity / depth thinning | yes | -$66,908 | -$5,165 (2022-09-18) | $0 |
+| R3 Deribit PME ±17.5% breach | **no** | $0 | $0 | $0 |
+| R4 stale IV (n_strikes<5) | yes | -$73,314 | -$3,905 (2022-10-08) | $0 |
+| R5 vega-stop hits (diagnostic) | n/a | $0 | $0 | $0 |
+| R6 exchange outages | no | -$37 | -$37 (2022-05-28) | $0 |
+
+**Headline**: 2,918 of 7,417 fired V2 trades (39%) had peak intra-bar
+drawdown > 2× their realized P&L. The R1+R7 finding survives the
+storytelling-bias guard: even excluding both IS-investigation days
+(2024-07-26 / 2024-11-05), the OOS-validation worst day at -$55,916
+on 2025-01-20 is 17× the daily materiality floor. R3 (PME margin
+breach) is non-material — V2 sizing leaves enough headroom that the
+documented Deribit ±17.5% spot shock + 25vp IV shock never breaches.
+
+**Interpretation note**: peak intra-bar DD is RISK exposure, not
+realized loss. V2 books P&L at the 15-min close, so most of the
+$10M peak DD reverses before exit and never appears in the canonical
+trade log. The exposure measure is what (a) a Tier C-2 vega-stop
+would have prevented, (b) a real account would face as
+margin-call / forced-liquidation risk, and (c) credibility risk for
+vault-pitch reporting (peak DD numbers shown to investors).
+
+**Recommended Tier-C path** (gated by adoption rule:
+10th-pct PSR ≥ +0.3 AND OOS worst-day cut ≥ $5K AND NC Sharpe drop
+≤ 0.3, and never tuned on the 2 IS-investigation days):
+1. **C-2** `vega_stop_minute_usd` CPCV sweep (cheapest experiment;
+   may resolve R1+R7 alone).
+2. **C-1** intrabar vega-PnL recompute (only if C-2 alone insufficient).
+3. **Tier B** annotators for R2 (depth ratio) and R4 (svi_n_strikes).
+4. C-3 / C-4 / C-5 skipped — R3 / R6 immaterial, C-5 redundant with
+   the Tier-B depth annotator.
+
+15/15 audit tests + `test_kelly_sizing.py::test_v2_preset_loads_k1_sidecar_path`
+all green. Canonical V2 byte-identity preserved (audit is read-only).
+
+```bash
+# Reproduce
+PYTHONPATH=. python scripts/forensic/audit_v2_tail_risks.py
+cat vol_arb/output/V2_TAIL_RISK_AUDIT.md
+```
+
+## Stage 35: V2 Tail-Risk Tier B + Tier C-2 (2026-05-01)
+
+Continuation of Stage 34 audit. Tier B annotators shipped; Tier C-2
+vega-stop CPCV sweep run with **honest negative result — REJECT all
+candidates**.
+
+### Tier B annotators
+
+`vol_arb/trade_log_annotators.py` (+ `tests/test_trade_log_annotators.py`,
+11 tests) — pure post-hoc enrichment following the DFL-head pattern
+(`vol_arb/dfl_head.py`). Two annotators, one column each:
+
+* `annotate_depth_ratio` (R2): `N_contracts / available_depth_btc`
+  per entry bar from `bar_execution_quality.parquet`. Flags
+  526 trades with size > available depth; total understatement
+  $66,908.
+* `annotate_svi_n_strikes_at_entry` (R4): boolean `thin_svi` flag
+  (`svi_n_strikes < 5`). Floor anchored in SVI methodology, not tuned.
+  1,404 fired thin-SVI trades; $73,314 PnL at risk.
+
+Output sibling parquet: `vol_arb/output/BTC_v2_trade_log_annotated.parquet`.
+**Canonical V2 trade log byte-identity preserved** (verified by hash
+comparison; `test_v2_preset_loads_k1_sidecar_path` still green).
+
+```bash
+PYTHONPATH=. python -m vol_arb.run_backtest --btc-production-v2 --realistic --annotate
+```
+
+### Tier C-2 vega-stop CPCV sweep — REJECTED
+
+`scripts/sweep_vega_stop_threshold.py` (+ `tests/test_sweep_vega_stop_threshold.py`,
+15 tests including `probe_causality_by_mutation`).
+
+**Pre-committed parameters** (locked in plan, not tuned post-hoc):
+- Candidates: {$5,000, $10,000, $25,000, $50,000} per-trade adverse vega
+  P&L ceiling.
+- CPCV: 6 chronological groups choose-2 = 15 paths (AFML Ch. 12).
+- Quarantine: 4 OOS-validation days + 2 IS-investigation days dropped
+  from BOTH fitting and CPCV evaluation. The 4 OOS-validation days are
+  evaluated separately as a held-out test set.
+- Adoption gate (all THREE):
+  - 10th-pct PSR delta ≥ +0.30 vs baseline
+  - OOS-validation 4-day worst-day cut ≥ $5,000
+  - NC Sharpe drop ≤ 0.30
+- DSR haircut applied for K=4 multiple-testing correction.
+
+**Result**:
+
+| Threshold | Sharpe (fit) | PnL (fit) | OOS worst day | Adopt? |
+|---:|---:|---:|---:|---|
+| baseline ($0) | 5.33 | $915,193 | **+$3,086** | — |
+| $5,000 | -3.70 | -$4,958,745 | -$97,405 | NO |
+| $10,000 | -2.68 | -$2,976,993 | -$69,722 | NO |
+| $25,000 | -1.26 | -$996,896 | +$3,086 | NO |
+| $50,000 | 0.60 | $305,137 | +$3,086 | NO |
+
+**All 4 candidates fail every gate.**
+
+**Structural interpretation** (the honest finding):
+
+The baseline OOS worst day is **POSITIVE** ($+3,086) — V2 was profitable
+on all four held-out stress days (Celsius 2022-06-13, FTX 2022-11-08,
+JPY carry 2024-08-05, Trump inauguration 2025-01-20). The Stage 34
+finding of $10M cumulative intrabar peak DD is a real RISK measure but
+**reverses BEFORE the 15-min close in the canonical trade log**.
+
+V2's edge is structurally short-gamma + IV mean-reversion within the
+15-min holding window. A per-minute vega-stop closes positions at the
+worst intrabar minute — exactly when the mean reversion is about to
+fire. Tighter thresholds destroy PnL more aggressively: $5K stops the
+strategy from ever holding through normal intra-bar volatility,
+turning $915K fit-slice PnL into −$4.96M.
+
+**The R1+R7 risk descriptor is real but is V2's WORKING CAPITAL** — the
+intrabar drawdown the strategy uses to capture edge — not a bleed
+event a reactive stop should cut.
+
+**Adoption decision**: REJECT all candidates. `vega_stop_minute_usd`
+stays disabled by default. `with_btc_production_filters_v2()`
+unchanged. Canonical V2 trade log byte-identity preserved.
+
+Per the pre-committed AFML Ch. 11 storytelling-bias guard, lowering
+the gate or tweaking thresholds post-hoc to find a pass is forbidden.
+The honest answer is no.
+
+**Tier C-1 / C-3 / C-4 / C-5 not pursued**:
+- C-1 (intrabar PnL recompute): same mechanism as C-2 — would also
+  destroy mean-reversion capture.
+- C-3 (outage exit): R6 immaterial in Stage 34 (-$37 total).
+- C-4 (Deribit PME maintenance margin engine): R3 immaterial (V2
+  sizing has full headroom under documented ±17.5% / 25vp shocks).
+- C-5 (depth-thinning slippage adjuster): redundant with the Tier B
+  R2 annotator already shipped.
+
+**Future research direction** (not in this plan's scope): the
+R1+R7 mitigation that aligns with the strategy's mechanics is
+**preventative sizing reduction** on bars with elevated pre-trade
+gamma or DVOL — shrinking exposure BEFORE entry, not reactive
+stops that close into the reversion. This is a separate research
+cycle.
+
+```bash
+# Reproduce
+PYTHONPATH=. python scripts/sweep_vega_stop_threshold.py
+cat vol_arb/output/V2_VEGA_STOP_SWEEP.md
+```
+
 ## Current Status (as of 2026-05-01)
 
 | Wave | Work | Status |
@@ -5058,6 +5244,8 @@ As of 2026-05-01, the engine is alive on the homeserver:
 | — | Live engine V2 alignment cycle Phase A-D (Stage 31) | DONE |
 | — | Phase E remediation E.1-3 (Stage 32) | DONE |
 | — | Monthly aligner refresh + ops hardening (Stage 33) | DONE |
+| — | V2 tail-risk audit Tier A (Stage 34) | DONE — 3 material findings |
+| — | V2 tail-risk Tier B annotators + Tier C-2 vega-stop sweep (Stage 35) | DONE — Tier B shipped, Tier C-2 REJECTED |
 
 **Production exit checklist**: 13/15 gates passed. Remaining:
 - D3: Phase 8 paper run completes ≥7 days of live testnet trading.

@@ -32,10 +32,18 @@ from scripts.forensic.audit_v2_tail_risks import (
     probe_liquidity_depth,
     probe_outages,
     probe_pme_margin,
+    probe_pnl_concentration_signed,
+    probe_regime_conditional_sharpe,
+    probe_rolling_streak_worst,
     probe_stale_iv,
     probe_vega_stops,
     CANONICAL_NC_PNL,
     DERIBIT_PME_SPOT_SHOCK,
+    HHI_CONCENTRATION_FLAG,
+    ROLLING_STREAK_FLOOR_USD,
+    ROLLING_STREAK_WINDOWS_DAYS,
+    TERCILE_CUT_HIGH,
+    TERCILE_CUT_LOW,
 )
 from vol_model.leakage_probes import probe_causality_by_mutation
 
@@ -257,3 +265,267 @@ class TestLeakageMutation:
             mutation_mask=lambda idx, t: np.asarray(idx >= T),
         )
         assert result.passed, result.detail
+
+
+# ─── 4. Cycle-2 Phase R diagnostic probes (measurement only) ────────────
+
+
+class TestDiagnosticHHI:
+    """D1: HHI on signed daily NC PnL."""
+
+    def _build_log(self, daily_pnls: list[float]) -> pd.DataFrame:
+        idx = pd.date_range("2023-01-01", periods=len(daily_pnls),
+                             freq="D", tz="UTC")
+        return pd.DataFrame(
+            {"signal": [-1] * len(daily_pnls),
+             "net_pnl_nc": daily_pnls},
+            index=idx,
+        )
+
+    def test_single_day_returns_one(self):
+        """Degenerate case: one day → all magnitude on that day → HHI=1."""
+        tl = self._build_log([1_000.0])
+        out = probe_pnl_concentration_signed(tl)
+        assert out["hhi_abs"] == pytest.approx(1.0, rel=1e-6)
+        assert out["n_days"] == 1
+
+    def test_uniform_n_days_returns_one_over_n(self):
+        """N equal-magnitude days → HHI = 1/N (uniform-spread reference)."""
+        n = 10
+        tl = self._build_log([100.0] * n)
+        out = probe_pnl_concentration_signed(tl)
+        assert out["hhi_abs"] == pytest.approx(1.0 / n, rel=1e-6)
+
+    def test_signed_uses_absolute_magnitude(self):
+        """Mixed signs: HHI on |daily_pnl| treats both magnitudes equally."""
+        # 5 days of $+100, 5 days of $-100 → all 10 contribute equally → HHI=1/10
+        tl = self._build_log([100.0] * 5 + [-100.0] * 5)
+        out = probe_pnl_concentration_signed(tl)
+        assert out["hhi_abs"] == pytest.approx(0.1, rel=1e-6)
+        # Positive-only HHI: 5 equal days → 1/5
+        assert out["hhi_pos_only"] == pytest.approx(0.2, rel=1e-6)
+        # Negative-only HHI: 5 equal days → 1/5
+        assert out["hhi_neg_only"] == pytest.approx(0.2, rel=1e-6)
+
+    def test_concentration_flag_threshold(self):
+        """Pre-committed flag fires only above 0.10."""
+        # 8 days of $100 + 1 day of $1000 → magnitude shares heavily skewed
+        tl = self._build_log([100.0] * 8 + [1_000.0])
+        out = probe_pnl_concentration_signed(tl)
+        # 1000 / (8*100 + 1000) = 1000/1800 ≈ 0.556; share² ≈ 0.309
+        # plus 8 × (100/1800)² ≈ 8 × 0.00309 = 0.0247
+        # total ≈ 0.334 → above 0.10
+        assert out["hhi_abs"] > HHI_CONCENTRATION_FLAG
+        assert out["flag"] is True
+
+    def test_zero_pnl_safe(self):
+        """All-zero days: no division by zero, returns 0.0 HHI."""
+        tl = self._build_log([0.0, 0.0, 0.0])
+        out = probe_pnl_concentration_signed(tl)
+        assert out["hhi_abs"] == 0.0
+        assert out["flag"] is False
+
+
+class TestDiagnosticRollingStreak:
+    """D2: rolling-N-day worst NC PnL."""
+
+    def _build_log(self, daily_pnls: list[float]) -> pd.DataFrame:
+        idx = pd.date_range("2023-01-01", periods=len(daily_pnls),
+                             freq="D", tz="UTC")
+        return pd.DataFrame(
+            {"signal": [-1] * len(daily_pnls),
+             "net_pnl_nc": daily_pnls},
+            index=idx,
+        )
+
+    def test_consecutive_loss_streak_3day(self):
+        """Three consecutive $-2K days → rolling-3d worst = $-6K (breaches 1× floor)."""
+        # Pad with zeros to give the rolling window enough days to evaluate
+        tl = self._build_log(
+            [0.0, 0.0, 0.0] + [-2_000.0, -2_000.0, -2_000.0] + [0.0, 0.0, 0.0]
+        )
+        out = probe_rolling_streak_worst(tl)
+        assert out["worst_3d"] == pytest.approx(-6_000.0, abs=1.0)
+        # Threshold: 1× × $3,200 = $-3,200; -6,000 ≤ -3,200 → breach
+        assert out["worst_3d_breaches"] is True
+
+    def test_single_loss_isolated(self):
+        """Single $-1K loss surrounded by zeros: no breach at 1×$3,200 threshold."""
+        tl = self._build_log([0.0] * 5 + [-1_000.0] + [0.0] * 5)
+        out = probe_rolling_streak_worst(tl)
+        # 3-day rolling worst captures only the single -1K → -1K vs threshold -3.2K
+        assert out["worst_3d"] == pytest.approx(-1_000.0, abs=1.0)
+        assert out["worst_3d_breaches"] is False
+
+    def test_30day_threshold_higher_bar(self):
+        """30-day window has 10× higher threshold ($-32K)."""
+        # 10 × $-2K days = $-20K — does NOT breach the 10× × $3,200 = $-32K bar
+        tl = self._build_log([0.0] * 5 + [-2_000.0] * 10 + [0.0] * 20)
+        out = probe_rolling_streak_worst(tl)
+        # 30-day rolling captures all 10 loss days → $-20K
+        assert out["worst_30d"] == pytest.approx(-20_000.0, abs=1.0)
+        assert out["worst_30d_threshold"] == pytest.approx(-32_000.0)
+        assert out["worst_30d_breaches"] is False
+
+    def test_thresholds_locked(self):
+        """Pre-committed thresholds: 1× / 5× / 10× of $3,200 floor."""
+        assert ROLLING_STREAK_FLOOR_USD == 3_200.0
+        assert ROLLING_STREAK_WINDOWS_DAYS == (3, 7, 30)
+
+    def test_calendar_gap_filled_with_zeros(self):
+        """Non-trading days fill with zero so rolling sums are calendar-honest."""
+        # Three trades 5 days apart, no fired trades in between
+        idx = pd.DatetimeIndex(
+            ["2023-01-01", "2023-01-06", "2023-01-11"], tz="UTC",
+        )
+        tl = pd.DataFrame(
+            {"signal": [-1, -1, -1],
+             "net_pnl_nc": [-1_000.0, -1_000.0, -1_000.0]},
+            index=idx,
+        )
+        out = probe_rolling_streak_worst(tl)
+        # 3-day rolling never sees more than one -1K day (5-day spacing)
+        assert out["worst_3d"] == pytest.approx(-1_000.0, abs=1.0)
+
+
+class TestDiagnosticRegimeSharpe:
+    """D3: per-cell trade-level Sharpe with frozen calibration-window cuts."""
+
+    def _build_log_in_calibration(
+        self, n: int = 200, dvol_pattern: str = "uniform",
+        jump_pattern: str = "uniform", pnl_pattern: str = "noise",
+    ) -> pd.DataFrame:
+        """Synthetic trade log inside the calibration window."""
+        idx = pd.date_range(
+            "2022-06-01", periods=n, freq="15min", tz="UTC",
+        )
+        rng = np.random.default_rng(seed=42)
+        if dvol_pattern == "uniform":
+            dvol = rng.uniform(40, 80, n)
+        else:
+            dvol = np.full(n, 60.0)
+        if jump_pattern == "uniform":
+            jump = rng.uniform(0, 0.3, n)
+        else:
+            jump = np.full(n, 0.05)
+        if pnl_pattern == "noise":
+            pnl = rng.normal(50.0, 100.0, n)
+        elif pnl_pattern == "all_loss_high_dvol":
+            pnl = np.where(dvol > 70, -200.0, 100.0) + rng.normal(0, 10, n)
+        else:
+            pnl = np.full(n, 50.0)
+        return pd.DataFrame(
+            {
+                "signal": [-1] * n,
+                "net_pnl_nc": pnl,
+                "dvol_close": dvol,
+                "jump_fraction": jump,
+            },
+            index=idx,
+        )
+
+    def test_skips_when_too_few_calibration_trades(self):
+        out = probe_regime_conditional_sharpe(
+            self._build_log_in_calibration(n=50)
+        )
+        assert "skipped" in out
+        assert "100 minimum" in out["skipped"]
+
+    def test_skips_when_columns_missing(self):
+        idx = pd.date_range("2022-06-01", periods=200, freq="15min", tz="UTC")
+        tl = pd.DataFrame(
+            {"signal": [-1] * 200, "net_pnl_nc": [10.0] * 200},
+            index=idx,
+        )
+        out = probe_regime_conditional_sharpe(tl)
+        assert "skipped" in out
+        assert "missing" in out["skipped"]
+
+    def test_tercile_cuts_match_quantiles(self):
+        """Frozen cuts equal the 0.33 / 0.67 quantiles of calibration slice."""
+        tl = self._build_log_in_calibration(n=300)
+        out = probe_regime_conditional_sharpe(tl)
+        cal_slice = tl  # all 300 are in the calibration window by construction
+        expected_dvol_low = float(cal_slice["dvol_close"].quantile(TERCILE_CUT_LOW))
+        expected_dvol_high = float(cal_slice["dvol_close"].quantile(TERCILE_CUT_HIGH))
+        assert out["dvol_low_cut"] == pytest.approx(expected_dvol_low, rel=1e-9)
+        assert out["dvol_high_cut"] == pytest.approx(expected_dvol_high, rel=1e-9)
+
+    def test_nine_cells_returned(self):
+        tl = self._build_log_in_calibration(n=500)
+        out = probe_regime_conditional_sharpe(tl)
+        # 3 dvol × 3 jump = 9 cells
+        assert len(out["cells"]) == 9
+        keys = {(c["dvol_t"], c["jump_t"]) for c in out["cells"]}
+        assert keys == {
+            (d, j) for d in ("low", "mid", "high")
+                   for j in ("low", "mid", "high")
+        }
+
+    def test_calibration_window_freeze_no_recompute(self):
+        """Mutating values OUTSIDE the calibration window must not change cuts.
+
+        This is the leakage-mutation guarantee. Cuts are frozen on the
+        2021-04-01 → 2023-09-30 window only; post-window data is
+        observed-but-not-used for the cut decision.
+        """
+        # Calibration-window data
+        tl_cal = self._build_log_in_calibration(n=300)
+        out_baseline = probe_regime_conditional_sharpe(tl_cal)
+
+        # Append POST-calibration-window data with extreme values
+        post_idx = pd.date_range(
+            "2024-06-01", periods=100, freq="15min", tz="UTC",
+        )
+        rng = np.random.default_rng(seed=7)
+        tl_post = pd.DataFrame(
+            {
+                "signal": [-1] * 100,
+                "net_pnl_nc": rng.normal(0, 10, 100),
+                # Extreme values that WOULD shift quantiles if mistakenly included
+                "dvol_close": np.full(100, 200.0),
+                "jump_fraction": np.full(100, 0.99),
+            },
+            index=post_idx,
+        )
+        tl_combined = pd.concat([tl_cal, tl_post]).sort_index()
+        out_with_post = probe_regime_conditional_sharpe(tl_combined)
+
+        # Frozen cut points must be IDENTICAL — post-window data must not
+        # affect the calibration quantile.
+        assert out_baseline["dvol_low_cut"] == pytest.approx(
+            out_with_post["dvol_low_cut"], rel=1e-12,
+        )
+        assert out_baseline["dvol_high_cut"] == pytest.approx(
+            out_with_post["dvol_high_cut"], rel=1e-12,
+        )
+        assert out_baseline["jump_low_cut"] == pytest.approx(
+            out_with_post["jump_low_cut"], rel=1e-12,
+        )
+        assert out_baseline["jump_high_cut"] == pytest.approx(
+            out_with_post["jump_high_cut"], rel=1e-12,
+        )
+
+    def test_signal_concentrated_in_high_dvol_cell(self):
+        """If we plant pnl=-200 in high-dvol bars and pnl=+100 elsewhere,
+        the high-dvol cells should show negative Sharpe and the low/mid
+        cells should show positive Sharpe.
+        """
+        tl = self._build_log_in_calibration(
+            n=600, dvol_pattern="uniform", jump_pattern="uniform",
+            pnl_pattern="all_loss_high_dvol",
+        )
+        out = probe_regime_conditional_sharpe(tl)
+        cells_by_key = {(c["dvol_t"], c["jump_t"]): c for c in out["cells"]}
+        # Aggregate the 3 high-dvol cells (across jump terciles)
+        high_dvol_cells = [
+            cells_by_key[("high", j)] for j in ("low", "mid", "high")
+        ]
+        low_dvol_cells = [
+            cells_by_key[("low", j)] for j in ("low", "mid", "high")
+        ]
+        # Average sum across jump terciles
+        high_total = sum(c["sum_pnl"] for c in high_dvol_cells)
+        low_total = sum(c["sum_pnl"] for c in low_dvol_cells)
+        assert high_total < 0
+        assert low_total > 0

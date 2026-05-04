@@ -85,6 +85,21 @@ IS_INVESTIGATION_DAYS: dict[str, pd.Timestamp] = {
 DERIBIT_PME_SPOT_SHOCK: float = 0.175  # ±17.5%
 DERIBIT_IM_OVER_MM_RATIO: float = 1.3   # IM = 1.3 × MM
 
+# ─── Cycle-2 diagnostic thresholds (locked in plan, measurement only) ───
+# Pre-committed: any change requires a new plan file. These thresholds
+# never trigger a code action; they are tags rendered into the markdown
+# for transparency. See plan §"Phase R" for the derivation.
+HHI_CONCENTRATION_FLAG: float = 0.10
+ROLLING_STREAK_WINDOWS_DAYS: tuple[int, int, int] = (3, 7, 30)
+ROLLING_STREAK_FLOOR_USD: float = 3_200.0
+ROLLING_STREAK_MULTIPLIERS: tuple[float, float, float] = (1.0, 5.0, 10.0)
+DIAGNOSTIC_CALIBRATION_WINDOW: tuple[pd.Timestamp, pd.Timestamp] = (
+    pd.Timestamp("2021-04-01", tz="UTC"),
+    pd.Timestamp("2023-10-01", tz="UTC"),  # exclusive upper bound
+)
+TERCILE_CUT_LOW: float = 0.33
+TERCILE_CUT_HIGH: float = 0.67
+
 
 # ─── Dataclass for findings ──────────────────────────────────────────────
 
@@ -709,10 +724,291 @@ def probe_outages(trade_log: pd.DataFrame,
     )
 
 
+# ─── Cycle-2 Phase R diagnostics (measurement only, no fitting) ─────────
+#
+# These probes do NOT drive any code action. They are tagged with a
+# pre-committed flag in the markdown so the reader sees concentration /
+# streak / regime structure at a glance. Tercile cuts are FROZEN on the
+# calibration window 2021-04-01 → 2023-09-30 and applied to the whole
+# trade log; no expanding-window recompute, no quantile retuning.
+
+def probe_pnl_concentration_signed(trade_log: pd.DataFrame) -> dict:
+    """Diagnostic D1: HHI on daily NC PnL (absolute-magnitude shares).
+
+    Three HHI variants are reported:
+    - ``hhi_abs``: shares of |daily_pnl| in sum(|daily_pnl|) — concentration
+      of bar-level magnitude regardless of sign. THIS IS THE FLAG VARIABLE.
+    - ``hhi_pos_only``: matches the existing ``concentration_metrics`` HHI
+      definition (positive days only).
+    - ``hhi_neg_only``: HHI on negative-day magnitudes — concentration of
+      LOSSES specifically. Useful complement.
+
+    Pre-committed flag: ``hhi_abs > 0.10`` → "concentration risk" tag.
+    No action triggered; pure description.
+    """
+    daily = daily_pnl(trade_log)
+    if len(daily) == 0:
+        return {
+            "diag_id": "D1", "name": "pnl_concentration_signed",
+            "hhi_abs": 0.0, "hhi_pos_only": 0.0, "hhi_neg_only": 0.0,
+            "top_1pct_abs_share": 0.0, "n_days": 0, "flag": False,
+        }
+    abs_pnl = daily.abs()
+    abs_total = float(abs_pnl.sum())
+    if abs_total <= 0:
+        hhi_abs = 0.0
+    else:
+        shares_abs = abs_pnl / abs_total
+        hhi_abs = float((shares_abs ** 2).sum())
+
+    pos = daily[daily > 0]
+    pos_total = float(pos.sum())
+    hhi_pos = float(((pos / pos_total) ** 2).sum()) if pos_total > 0 else 0.0
+
+    neg_mag = (-daily[daily < 0])
+    neg_total = float(neg_mag.sum())
+    hhi_neg = float(((neg_mag / neg_total) ** 2).sum()) if neg_total > 0 else 0.0
+
+    abs_sorted = abs_pnl.sort_values(ascending=False)
+    if abs_total > 0:
+        k = max(1, int(np.ceil(len(abs_sorted) * 0.01)))
+        top_share = float(abs_sorted.head(k).sum() / abs_total)
+    else:
+        top_share = 0.0
+
+    return {
+        "diag_id": "D1", "name": "pnl_concentration_signed",
+        "hhi_abs": hhi_abs,
+        "hhi_pos_only": hhi_pos,
+        "hhi_neg_only": hhi_neg,
+        "top_1pct_abs_share": top_share,
+        "n_days": int(len(daily)),
+        "flag": bool(hhi_abs > HHI_CONCENTRATION_FLAG),
+    }
+
+
+def probe_rolling_streak_worst(trade_log: pd.DataFrame) -> dict:
+    """Diagnostic D2: rolling 3 / 7 / 30-day worst NC PnL sum.
+
+    Catches serial correlation that the day-level worst metric masks. A
+    strategy with five $-3K days in a row has the same daily-worst as one
+    with a single $-3K day, but very different drawdown character.
+
+    Pre-committed thresholds: 1× / 5× / 10× of the existing $3,200 daily
+    floor for the 3 / 7 / 30-day windows respectively. Diagnostic only.
+    """
+    daily = daily_pnl(trade_log)
+    if len(daily) == 0:
+        return {
+            "diag_id": "D2", "name": "rolling_streak_worst",
+            **{f"worst_{w}d": 0.0 for w in ROLLING_STREAK_WINDOWS_DAYS},
+            **{f"worst_{w}d_date": "—" for w in ROLLING_STREAK_WINDOWS_DAYS},
+            **{f"worst_{w}d_threshold": 0.0 for w in ROLLING_STREAK_WINDOWS_DAYS},
+            **{f"worst_{w}d_breaches": False for w in ROLLING_STREAK_WINDOWS_DAYS},
+        }
+    full_idx = pd.date_range(
+        daily.index.min(), daily.index.max(), freq="D", tz=daily.index.tz,
+    )
+    daily_full = daily.reindex(full_idx, fill_value=0.0)
+
+    out: dict = {"diag_id": "D2", "name": "rolling_streak_worst"}
+    for window, mult in zip(ROLLING_STREAK_WINDOWS_DAYS, ROLLING_STREAK_MULTIPLIERS):
+        rolling = daily_full.rolling(f"{window}D").sum()
+        if rolling.dropna().empty:
+            out[f"worst_{window}d"] = 0.0
+            out[f"worst_{window}d_date"] = "—"
+            out[f"worst_{window}d_threshold"] = -mult * ROLLING_STREAK_FLOOR_USD
+            out[f"worst_{window}d_breaches"] = False
+            continue
+        worst = float(rolling.min())
+        worst_date = str(rolling.idxmin().date())
+        threshold = -mult * ROLLING_STREAK_FLOOR_USD
+        out[f"worst_{window}d"] = worst
+        out[f"worst_{window}d_date"] = worst_date
+        out[f"worst_{window}d_threshold"] = threshold
+        out[f"worst_{window}d_breaches"] = bool(worst <= threshold)
+    return out
+
+
+def _frozen_tercile_label(value: float, low_cut: float, high_cut: float) -> str:
+    """Map a value to a frozen-tercile label using pre-committed cuts."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "na"
+    if value <= low_cut:
+        return "low"
+    if value >= high_cut:
+        return "high"
+    return "mid"
+
+
+def probe_regime_conditional_sharpe(trade_log: pd.DataFrame) -> dict:
+    """Diagnostic D3: trade-level Sharpe per (DVOL × jump) tercile cell.
+
+    Tercile cuts are computed ONCE on the calibration window
+    (2021-04-01 → 2023-09-30) and applied to the entire fired trade log;
+    this is stricter than the expanding-window approach in
+    ``scripts/h5_deep_dive.py:100-120`` and is what the plan pre-committed.
+
+    Anti-leak guard: cuts are frozen on the calibration slice; mutating
+    test-slice values must not change the cut points.
+    Anti-overfit guard: cut points are 0.33 / 0.67 quantiles, not tuned.
+
+    Sharpe annualisation factor = trades / year (V2 fires ~1,500/year),
+    so per-cell Sharpe = mean / std × sqrt(trades_per_year). Cells with
+    < 2 trades report sharpe=NaN.
+    """
+    fired = trade_log[trade_log["net_pnl_nc"] != 0].copy()
+    if len(fired) == 0:
+        return {"diag_id": "D3", "name": "regime_conditional_sharpe",
+                "cells": [], "skipped": "no fired trades"}
+    if "dvol_close" not in fired.columns or "jump_fraction" not in fired.columns:
+        return {"diag_id": "D3", "name": "regime_conditional_sharpe",
+                "cells": [],
+                "skipped": "missing dvol_close or jump_fraction column"}
+
+    cal_start, cal_end = DIAGNOSTIC_CALIBRATION_WINDOW
+    cal_slice = fired.loc[
+        (fired.index >= cal_start) & (fired.index < cal_end)
+    ]
+    if len(cal_slice) < 100:
+        return {"diag_id": "D3", "name": "regime_conditional_sharpe",
+                "cells": [],
+                "skipped": (f"calibration slice has only {len(cal_slice)} fired "
+                            "trades (< 100 minimum)")}
+
+    dvol_low = float(cal_slice["dvol_close"].quantile(TERCILE_CUT_LOW))
+    dvol_high = float(cal_slice["dvol_close"].quantile(TERCILE_CUT_HIGH))
+    jump_low = float(cal_slice["jump_fraction"].quantile(TERCILE_CUT_LOW))
+    jump_high = float(cal_slice["jump_fraction"].quantile(TERCILE_CUT_HIGH))
+
+    fired = fired.assign(
+        dvol_t=fired["dvol_close"].apply(
+            lambda v: _frozen_tercile_label(v, dvol_low, dvol_high)
+        ),
+        jump_t=fired["jump_fraction"].apply(
+            lambda v: _frozen_tercile_label(v, jump_low, jump_high)
+        ),
+    )
+
+    span_days = max(1.0, (fired.index.max() - fired.index.min()).total_seconds()
+                     / 86_400.0)
+    n_years = max(1e-3, span_days / 365.25)
+    trades_per_year = len(fired) / n_years
+    annualization = float(np.sqrt(trades_per_year))
+
+    cells: list[dict] = []
+    for dl in ("low", "mid", "high"):
+        for jl in ("low", "mid", "high"):
+            cell = fired[(fired["dvol_t"] == dl) & (fired["jump_t"] == jl)]
+            n = int(len(cell))
+            if n < 2:
+                cells.append({
+                    "dvol_t": dl, "jump_t": jl, "n_trades": n,
+                    "mean_pnl": 0.0, "sum_pnl": 0.0, "sharpe": float("nan"),
+                })
+                continue
+            mu = float(cell["net_pnl_nc"].mean())
+            sd = float(cell["net_pnl_nc"].std(ddof=1))
+            total = float(cell["net_pnl_nc"].sum())
+            sharpe = (mu / sd * annualization) if sd > 0 else 0.0
+            cells.append({
+                "dvol_t": dl, "jump_t": jl, "n_trades": n,
+                "mean_pnl": mu, "sum_pnl": total, "sharpe": float(sharpe),
+            })
+
+    return {
+        "diag_id": "D3", "name": "regime_conditional_sharpe",
+        "calibration_window": (str(cal_start.date()),
+                                str(cal_end.date())),
+        "calibration_n_trades": int(len(cal_slice)),
+        "trades_per_year": float(trades_per_year),
+        "annualization_factor": annualization,
+        "dvol_low_cut": dvol_low, "dvol_high_cut": dvol_high,
+        "jump_low_cut": jump_low, "jump_high_cut": jump_high,
+        "cells": cells,
+    }
+
+
+def render_diagnostics(d1: dict, d2: dict, d3: dict) -> list[str]:
+    """Render the Phase-R diagnostics block as markdown lines."""
+    lines = [
+        "## Diagnostic measurements (Cycle 2 Phase R — no fitting, no decisions)",
+        "",
+        "Pure measurement. Pre-committed flags below NEVER drive an action; "
+        "they are tags for transparency. Tercile cuts are FROZEN on the "
+        "calibration window `2021-04-01` → `2023-09-30` and applied to the "
+        "full fired trade log. Lock source: plan file Phase R section.",
+        "",
+        "### D1 — daily NC PnL concentration (HHI)",
+        "",
+        f"- HHI on absolute magnitude:   **{d1['hhi_abs']:.4f}**  "
+        f"({'⚠ above 0.10 flag' if d1['flag'] else 'within 0.10 flag'})",
+        f"- HHI on positive days only:   {d1['hhi_pos_only']:.4f}",
+        f"- HHI on negative days only:   {d1['hhi_neg_only']:.4f}",
+        f"- Top-1% days share of |PnL|:  {d1['top_1pct_abs_share']*100:.1f}%",
+        f"- N trading days:              {d1['n_days']}",
+        "",
+        "### D2 — rolling worst-streak (NC PnL sum)",
+        "",
+    ]
+    for window in ROLLING_STREAK_WINDOWS_DAYS:
+        worst = d2[f"worst_{window}d"]
+        thresh = d2[f"worst_{window}d_threshold"]
+        breach = d2[f"worst_{window}d_breaches"]
+        date = d2[f"worst_{window}d_date"]
+        lines.append(
+            f"- Rolling-{window}d worst:  ${worst:,.0f}  ({date})  "
+            f"— threshold ${thresh:,.0f}  "
+            f"({'⚠ breach' if breach else 'within'})"
+        )
+    lines += ["", "### D3 — regime-conditional trade-level Sharpe", ""]
+    if d3.get("skipped"):
+        lines += [f"_Skipped: {d3['skipped']}_", ""]
+        return lines
+
+    lines += [
+        f"- Calibration window: {d3['calibration_window'][0]} → "
+        f"{d3['calibration_window'][1]}  "
+        f"({d3['calibration_n_trades']} fired trades)",
+        f"- DVOL tercile cuts:  low ≤ {d3['dvol_low_cut']:.2f}, "
+        f"high ≥ {d3['dvol_high_cut']:.2f}",
+        f"- Jump tercile cuts:  low ≤ {d3['jump_low_cut']:.4f}, "
+        f"high ≥ {d3['jump_high_cut']:.4f}",
+        f"- Annualization:     "
+        f"sqrt({d3['trades_per_year']:.0f} trades/yr) "
+        f"= {d3['annualization_factor']:.2f}",
+        "",
+        "Per-cell trade-level annualised Sharpe ratio "
+        "(empty cells reported as `—`):",
+        "",
+        "| DVOL ╲ Jump | low | mid | high |",
+        "|---|---|---|---|",
+    ]
+    cells_by_key = {(c["dvol_t"], c["jump_t"]): c for c in d3["cells"]}
+    for dl in ("low", "mid", "high"):
+        row = [f"**{dl}**"]
+        for jl in ("low", "mid", "high"):
+            c = cells_by_key.get((dl, jl), {"sharpe": float("nan"),
+                                             "n_trades": 0,
+                                             "sum_pnl": 0.0})
+            sh = c["sharpe"]
+            n = c["n_trades"]
+            total = c.get("sum_pnl", 0.0)
+            if n < 2 or np.isnan(sh):
+                cell_str = f"— (n={n})"
+            else:
+                cell_str = f"{sh:+.2f} (n={n}, ${total:+,.0f})"
+            row.append(cell_str)
+        lines.append("| " + " | ".join(row) + " |")
+    lines += ["", ""]
+    return lines
+
+
 # ─── Render audit markdown ───────────────────────────────────────────────
 
 def render_markdown(findings: list[RiskFinding],
-                    cum_pnl: float, median_daily: float) -> str:
+                    cum_pnl: float, median_daily: float,
+                    diagnostics: tuple[dict, dict, dict] | None = None) -> str:
     cum_thresh = abs(cum_pnl) * MATERIAL_PCT_OF_CUM
     daily_thresh = max(abs(median_daily) * MATERIAL_DAILY_MULTIPLIER, 3_200.0)
     daily_floor_binding = (abs(median_daily) * MATERIAL_DAILY_MULTIPLIER) < 3_200.0
@@ -787,6 +1083,9 @@ def render_markdown(findings: list[RiskFinding],
         "(per AFML Ch. 11 storytelling-bias guard).",
         "",
     ]
+    if diagnostics is not None:
+        d1, d2, d3 = diagnostics
+        lines += render_diagnostics(d1, d2, d3)
     return "\n".join(lines)
 
 
@@ -817,7 +1116,26 @@ def main() -> int:
     findings.append(probe_vega_stops(trade_log, median_daily))
     findings.append(probe_outages(trade_log, median_daily))
 
-    output = render_markdown(findings, cum_pnl, median_daily)
+    # Cycle 2 Phase R: measurement-only diagnostics (no fitting, no actions)
+    d1 = probe_pnl_concentration_signed(trade_log)
+    d2 = probe_rolling_streak_worst(trade_log)
+    d3 = probe_regime_conditional_sharpe(trade_log)
+    diagnostics = (d1, d2, d3)
+    logger.info("Diagnostic D1 (HHI abs): %.4f (flag=%s)",
+                d1["hhi_abs"], d1["flag"])
+    logger.info("Diagnostic D2 (rolling worsts): "
+                "3d=$%.0f, 7d=$%.0f, 30d=$%.0f",
+                d2["worst_3d"], d2["worst_7d"], d2["worst_30d"])
+    if d3.get("skipped"):
+        logger.info("Diagnostic D3 skipped: %s", d3["skipped"])
+    else:
+        logger.info("Diagnostic D3: DVOL cuts (%.2f, %.2f), "
+                    "Jump cuts (%.4f, %.4f), %d cells",
+                    d3["dvol_low_cut"], d3["dvol_high_cut"],
+                    d3["jump_low_cut"], d3["jump_high_cut"],
+                    len(d3["cells"]))
+
+    output = render_markdown(findings, cum_pnl, median_daily, diagnostics)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(output, encoding="utf-8")

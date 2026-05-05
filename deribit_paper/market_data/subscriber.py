@@ -100,7 +100,21 @@ class MarketDataSubscriber:
         moneyness_hi: float = 1.20,
         dte_min_days: float = 0.0,
         dte_max_days: float = 21.0,
+        trades_interval: str = "raw",
     ):
+        # ``trades_interval`` selects the trades-channel granularity:
+        # - ``"raw"`` (default) gives every individual trade. Deribit
+        #   gates the ``.raw`` variant behind WS auth in some
+        #   configurations, so this requires credentials.
+        # - ``"100ms"`` aggregates trades into 100ms snapshots and
+        #   works on truly public WS connections (paper mode without
+        #   credentials). At the 15-min bar level the granularity
+        #   difference is invisible.
+        if trades_interval not in {"raw", "100ms", "agg2"}:
+            raise ValueError(
+                f"trades_interval must be 'raw' | '100ms' | 'agg2', "
+                f"got {trades_interval!r}",
+            )
         self._ws = ws
         self.perp_buffer = perp_buffer
         self.option_buffer = option_buffer
@@ -110,6 +124,7 @@ class MarketDataSubscriber:
         self.moneyness_hi = moneyness_hi
         self.dte_min_days = dte_min_days
         self.dte_max_days = dte_max_days
+        self.trades_interval = trades_interval
         self._kill_switch: Any = None  # injected after construction via set_kill_switch
 
         # Counters for observability
@@ -136,8 +151,8 @@ class MarketDataSubscriber:
         """Subscribe to all required channels.  Requires an active ``ws``."""
         if self._ws is None:
             raise RuntimeError("MarketDataSubscriber.start() requires a ws client")
-        perp_channel = f"trades.{self.currency}-PERPETUAL.raw"
-        option_channel = f"trades.option.{self.currency}.raw"
+        perp_channel = f"trades.{self.currency}-PERPETUAL.{self.trades_interval}"
+        option_channel = f"trades.option.{self.currency}.{self.trades_interval}"
         index_channel = f"deribit_price_index.{self.currency.lower()}_usd"
 
         await self._ws.subscribe([perp_channel], self._on_perp_trade_event)

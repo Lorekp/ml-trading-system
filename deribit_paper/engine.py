@@ -197,22 +197,41 @@ class TradingEngine:
         )
 
         # ── Phase 1: Deribit client ──
-        if not cfg.client_id or not cfg.client_secret:
-            raise RuntimeError(
-                "Deribit credentials missing — set DERIBIT_TESTNET_CLIENT_ID + "
-                "_SECRET in .env before running the engine",
+        # Paper mode (cfg.paper_mode=True) connects to public mainnet
+        # WS/REST without credentials; the dry-run safety belt prevents
+        # any private endpoint from being called. All other modes
+        # require credentials and authenticate on startup.
+        if cfg.paper_mode:
+            self.auth = None
+            logger.info(
+                "Paper mode: connecting unauthenticated; no /private/* "
+                "endpoints will be called",
             )
-        self.auth = DeribitAuth(cfg.client_id, cfg.client_secret, cfg.rest_base_url)
+        else:
+            if not cfg.client_id or not cfg.client_secret:
+                raise RuntimeError(
+                    "Deribit credentials missing — set DERIBIT_TESTNET_CLIENT_ID + "
+                    "_SECRET in .env before running the engine",
+                )
+            self.auth = DeribitAuth(cfg.client_id, cfg.client_secret, cfg.rest_base_url)
         self.rest = DeribitRESTClient(self.auth, cfg.rest_base_url)
         await self.rest.__aenter__()  # opens the httpx session
 
-        # Sanity-check: authenticate + fetch account
-        summary = await self.rest.get_account_summary(currency=cfg.currency)
-        account_equity_btc = float(summary.get("equity", 0.0) or 0.0)
-        logger.info(
-            "Deribit auth OK — account equity %.4f %s",
-            account_equity_btc, cfg.currency,
-        )
+        if cfg.paper_mode:
+            # No account on Deribit; equity is synthetic.
+            account_equity_btc = 0.0
+            logger.info(
+                "Paper mode: synthetic equity=$%.0f (no Deribit account)",
+                cfg.paper_initial_equity_usd,
+            )
+        else:
+            # Sanity-check: authenticate + fetch account
+            summary = await self.rest.get_account_summary(currency=cfg.currency)
+            account_equity_btc = float(summary.get("equity", 0.0) or 0.0)
+            logger.info(
+                "Deribit auth OK — account equity %.4f %s",
+                account_equity_btc, cfg.currency,
+            )
 
         # ── Phase 2: Market data buffers + WebSocket ──
         self.perp_buffer = TradeBuffer(
@@ -235,6 +254,10 @@ class TradingEngine:
         self.ws = DeribitWebSocketClient(
             cfg.ws_url, auth=self.auth, on_reconnect=_on_ws_reconnect,
         )
+        # Paper mode uses the 100ms aggregated trade channels which work
+        # without WS auth; production runs use .raw which Deribit gates
+        # behind authentication in some configurations.
+        trades_interval = "100ms" if cfg.paper_mode else "raw"
         self.subscriber = MarketDataSubscriber(
             ws=self.ws,
             perp_buffer=self.perp_buffer,
@@ -243,6 +266,7 @@ class TradingEngine:
             currency=cfg.currency,
             dte_min_days=0.0,
             dte_max_days=21.0,
+            trades_interval=trades_interval,
         )
 
         self.bar_clock = BarClock(bar_minutes=cfg.bar_minutes)
@@ -524,11 +548,17 @@ class TradingEngine:
         # via the index price.  On subsequent bars we track via realized PnL.
         index_info = await self.rest.get_index_price(index_name=f"{cfg.currency.lower()}_usd")
         index_price_usd = float(index_info.get("index_price", 0.0) or 0.0)
-        initial_equity_usd = (
-            account_equity_btc * index_price_usd
-            if account_equity_btc > 0 and index_price_usd > 0
-            else cfg.initial_equity * 60_000.0  # fallback to 1 BTC × $60k
-        )
+        if cfg.paper_mode:
+            # Paper run: seed from paper_initial_equity_usd so the
+            # per-trade dollar PnL distribution lines up with the V2
+            # backtest convention ($100K starting equity).
+            initial_equity_usd = cfg.paper_initial_equity_usd
+        else:
+            initial_equity_usd = (
+                account_equity_btc * index_price_usd
+                if account_equity_btc > 0 and index_price_usd > 0
+                else cfg.initial_equity * 60_000.0  # fallback to 1 BTC × $60k
+            )
         self.equity_tracker = EquityTracker(initial_equity_usd=initial_equity_usd)
         self.position_tracker = PositionTracker()
         self.store = SQLiteStore(cfg.sqlite_db)
@@ -1534,6 +1564,31 @@ class TradingEngine:
         """
         if self.rest is None:
             return
+        if self.config.paper_mode:
+            # No exchange-side positions exist in paper mode; the engine
+            # simulates fills locally. DB-side state still matters (a
+            # crash mid-trade leaves an open position record we should
+            # resume), but exchange reconciliation is a no-op.
+            db_positions: list[dict] = []
+            if self.store is not None:
+                try:
+                    db_positions = await self.store.load_open_positions()
+                except Exception as exc:
+                    logger.error(
+                        "Paper-mode startup: load_open_positions failed: %s",
+                        exc,
+                    )
+            for db_row in db_positions:
+                await self._resume_trade(db_row)
+            if db_positions:
+                logger.info(
+                    "Paper-mode startup: resumed %d DB positions (no "
+                    "exchange query in paper mode)",
+                    len(db_positions),
+                )
+            else:
+                logger.info("Paper-mode startup: no DB positions to resume")
+            return
 
         # ── 1. Load DB positions ──
         db_positions: list[dict] = []
@@ -1817,7 +1872,13 @@ class TradingEngine:
                             "Emergency close failed for %s: %s", instrument, exc,
                         )
 
-        # 3. Flatten perp hedge
+        # 3. Flatten perp hedge (skip in paper mode — no real positions)
+        if self.config.paper_mode:
+            summary = f"Emergency close complete: {closed} fills. Reason: {reason}"
+            logger.warning(summary)
+            if self.telegram is not None:
+                self.telegram.send("error", summary)
+            return
         try:
             perp_positions = await self.rest.get_positions(
                 currency=self.config.currency, kind="future",
@@ -1852,6 +1913,10 @@ class TradingEngine:
     async def _reconcile_equity(self) -> None:
         """Compare internal equity tracker with exchange account summary."""
         if self.rest is None or self.equity_tracker is None:
+            return
+        if self.config.paper_mode:
+            # Paper mode has no exchange-side equity to reconcile against;
+            # internal tracker is the source of truth.
             return
         try:
             summary = await self.rest.get_account_summary(

@@ -52,6 +52,18 @@ class PaperConfig:
     client_secret: str = ""
     rest_base_url: str = "https://test.deribit.com/api/v2"
     ws_url: str = "wss://test.deribit.com/ws/api/v2"
+    # Paper mode: connect to the configured venue (typically prod) for
+    # real market data, but never authenticate for private endpoints
+    # and never submit orders. Requires no Deribit API credentials.
+    # Implies ``dry_run=True`` (enforced by the CLI). Used for live
+    # signal-stack validation against real mainnet quotes without any
+    # account-side risk.
+    paper_mode: bool = False
+    # Synthetic starting equity (USD) when ``paper_mode`` is on and no
+    # exchange account is being read. Defaults match V2 backtest
+    # conventions ($100K) so the per-trade dollar PnL distribution is
+    # directly comparable to ``BTC_v2_trade_log.parquet``.
+    paper_initial_equity_usd: float = 100_000.0
 
     # ── Strategy (mirrors BacktestConfig) ──────────────────────────
     currency: str = "BTC"
@@ -374,7 +386,7 @@ class PaperConfig:
         for path in (self.state_dir, self.logs_dir):
             Path(path).mkdir(parents=True, exist_ok=True)
 
-    def switch_to_prod(self) -> None:
+    def switch_to_prod(self, *, paper_mode: bool = False) -> None:
         """Flip the venue URLs to production Deribit.
 
         This should ONLY be called after Phase 7 validation passes and
@@ -382,13 +394,20 @@ class PaperConfig:
         default venue is testnet and stays testnet unless this is
         invoked.  ``DERIBIT_PROD_CLIENT_ID`` / ``_SECRET`` must be set
         separately — we refuse to reuse testnet credentials on prod.
+
+        When ``paper_mode=True``, mainnet URLs are still set but
+        credentials are NOT required: the engine connects to public
+        WS channels only and the dry-run safety belt prevents any
+        order submission. If ``DERIBIT_PROD_*`` env vars happen to be
+        set anyway they will be loaded but unused (auth never fires).
         """
         self.venue = "prod"
         self.rest_base_url = "https://www.deribit.com/api/v2"
         self.ws_url = "wss://www.deribit.com/ws/api/v2"
+        self.paper_mode = paper_mode
         self.client_id = os.environ.get("DERIBIT_PROD_CLIENT_ID", "")
         self.client_secret = os.environ.get("DERIBIT_PROD_CLIENT_SECRET", "")
-        if not self.client_id or not self.client_secret:
+        if not paper_mode and (not self.client_id or not self.client_secret):
             raise RuntimeError(
                 "switch_to_prod() requires DERIBIT_PROD_CLIENT_ID and "
                 "DERIBIT_PROD_CLIENT_SECRET in the environment — refusing "

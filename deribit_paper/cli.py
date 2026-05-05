@@ -109,6 +109,19 @@ def _parse_args() -> argparse.Namespace:
         help="Python logging level (default: INFO)",
     )
     parser.add_argument(
+        "--paper",
+        action="store_true",
+        help=(
+            "Paper-trade against Deribit MAINNET quotes. Implies --venue prod "
+            "and --dry-run; no real orders are submitted. No DERIBIT_PROD_* "
+            "credentials required (public WS only via 100ms trade aggregates "
+            "+ public ticker / index price endpoints). Fills simulated via "
+            "the existing 3-tier IOC ladder against real mainnet quotes; "
+            "trades log to vol_arb/output/live_trades_harness.parquet plus "
+            "the SQLite store. Mutually exclusive with --live."
+        ),
+    )
+    parser.add_argument(
         "--allow-stale-aligner",
         action="store_true",
         help=(
@@ -204,7 +217,25 @@ def main() -> None:
             "--allow-stale-aligner: bypassing β* staleness check "
             "(predictions may be biased toward older regime)",
         )
-    if args.venue == "prod":
+    if args.paper and args.live:
+        print(
+            "Error: --paper and --live are mutually exclusive. "
+            "--paper implies dry-run; --live submits real orders.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.paper:
+        # --paper is an umbrella flag: mainnet venue, dry-run safety belt,
+        # no credentials required. We honour --venue prod even when set
+        # explicitly, but ignore --venue testnet to avoid confusion (paper
+        # mode is fundamentally a "real data, no orders" run).
+        cfg.switch_to_prod(paper_mode=True)
+        logging.getLogger("cli").info(
+            "Paper mode: mainnet quotes, simulated fills via IOC ladder, "
+            "no credentials required",
+        )
+    elif args.venue == "prod":
         cfg.switch_to_prod()
 
     if args.live:
@@ -222,8 +253,8 @@ def main() -> None:
         pass
 
     logging.getLogger("cli").info(
-        "Starting deribit_paper venue=%s dry_run=%s",
-        cfg.venue, get_dry_run(),
+        "Starting deribit_paper venue=%s paper_mode=%s dry_run=%s",
+        cfg.venue, cfg.paper_mode, get_dry_run(),
     )
 
     if args.test_auth:
@@ -321,8 +352,8 @@ async def _run_engine(cfg: PaperConfig, duration_minutes: int) -> int:
     logger = logging.getLogger("paper")
     logger.info("=" * 60)
     logger.info("  STARTING DERIBIT PAPER ENGINE")
-    logger.info("  venue=%s  dry_run=%s  duration=%s",
-                cfg.venue, get_dry_run(),
+    logger.info("  venue=%s  paper_mode=%s  dry_run=%s  duration=%s",
+                cfg.venue, cfg.paper_mode, get_dry_run(),
                 f"{duration_minutes}min" if duration_minutes > 0 else "forever")
     logger.info("=" * 60)
 

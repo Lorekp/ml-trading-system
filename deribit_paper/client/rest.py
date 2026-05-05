@@ -71,11 +71,15 @@ class DeribitRESTClient:
 
     def __init__(
         self,
-        auth: DeribitAuth,
+        auth: DeribitAuth | None,
         rest_base_url: str,
         max_retries: int = 3,
         retry_base_delay: float = 0.5,
     ):
+        # ``auth`` may be None in paper-mode where the engine connects
+        # to mainnet for read-only public quotes (ticker, index price)
+        # and never invokes a private endpoint. Authenticated requests
+        # raise a clear error rather than crashing on AttributeError.
         self._auth = auth
         self._rest_base_url = rest_base_url.rstrip("/")
         self._max_retries = max_retries
@@ -279,6 +283,13 @@ class DeribitRESTClient:
         http = await self._ensure_http()
         headers: dict[str, str] = {}
         if authenticated:
+            if self._auth is None:
+                raise DeribitAuthError(
+                    f"REST endpoint {path} requires authentication but no "
+                    "DeribitAuth instance was provided (paper_mode=True "
+                    "with no DERIBIT_PROD_* credentials). The caller "
+                    "should gate this call on cfg.paper_mode.",
+                )
             token = await self._auth.get_token()
             headers["Authorization"] = f"Bearer {token}"
 

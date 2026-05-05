@@ -5664,3 +5664,167 @@ the OUTCOME. The plan-default path (pre-gate halt) and the user-
 override path (run all 5 strategies through the post-hoc gate) both
 produce the same shipping decision: REJECT, ship as opt-in only,
 canonical V2 byte-identity preserved.
+
+
+## Stage 38: V2 Cycle 4 — Conditional-Shortfall Classifier (DFL panel + sigma_epi_squared) (2026-05-05)
+
+Cycle 4 closes out the sigma_epi-on-V2 research direction with a
+falsifiable controlled comparison. Stage 37 (Cycle 3) found that
+sigma_epi has the wrong sign for V2's edge structure (rho = -0.178
+with |trade NC PnL|), an artifact of conditioning on V2's
+|edge|-filtered entry rule (collider-bias-like). The Stage-37 critique
+reframed: the right question is not "does sigma_epi disagree"
+(parameter-space) but "does adding sigma_epi to the DFL Head decision
+panel improve a downside-asymmetric, decision-aligned classifier —
+P(trade_PnL < -X)?". DFL Head (Stage 28) already shipped a
+positive-Sharpe filter on a 10-feature panel with target P(win);
+Cycle 4 reuses the panel verbatim and tests whether sigma_epi adds
+information.
+
+Plan: ``C:\Users\laure\.claude\plans\now-check-empirically-from-eager-bird.md``.
+
+### Phase A.0 — Walk-forward sigma_epi regeneration
+
+**Problem with the Cycle 3 ensemble parquet**: ``train_purged_cv``
+with ``n_splits=5`` over the FULL 2021-01 -> 2026-03 span (verified
+via ``BTC_v2_har_pd_ensemble_var.meta.json`` ``n_splits_purged_cv: 5``).
+PurgedKFold prevents adjacent-bar leakage but does NOT enforce
+strict time-causality across years: a 2024 OOF prediction was made
+by a model whose training set in some folds spans 2025. For a
+walk-forward shortfall classifier (DFL Head expanding-by-year
+contract), sigma_epi as a feature would carry information DFL
+features cannot access — synthetic AUC delta of arbitrary size.
+
+**Fix**: Phase A.0 regenerates sigma_epi under expanding-window-by-year
+training. For each test year T in {2023, 2024, 2025}: train K=10
+ensemble on data with timestamp < T-01-01 (pre-winsorize using
+pre-T-quantiles for walk-forward causality of winsorize parameters),
+predict on year T using the ensemble's K-fold-averaged predictions,
+combine with HQR aleatoric (cal window inside training data).
+
+Output: ``vol_model/output/BTC_v2_har_pd_ensemble_var_walkforward.parquet``
+(NEW; the Cycle 3 K-fold parquet preserved verbatim at the legacy path).
+
+Per-year empirical 90% PI coverage: 2023 = 0.852, 2024 = 0.962,
+2025 = 0.944. The 2024 over-coverage is borderline (target [0.85, 0.95])
+but acceptable; gate is on AUC delta, not PI calibration.
+
+### Phase A.1 — Three-classifier walk-forward training (with fairness parity)
+
+Three LightGBM classifiers, **identical** ``DFL_LGBM_PARAMS``,
+**identical** walk-forward year folds (mirrors
+``vol_arb.dfl_head.compute_walkforward_scores``), only the feature
+set differs:
+
+- **BASELINE**: 10 DFL features verbatim (``DFL_HEAD_FEATURES``)
+- **TREATMENT**: 10 DFL + ``sigma_epi_squared`` (the variance, not std)
+- **PLACEBO**: 10 DFL + within-year-shuffled ``sigma_epi_squared``
+  (defence-in-depth leakage probe; deterministic seed 4242)
+
+**Critical discipline implemented mid-cycle — fairness parity**:
+First Phase A.1 run produced an UNFAIR comparison. BASELINE trained
+on year-2022 fired trades (DFL features non-NaN there); TREATMENT
+dropped year 2022 because ``sigma_epi_squared`` is NaN by Phase A.0
+walk-forward design. So BASELINE 2024 trained on 4,131 trades but
+TREATMENT 2024 trained on 1,389 — confounding "sigma_epi adds info"
+with "TREATMENT trains on less data". Fix: ``shortfall_head.py``
+gained a ``fairness_columns`` kwarg that forces all three classifiers
+to drop rows where ANY of the 11 features is NaN, before per-classifier
+column subsetting. Driver passes ``SHORTFALL_FEATURES_TREATMENT``
+verbatim. Regression test ``test_fairness_columns_enforces_same_training_rows``
+locks the contract.
+
+**Pre-committed shortfall threshold**: X = $200 (locked PRE-experiment
+based on power analysis — 5.91% positive rate globally; X=$500 sparse
+at 1.35%; X=$1000 degenerate at 0% in train). X=$500 reported as
+descriptive secondary, no decision axis. X=$1000 dropped.
+
+Phase A.1 output (post-fairness-fix): pooled-OOS AUC across test
+years {2024, 2025} (year 2023 skipped — fairness parity makes 2022
+training data invalid for BASELINE under the sigma_epi-non-NaN
+constraint, which leaves test_y=2023 with zero training history):
+
+| Classifier | Pooled AUC | Year 2024 | Year 2025 |
+|---|---:|---:|---:|
+| BASELINE  | 0.6230 | 0.5551 | 0.6862 |
+| TREATMENT | 0.6237 | 0.5482 | 0.6927 |
+| PLACEBO   | 0.6083 | 0.5129 | 0.6988 |
+
+**Pooled dAUC = TREATMENT - BASELINE = +0.0007** (essentially zero).
+
+### Phase B — Pre-committed AUC-delta gate (FAIL on all 4)
+
+Conjunctive gate (locked before Phase A.1):
+
+| Gate | Threshold | Observed | Verdict |
+|---|---|---|---|
+| G1 - pooled AUC delta | >= +0.020 | +0.0007 | **FAIL** |
+| G2 - 95% block-bootstrap CI lower bound (mean block 5d, paired by day, n_reps=1000, Politis-Romano stationary) | > 0 | LCB = -0.0210 (UCB +0.0207) | **FAIL** |
+| G3 - paired DeLong p (Sun-Xu 2014 closed form, one-sided) | < 0.010 | p = 0.469 | **FAIL** |
+| G4 - \|placebo delta\| (within-year shuffle) | < 0.005 | -0.0147 | **FAIL** |
+
+ALL FOUR fail. Phase C (sidecar filter under Tier C-2) NOT authorized.
+Honest reject. Cycle 3 + Cycle 4 jointly closed on the sigma_epi axis.
+
+Descriptive X=$500 secondary: pooled dAUC = -0.0044 (NO decision axis;
+reported for transparency).
+
+### Cycle ledger update
+
+| Cycle | Kind | Outcome |
+|---|---|---|
+| Cycle 1 (Stage 32) | Tail-risk Tier C-2 vega-stop sweep | REJECT |
+| Cycle 2 (Stage 36) | OU MC infra + preventative sizing | REJECT (rule non-binds at scale) |
+| Cycle 3 (Stage 37) | Deep-ensemble + HQR + 5 overlays (sigma_epi as filter/scaler) | REJECT (anti-economic, rho = -0.178 with \|trade PnL\|) |
+| **Cycle 4 (Stage 38)** | **sigma_epi as feature in decision-aligned shortfall classifier (DFL panel + 1 extra)** | **REJECT - gate fails on all 4 sub-gates; closes the sigma_epi-on-V2 research direction definitively** |
+
+### Why this closes the question
+
+The Cycle 3 finding (sigma_epi has wrong sign) survived a more
+sophisticated test. The decision-aligned reframing (Stage-37 critique)
+predicted that "if sigma_epi adds information, it shows up only when
+conditioned on the DFL decision panel". Cycle 4 ran that test cleanly
+under fairness parity. The decision-aligned sigma_epi adds **+0.0007 AUC**
+versus baseline (vs +0.020 gate) — i.e., zero. Even ignoring the gate,
+the placebo AUC (random shuffle of sigma_epi) is only **-0.0147** below
+baseline, while real sigma_epi is **+0.0007** above — the "information
+content" of real sigma_epi over random is ~+0.015, still below the gate
+and not statistically distinguishable from sample noise (DeLong p=0.47,
+bootstrap CI straddles zero).
+
+**Recommendation for future cycles**: the Stage-37 critique's full
+ranked decision tree applies. Don't escalate ensemble strength
+(transformer-with-dropout, K=20, variational LightGBM) — the structural
+issue (entry-threshold collider on |edge|) survives model-class change.
+Don't reinvestigate sigma_epi on V2's existing 44-base + HAR-PD + DFL panel.
+Pivot to alternative decision-aligned signal definitions that aren't
+correlated with |edge|: e.g., expected SHORTFALL conditional on edge
+direction-uncertainty (instead of edge-magnitude uncertainty), or
+features derived from V2's failure-mode taxonomy (high-vega single-day
+blowups vs slow-grind loss runs — already empirically separated by
+the P&L throttle's autocorrelation analysis).
+
+### Critical files
+
+**New (Cycle 4)**:
+- ``vol_arb/shortfall_head.py`` — three-classifier API + DeLong + block bootstrap + composite gate
+- ``scripts/regenerate_walkforward_ensemble_variance.py`` — Phase A.0 (walk-forward sigma_epi)
+- ``scripts/run_shortfall_classifier.py`` — Phase A.1 driver (with fairness parity)
+- ``scripts/evaluate_shortfall_auc_gate.py`` — Phase B gate evaluator (renders V4_SHORTFALL_HEAD.md)
+- ``scripts/generate_shortfall_filter_sidecars.py`` — Phase C generator (NOT executed; gate failed)
+- ``scripts/evaluate_shortfall_filter_gate.py`` — Phase C evaluator (NOT executed)
+- ``tests/test_shortfall_head.py`` (38 tests)
+- ``tests/test_shortfall_overlays.py`` (18 tests)
+- ``tests/test_walkforward_ensemble_regeneration.py`` (13 tests)
+- ``vol_model/output/BTC_v2_har_pd_ensemble_var_walkforward.parquet`` (frozen, refused-on-overwrite)
+- ``vol_arb/output/BTC_v2_shortfall_oos_predictions.parquet`` (frozen)
+- ``vol_arb/output/V4_SHORTFALL_HEAD.md`` (gate report)
+
+**Untouched** (intentional): ``vol_arb/backtester.py`` (Phase C would have
+reused the existing ``uncertainty_filter_path`` flag from Cycle 3 — no
+code changes required); ``vol_model/uncertainty.py`` (Phase A.0 calls
+existing API verbatim); ``vol_arb/uncertainty_overlays.py`` (Phase C
+would have reused the boolean filter sidecar contract from Cycle 3).
+
+268/268 regression tests green incl 69 new Cycle 4 tests + Cycle 3
++ DFL head + Kelly + uncertainty + leakage probes + V2 byte-identity.

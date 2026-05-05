@@ -382,3 +382,62 @@ class TestBacktesterIntegration:
         # would require BTC production data we don't want to load in
         # a unit test.
         assert cfg.preventative_size_mult_path == str(sidecar_path)
+
+
+# ─── 8. NC-path mirror regression (Cycle 3 bug fix) ───────────────────
+
+
+class TestNCPathMirror:
+    """Regression test for the Cycle-3 backtester fix.
+
+    Pre-fix: the non-compound (NC) path at backtester.py:2260+ mirrored
+    the Kelly K1 multiplier but NOT the preventative-sizing multiplier
+    or the uncertainty filter. This made any rule using
+    ``preventative_size_mult_path`` or ``uncertainty_filter_path``
+    appear NON-BINDING on ``net_pnl_nc`` even when it was binding on
+    the compound path.
+
+    Post-fix: both NC overlays mirror their compound-side counterparts.
+    These tests lock the post-fix behavior so any future regression
+    that re-introduces the gap will fail.
+    """
+
+    def test_preventative_sizing_actually_binds_on_NC(self):
+        """Cycle 2 preventative sizing must reduce NC PnL post-fix.
+
+        Pre-fix this delta was +$18 (essentially no-op). Post-fix it
+        is around -$18,624 (~-2%). Lock the order of magnitude.
+        """
+        from vol_arb.backtester import BacktestConfig, VolArbBacktester
+        sidecar = Path("vol_arb/output/BTC_v2_preventative_size_mult.parquet")
+        if not sidecar.exists():
+            pytest.skip(f"sidecar {sidecar} not generated")
+
+        cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+        cfg.preventative_size_mult_path = str(sidecar)
+        _, tl = VolArbBacktester(cfg).run_backtest()
+        nc_pnl_with = float(tl["net_pnl_nc"].sum())
+        # Canonical baseline = $959,571.0653
+        delta = nc_pnl_with - 959_571.0653
+        # Should be a real reduction (rule binds): delta is negative and
+        # of meaningful magnitude. Lock to require at least -$5,000.
+        assert delta < -5_000.0, (
+            f"NC-path mirror regression: preventative sizing produced "
+            f"delta=${delta:+,.0f}, expected ≤ -$5,000 (rule must actually "
+            "bind on NC path)"
+        )
+
+    def test_bare_v2_byte_identity_preserved(self):
+        """The NC-path fix MUST preserve V2 byte-identity when no
+        overlays are active.
+        """
+        from vol_arb.backtester import BacktestConfig, VolArbBacktester
+        cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+        # Both overlay flags default off
+        assert cfg.preventative_size_mult_path is None
+        assert cfg.uncertainty_filter_path is None
+        _, tl = VolArbBacktester(cfg).run_backtest()
+        nc_pnl = float(tl["net_pnl_nc"].sum())
+        n_fired = int((tl["net_pnl_nc"] != 0).sum())
+        assert abs(nc_pnl - 959_571.0653) < 1.0, f"NC PnL drift: {nc_pnl}"
+        assert n_fired == 7417, f"Fired count drift: {n_fired}"

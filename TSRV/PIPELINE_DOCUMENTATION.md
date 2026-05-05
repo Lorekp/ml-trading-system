@@ -5606,3 +5606,61 @@ methodology.
    `vol_model/uncertainty.py`) is now production-ready** in the sense
    that any future cycle can call it and get calibrated PIs without
    re-deriving the methodology.
+
+### Stage 37 amendment: user override + NC-path bug fix (mid-cycle)
+
+User explicitly authorised proceeding to Phase P over the documented
++0.119 pre-gate fail. Running the 5-strategy gate then surfaced a real
+bug in the backtester's non-compound (NC) path: the NC sizing pipeline
+at `vol_arb/backtester.py:2260+` mirrored the Kelly K1 multiplier but
+NOT the preventative-sizing or uncertainty-filter overlays. Pre-fix,
+the gate evaluator saw Cycle-3 S2 produce ΔNC PnL ≈ -$1 and Cycle-2
+preventative sizing produce ΔNC PnL ≈ +$18 — both APPARENTLY no-ops
+but actually rules whose effect was being lost between the compound
+loop and the NC vector pipeline.
+
+**Fix** (`vol_arb/backtester.py:2280-2300`): added two new NC-mirror
+blocks alongside the existing Kelly K1 mirror — one zeros `N_nc` on
+bars where the uncertainty filter forced signal→0; the other multiplies
+`N_nc` by the same per-bar `_prev_applied_arr` used on the compound
+loop. Bare V2 byte-identity preserved ($959,571.0653 / 7,417 trades).
+Two regression tests in `tests/test_preventative_sizing.py::TestNCPathMirror`
+lock the post-fix behavior.
+
+**Cycle-2 preventative-sizing conclusion partially revised**: the
+Stage 36 verdict ("rule rejected because compound equity growth makes
+it non-binding") was partially miscalibrated — the rule was actually
+non-APPLYING on the NC path, not non-binding. Post-fix, the Cycle-2
+sidecar produces ΔNC PnL = -$18,624 (real -2% reduction). The REJECT
+verdict still stands but for a different mechanistic reason: the rule
+binds and HURTS PnL by 2% rather than helping; it just never reached
+the gate evaluator's metric in the original Cycle-2 run.
+
+**Cycle-3 5-strategy gate result** (post-fix, with override):
+
+| Tag | Kind | NC PnL | ΔPnL | Fired | ΔSharpe(eval) | OOS cut | Adopt? |
+|---|---|---:|---:|---:|---:|---:|---|
+| F1 | drop top-1% σ²_epi | $946,611 | -$12,960 | 7267 | -0.106 | +$15 | FAIL |
+| F2 | drop top-5% σ²_epi | $915,261 | -$44,310 | 6714 | -0.272 | +$84 | FAIL |
+| F3 | drop top-10% σ²_epi | $851,467 | -$108,104 | 6046 | -0.626 | +$101 | FAIL |
+| S1 | f = 1/(1+σ²/median) | $454,848 | -$504,723 | 7417 | -1.253 | -$818 | FAIL |
+| S2 | f = σ²_train/(σ²_train+σ²_epi) | $671,347 | -$288,224 | 7417 | -0.799 | -$322 | FAIL |
+
+**ALL 5 strategies REJECT decisively.** Every filter REDUCES PnL and
+Sharpe; every scaler is severely net-negative. The σ²_epi signal is
+**economically anti-aligned** with V2's edge structure. This confirms
+the Phase R audit's PnL correlation finding ρ = -0.178 — high-σ²_epi
+trades carry HIGHER expected absolute PnL than typical (V2's existing
+entry threshold already filters by edge magnitude; trades that survive
+the filter on high-σ²_epi bars are the high-edge trades worth taking).
+
+**Reading**: deep-ensemble VARIANCE is a poor proxy for "this trade
+was a bad idea" in V2's setup. Future OOD-detection cycles should
+explore alternative signal definitions (e.g., density-based distance-
+to-training-manifold) rather than ensemble disagreement.
+
+**User override outcome**: the override changed the WORK PATH, not
+the OUTCOME. The plan-default path (pre-gate halt) and the user-
+override path (run all 5 strategies through the post-hoc gate) both
+produce the same shipping decision: REJECT, ship as opt-in only,
+canonical V2 byte-identity preserved.

@@ -175,13 +175,14 @@ def _run_strategy(
     gate_pass = pass_psr and pass_oos and pass_sharpe
 
     logger.info(
-        "[%s] PSR_p10=%+.4f (haircut %+.4f), OOS_cut=$%+,.0f, ΔSharpe(eval)=%+.4f",
-        tag, psr_delta_p10, psr_delta_p10_haircut, oos_worst_cut, -sharpe_drop_eval,
+        f"[{tag}] PSR_p10={psr_delta_p10:+.4f} "
+        f"(haircut {psr_delta_p10_haircut:+.4f}), "
+        f"OOS_cut=${oos_worst_cut:+,.0f}, "
+        f"dSharpe(eval)={-sharpe_drop_eval:+.4f}"
     )
     logger.info(
-        "[%s] gate sub-results: PSR=%s, OOS=%s, Sharpe=%s → %s",
-        tag, pass_psr, pass_oos, pass_sharpe,
-        "ADOPT" if gate_pass else "REJECT",
+        f"[{tag}] gate: PSR={pass_psr}, OOS={pass_oos}, Sharpe={pass_sharpe} "
+        f"-> {'ADOPT' if gate_pass else 'REJECT'}"
     )
 
     return StrategyResult(
@@ -333,20 +334,20 @@ def main() -> int:
 
     print()
     print("=" * 70)
-    print(" V2 EPISTEMIC-UNCERTAINTY OVERLAY — GATE RESULT")
+    print(" V2 EPISTEMIC-UNCERTAINTY OVERLAY -- GATE RESULT")
     print("=" * 70)
     for r in results:
         flag = "PASS" if r.gate_pass else "FAIL"
         print(
             f"  [{r.tag}] {flag}  PSR={r.psr_delta_p10_haircut:+.3f}  "
-            f"OOS={r.oos_worst_cut:+,.0f}  ΔSh={-r.sharpe_drop_eval:+.3f}  "
-            f"ΔPnL=${r.pnl_delta:+,.0f}"
+            f"OOS=${r.oos_worst_cut:+,.0f}  dSh={-r.sharpe_drop_eval:+.3f}  "
+            f"dPnL=${r.pnl_delta:+,.0f}"
         )
     print("=" * 70)
     if passing:
         print(f"  ADOPT [{passing[0].tag}] AS DEFAULT")
     else:
-        print("  REJECT — ship 5 as opt-in")
+        print("  REJECT -- ship 5 as opt-in")
     print("=" * 70)
     return 0
 

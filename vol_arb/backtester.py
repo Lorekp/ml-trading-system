@@ -2277,6 +2277,28 @@ class VolArbBacktester:
                 N_nc = np.minimum(N_nc, dynamic_btc_cap)
                 N_nc = np.where(signal == 0, 0.0, N_nc)
 
+            # ── Uncertainty filter on NC path (Cycle 3 Phase P) ──
+            # Mirror the compound-loop filter: zero N_nc on bars where
+            # ``_uncert_filter_applied_arr`` is True, i.e. the
+            # epistemic-uncertainty filter forced signal→0. Without this,
+            # the NC PnL would not reflect dropped trades and the gate
+            # evaluator would see no change.
+            if _uncert_filter_arr is not None:
+                N_nc = np.where(_uncert_filter_applied_arr, 0.0, N_nc)
+
+            # ── Preventative / uncertainty-scaler shrink on NC path ──
+            # Mirror the compound-loop multiplier: multiply N_nc by the
+            # SAME per-bar f ∈ [f_min, 1.0] that was applied to N. Bars
+            # where the rule did not bind (pm == 1.0) leave
+            # _prev_applied_arr at 1.0 (no-op multiplication). Cycle-2
+            # preventative-sizing AND Cycle-3 uncertainty-scalers (S1/S2)
+            # share this contract via the ``preventative_size_mult_path``
+            # config flag; both rely on this NC-mirror to register on
+            # the gate evaluator's ``net_pnl_nc`` series.
+            if _prev_mult_arr is not None:
+                N_nc = N_nc * _prev_applied_arr
+                N_nc = np.where(signal == 0, 0.0, N_nc)
+
             # ── Kelly-shrinkage boost on NC path ──
             # Mirror the compound-loop application: multiply N_nc by the
             # same per-bar Kelly multiplier that was applied to N. Without

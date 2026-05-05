@@ -15,17 +15,57 @@ logger = logging.getLogger(__name__)
 
 def download_dvol(client: DeribitClient, currency: str, start: str, end: str,
                   resolution: str, output_dir: Path) -> Path:
-    """Download DVOL for one currency. Chunks by day to stay under 5000-candle limit."""
+    """Download DVOL for one currency. Chunks by day to stay under 5000-candle limit.
+
+    Append-friendly: if ``out_path`` already exists, the requested
+    ``start`` is silently advanced to one resolution-step after the
+    existing parquet's last timestamp, so monthly refreshes only
+    download the new tail. Concat + dedupe handles overlap. The file
+    is rewritten atomically via ``tmp + replace``. If the requested
+    range is fully covered already, the original file is returned
+    unmodified.
+    """
     res_label = f"{int(resolution)//60}m" if resolution.isdigit() else resolution
     out_path = output_dir / "dvol" / f"{currency}_dvol_{res_label}.parquet"
-    if out_path.exists():
-        logger.info("DVOL %s already exists, skipping", currency)
-        return out_path
 
     s = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     e = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
-    all_rows = []
+    existing_df: pd.DataFrame | None = None
+    if out_path.exists():
+        try:
+            existing_df = pd.read_parquet(out_path)
+        except Exception as exc:  # noqa: BLE001 - corrupt parquet -> redownload
+            logger.warning(
+                "Existing DVOL %s unreadable (%s) -- redownloading from scratch",
+                out_path, exc,
+            )
+            existing_df = None
+        else:
+            if "timestamp" in existing_df.columns and len(existing_df):
+                last_ts = pd.to_datetime(existing_df["timestamp"]).max()
+                if last_ts.tz is None:
+                    last_ts = last_ts.tz_localize("UTC")
+                # Download starts strictly AFTER last_ts; the dedupe
+                # below covers any overlap from boundary rounding.
+                advance_to = (last_ts + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0,
+                )
+                if advance_to >= e:
+                    logger.info(
+                        "DVOL %s already covers %s through %s (>= requested end %s) - no work",
+                        currency, existing_df["timestamp"].min(), last_ts, end,
+                    )
+                    return out_path
+                if advance_to > s:
+                    logger.info(
+                        "DVOL %s incremental: existing covers through %s; "
+                        "downloading %s to %s",
+                        currency, last_ts, advance_to.strftime("%Y-%m-%d"), end,
+                    )
+                    s = advance_to
+
+    all_rows: list[dict] = []
     day = s
     while day < e:
         next_day = day + timedelta(days=1)
@@ -44,13 +84,34 @@ def download_dvol(client: DeribitClient, currency: str, start: str, end: str,
 
         day = next_day
 
-    if not all_rows:
+    if not all_rows and existing_df is None:
         logger.warning("No DVOL data for %s", currency)
         return out_path
+    if not all_rows:
+        logger.info(
+            "DVOL %s: no new data in [%s, %s) - existing file unchanged",
+            currency, start, end,
+        )
+        return out_path
 
-    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    new_df = pd.DataFrame(
+        all_rows, columns=["timestamp", "open", "high", "low", "close"],
+    )
+    new_df["timestamp"] = pd.to_datetime(new_df["timestamp"], unit="ms", utc=True)
+
+    if existing_df is not None and len(existing_df):
+        # Coerce existing timestamps to a tz-aware DatetimeIndex matching
+        # new_df, then concat + dedupe + sort.
+        existing_df["timestamp"] = pd.to_datetime(
+            existing_df["timestamp"], utc=True,
+        )
+        df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        df = new_df
+
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values(
+        "timestamp",
+    ).reset_index(drop=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(".tmp")

@@ -26,9 +26,24 @@ EXIT_CODE_SHUTDOWN=42
 backoff=$INITIAL_BACKOFF
 restart_count=0
 
+# Pick the Python interpreter — homeserver has python3, dev boxes
+# may have either. Prefer python3, fall back to python.
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PY=python3
+    elif command -v python >/dev/null 2>&1; then
+        PY=python
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FATAL: no python interpreter found (tried python3, python)"
+        exit 127
+    fi
+fi
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Using interpreter: $PY ($($PY --version 2>&1))"
+
 while true; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting engine (restart #${restart_count})..."
-    python -m deribit_paper.cli --run-paper "$@"
+    "$PY" -m deribit_paper.cli --run-paper "$@"
     rc=$?
 
     if [ $rc -eq 0 ]; then

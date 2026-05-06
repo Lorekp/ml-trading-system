@@ -153,6 +153,21 @@ class DeribitRESTClient:
             authenticated=False,
         )
 
+    async def get_server_time_ms(self) -> int:
+        """H12 (2026-05-06): return Deribit server time in milliseconds.
+
+        Used at startup to check local-vs-server clock skew. The
+        ``/public/get_time`` endpoint returns the server's UTC timestamp
+        as an integer millisecond count. Public, unauthenticated.
+        """
+        result = await self._request(
+            "GET",
+            "/public/get_time",
+            params={},
+            authenticated=False,
+        )
+        return int(result)
+
     # ── Private endpoints (auth required) ────────────────────────────
 
     async def get_account_summary(

@@ -100,6 +100,20 @@ CREATE TABLE IF NOT EXISTS bar_cursor (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bar_cursor_fired_at ON bar_cursor(fired_at);
+
+-- H4 (2026-05-06): profit_scale_state persists the
+-- ProfitScaleEstimator EMAs across restarts. Without this row, the
+-- engine restarted with gross_count=0, λ=0, est_gross collapsing to
+-- est_theo for the first ~200 trades, drifting away from V2-parity.
+-- Single-row table indexed at id=1 (mirrors the kill_switch_state
+-- pattern). Updated after every closed trade.
+CREATE TABLE IF NOT EXISTS profit_scale_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    gross_per_btc_ema_usd REAL NOT NULL,
+    gross_count INTEGER NOT NULL,
+    hedge_per_btc_ema_usd REAL NOT NULL,
+    last_updated TEXT NOT NULL
+);
 """
 
 
@@ -426,3 +440,51 @@ class SQLiteStore:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row[0]) if row else 0
+
+    # ── profit_scale_state (H4) ─────────────────────────────────────
+
+    async def load_profit_scale_state(self) -> dict | None:
+        """Return persisted ``ProfitScaleEstimator`` state, or None.
+
+        Engine reads this at startup and calls ``load_state(state)`` on
+        the estimator if non-None. Returns None if no row exists yet
+        (cold start) so the estimator keeps its constructor defaults.
+        """
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        cursor = await self._conn.execute(
+            "SELECT gross_per_btc_ema_usd, gross_count, hedge_per_btc_ema_usd, "
+            "last_updated FROM profit_scale_state WHERE id = 1",
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return {
+            "gross_per_btc_ema_usd": float(row[0]),
+            "gross_count": int(row[1]),
+            "hedge_per_btc_ema_usd": float(row[2]),
+            "last_updated": row[3],
+        }
+
+    async def save_profit_scale_state(self, state: dict) -> None:
+        """Persist a state dict from ``ProfitScaleEstimator.state_dict()``.
+
+        Idempotent — uses INSERT OR REPLACE keyed at id=1. Stamps
+        ``last_updated`` with the current UTC timestamp so an operator
+        can spot stale rows post-mortem.
+        """
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO profit_scale_state "
+            "(id, gross_per_btc_ema_usd, gross_count, hedge_per_btc_ema_usd, last_updated) "
+            "VALUES (1, ?, ?, ?, ?)",
+            (
+                float(state["gross_per_btc_ema_usd"]),
+                int(state["gross_count"]),
+                float(state["hedge_per_btc_ema_usd"]),
+                pd.Timestamp.now(tz="UTC").isoformat(),
+            ),
+        )
+        await self._conn.commit()

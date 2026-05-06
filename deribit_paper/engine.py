@@ -286,6 +286,47 @@ class TradingEngine:
         self.rest = DeribitRESTClient(self.auth, cfg.rest_base_url)
         await self.rest.__aenter__()  # opens the httpx session
 
+        # H12 (2026-05-06): clock-skew gate. The bar boundary uses the
+        # local system clock (BarClock); if it drifts vs Deribit's
+        # server clock, every signal fires at a slightly different
+        # offset relative to where the V2 backtest sampled. Warn at
+        # 250ms, refuse at 5s. Best-effort: failure to query
+        # /public/get_time logs a warning but does not block startup.
+        try:
+            server_ms = await self.rest.get_server_time_ms()
+            local_ms = int(time.time() * 1000)
+            skew_ms = abs(local_ms - server_ms)
+            if skew_ms >= 5000:
+                msg = (
+                    f"H12 clock-skew check: local clock differs from "
+                    f"Deribit server by {skew_ms}ms (server={server_ms}, "
+                    f"local={local_ms}, threshold=5000ms). The bar-clock "
+                    f"would mis-align signals vs the V2 backtest. Run "
+                    f"ntpdate / systemd-timesyncd before re-launching."
+                )
+                logger.error(msg)
+                raise RuntimeError(msg)
+            elif skew_ms >= 250:
+                logger.warning(
+                    "H12 clock-skew check: local clock differs from "
+                    "Deribit server by %dms (threshold warn 250ms, "
+                    "refuse 5000ms). NTP sync recommended.",
+                    skew_ms,
+                )
+            else:
+                logger.info(
+                    "H12 clock-skew check: local-vs-Deribit %dms (OK)",
+                    skew_ms,
+                )
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "H12: failed to fetch Deribit server time — skew check "
+                "skipped (engine continues, but operator should verify "
+                "system clock is NTP-synced)"
+            )
+
         if cfg.paper_mode:
             # No account on Deribit; equity is synthetic.
             account_equity_btc = 0.0
@@ -766,6 +807,36 @@ class TradingEngine:
         else:
             logger.info("Kill-switch state at startup: clean")
 
+        # H4 (2026-05-06): restore ProfitScaleEstimator state from SQLite.
+        # Without this, every restart drops gross_count to 0 → λ=0 →
+        # est_gross collapses to est_theo for the first ~200 trades,
+        # drifting away from V2-parity. See profit_scale_state schema.
+        if self._profit_scale_estimator is not None:
+            try:
+                ps_state = await self.store.load_profit_scale_state()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "H4: profit_scale_state load failed — starting cold"
+                )
+                ps_state = None
+            if ps_state is not None:
+                self._profit_scale_estimator.load_state(ps_state)
+                logger.info(
+                    "ProfitScaleEstimator state RESTORED from SQLite: "
+                    "gross_ema=$%.2f/BTC, gross_count=%d, hedge_ema=$%.2f/BTC, "
+                    "last_updated=%s, λ=%.3f",
+                    self._profit_scale_estimator.gross_per_btc_ema_usd,
+                    self._profit_scale_estimator.gross_count,
+                    self._profit_scale_estimator.hedge_per_btc_ema_usd,
+                    ps_state.get("last_updated", "?"),
+                    self._profit_scale_estimator.shrinkage_lambda,
+                )
+            else:
+                logger.info(
+                    "ProfitScaleEstimator state at startup: cold "
+                    "(no profit_scale_state row in SQLite)"
+                )
+
         # Wire kill switch into the subscriber so mark_ws_message is called
         # on actual WS data arrival, not on bar ticks.
         self.subscriber.set_kill_switch(self.kill_switch)
@@ -834,12 +905,51 @@ class TradingEngine:
         # Subscribe to market data channels
         await self.subscriber.start()
 
+        # H5 (2026-05-06): set per-channel staleness thresholds on the
+        # WS client. The global ``data_stale_seconds`` (90s default)
+        # catches "EVERY channel stopped" zombies; these per-channel
+        # thresholds catch PARTIAL silence — index dies while perp
+        # keeps flowing. Conservative defaults so legitimate quiet
+        # minutes don't false-trip:
+        #   - index: 60s (Deribit publishes ~1Hz, 60s is generous)
+        #   - perp trades 100ms: 180s (perp can be quiet at off-hours)
+        #   - option trades 100ms: NOT enforced — option flow is
+        #     genuinely sparse (testnet can be silent for hours)
+        ccy = self.config.currency
+        ccy_lower = ccy.lower()
+        trades_iv = "100ms" if self.config.paper_mode else "raw"
+        try:
+            self.ws.set_channel_threshold(
+                f"deribit_price_index.{ccy_lower}_usd", 60.0,
+            )
+            self.ws.set_channel_threshold(
+                f"trades.{ccy}-PERPETUAL.{trades_iv}", 180.0,
+            )
+            logger.info(
+                "Per-channel staleness thresholds wired: "
+                "index=60s, perp_trades=180s",
+            )
+        except Exception:  # noqa: BLE001 - non-fatal
+            logger.exception(
+                "Failed to set per-channel staleness thresholds — "
+                "global watchdog still active",
+            )
+
         # Spawn background tasks
         self._background_tasks = [
             asyncio.create_task(self.ws.dispatch_forever(), name="ws_dispatch"),
             asyncio.create_task(self.bar_clock.run_forever(), name="bar_clock"),
             asyncio.create_task(self.telegram.flush_loop(), name="telegram_flush"),
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
+            # H10 (2026-05-06): bar-advance watchdog. The hourly Telegram
+            # heartbeat takes up to 60 minutes to notice a wedged engine.
+            # The bar-advance watchdog checks every 30s that
+            # ``stats.last_bar_timestamp`` advances at the expected
+            # cadence; alerts via Telegram if no bar has closed for
+            # 2× the bar interval (default 30 min for 15min bars).
+            asyncio.create_task(
+                self._bar_advance_watchdog(), name="bar_advance_watchdog",
+            ),
         ]
         if self.vpin_stream is not None:
             self._background_tasks.append(
@@ -849,6 +959,68 @@ class TradingEngine:
         logger.info("TradingEngine running — waiting for stop signal")
         await self._stop.wait()
         logger.info("TradingEngine received stop — shutting down")
+
+    async def _bar_advance_watchdog(self) -> None:
+        """H10 (2026-05-06): alert when bars stop advancing.
+
+        The hourly Telegram heartbeat (``_heartbeat_loop``) takes up to
+        60 minutes to notice a wedged engine. The bar-advance watchdog
+        runs at a 30s cadence and alerts via Telegram if
+        ``stats.last_bar_timestamp`` hasn't advanced within 2× the bar
+        interval — a 15min bar engine alerts at ~30 minutes of silence.
+
+        Self-rate-limited: alerts at most once per ``alert_cooldown``
+        seconds so a stuck engine doesn't spam Telegram.
+        """
+        check_interval_seconds = 30.0
+        bar_interval_seconds = self.config.bar_minutes * 60.0
+        # Tolerate up to 2 bars of silence before alerting (gives one
+        # bar's worth of slack if the engine is briefly busy).
+        max_silence_seconds = 2.0 * bar_interval_seconds
+        # Start the engine clock from when the watchdog itself starts —
+        # avoids alerting before the FIRST bar even closes.
+        watchdog_start = pd.Timestamp.now(tz="UTC")
+        last_alert_at: pd.Timestamp | None = None
+        alert_cooldown_seconds = bar_interval_seconds  # alert at most once per bar
+
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=check_interval_seconds,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            now = pd.Timestamp.now(tz="UTC")
+            last_bar = self.stats.last_bar_timestamp
+            # Use start-of-watchdog as the reference until first bar closes
+            reference_ts = last_bar if last_bar is not None else watchdog_start
+            silence_seconds = (now - reference_ts).total_seconds()
+
+            if silence_seconds <= max_silence_seconds:
+                continue
+
+            # Throttle alerts
+            if (last_alert_at is not None
+                    and (now - last_alert_at).total_seconds()
+                    < alert_cooldown_seconds):
+                continue
+            last_alert_at = now
+
+            msg = (
+                f"H10 bar-advance watchdog: no bar close for "
+                f"{silence_seconds:.0f}s "
+                f"(last_bar={last_bar}, threshold={max_silence_seconds:.0f}s, "
+                f"bar_interval={bar_interval_seconds:.0f}s). "
+                f"Engine may be wedged."
+            )
+            logger.error(msg)
+            if self.telegram is not None and self.telegram.enabled:
+                try:
+                    self.telegram.send("error", msg)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Bar-advance watchdog: Telegram send raised")
 
     async def _heartbeat_loop(self) -> None:
         """Periodic Telegram heartbeat for unattended monitoring.
@@ -1658,6 +1830,21 @@ class TradingEngine:
                     hedge_cost_usd=hedge_cost_usd,
                     n_btc=outcome.n_contracts_btc,
                 )
+                # H4 (2026-05-06): persist EMA state after every trade so
+                # a restart resumes the estimator at the live calibration
+                # rather than collapsing back to lambda=0 / est_theo for
+                # ~200 trades. Best-effort — DB write failure must not
+                # block the trade close path.
+                if self.store is not None:
+                    try:
+                        await self.store.save_profit_scale_state(
+                            self._profit_scale_estimator.state_dict()
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "H4: profit_scale_state persist failed for trade %s",
+                            getattr(outcome, "trade_id", "?"),
+                        )
 
             # Update execution cost EMA from actual fill slippage
             if (outcome.entry_call and outcome.entry_call.average_price > 0

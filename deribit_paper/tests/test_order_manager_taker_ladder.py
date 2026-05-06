@@ -130,25 +130,33 @@ async def test_tier1_tier2_zero_fill_falls_through_to_bounded_tier3():
 
 @pytest.mark.asyncio
 async def test_tier3_skipped_on_small_residual():
-    """E.1.7: residual < 10% of original is dropped, not market-filled."""
+    """E.1.7: residual < 10% of original is dropped, not market-filled.
+
+    H3 (2026-05-06): the original test used a 0.05 BTC residual that
+    H3's grid-rounding would now drop at tier-1 entirely (below the
+    0.1 BTC minimum contract). Re-cast on a 2.0 BTC order so the
+    residuals stay at-or-above the 0.1-BTC grid through tier-2.
+    """
     rest = AsyncMock()
     rest.get_ticker = AsyncMock(return_value=_ticker_btc())
-    # Tier-1 fills 0.95, tier-2 fills 0.04 → residual 0.01 < 10% × 1.0 → SKIP.
+    # Tier-1 fills 1.7 of 2.0 → residual 0.3 BTC → tier-2 fires.
+    # Tier-2 fills 0.2 → residual 0.1 BTC.
+    # 0.1 < 10% × 2.0 = 0.2 → tier-3 SKIP.
     rest.place_order = AsyncMock(side_effect=[
-        _stub_fill(amount=1.0, filled_amount=0.95, price=0.0505),
-        _stub_fill(amount=0.05, filled_amount=0.04, price=0.0510),
+        _stub_fill(amount=2.0, filled_amount=1.7, price=0.0505),
+        _stub_fill(amount=0.3, filled_amount=0.2, price=0.0510),
     ])
     manager = OrderManager(rest=rest)
 
     result = await manager.place_ioc_taker(
         instrument_name="BTC-OPT",
-        side="buy", amount=1.0,
+        side="buy", amount=2.0,
         max_slippage_pct=0.5,
         tiered=True,
     )
-    # Only 0.99 filled, not 1.0 — by design (the 0.01 residual was
+    # 1.9 filled, not 2.0 — by design (the 0.1 BTC residual was
     # dropped to defend against worst-case fills on the tail).
-    assert result.filled_amount == pytest.approx(0.99)
+    assert result.filled_amount == pytest.approx(1.9)
     # Tier-3 not called.
     assert rest.place_order.call_count == 2
 

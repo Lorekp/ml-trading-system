@@ -59,6 +59,16 @@ _PING_TIMEOUT = 15
 _DATA_STALE_SECONDS_DEFAULT = 90.0
 _WATCHDOG_CHECK_FLOOR_SECONDS = 15.0
 
+# H11 (2026-05-06): Deribit's canonical liveness primitive. After
+# ``public/set_heartbeat`` with interval=N, the server pushes a
+# ``test_request`` notification every N seconds; the client MUST reply
+# with ``public/test`` within the timeout or the server kills the
+# connection. This is belt-and-suspenders to the data-stale watchdog —
+# it triggers the server SIDE to drop the connection, while our
+# watchdog handles the case where the server is technically up but
+# silently broken.
+_HEARTBEAT_INTERVAL_DEFAULT = 30
+
 
 ChannelHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -82,6 +92,7 @@ class DeribitWebSocketClient:
         auth: DeribitAuth | None = None,
         on_reconnect: Callable[[], None] | None = None,
         data_stale_seconds: float = _DATA_STALE_SECONDS_DEFAULT,
+        heartbeat_interval_seconds: int = _HEARTBEAT_INTERVAL_DEFAULT,
     ):
         self._ws_url = ws_url
         self._auth = auth
@@ -107,6 +118,27 @@ class DeribitWebSocketClient:
         self._data_stale_seconds = float(data_stale_seconds)
         self._last_message_ts: float = time.monotonic()
         self._watchdog_task: asyncio.Task | None = None
+        # H5 (2026-05-06): per-channel staleness tracking. The global
+        # ``_last_message_ts`` only catches "ALL channels stopped" — but
+        # a Deribit-side bug or thin liquidity could silence ONE channel
+        # (e.g. the index price) while others keep flowing, leaving the
+        # global watchdog blind. Map: channel -> monotonic ts of last
+        # message. Only populated AFTER the first message arrives, so a
+        # never-bound channel doesn't false-trip on startup.
+        self._last_message_ts_per_channel: dict[str, float] = {}
+        # Per-channel max-staleness thresholds (seconds). Caller (engine)
+        # populates via ``set_channel_threshold`` for channels it knows
+        # are high-frequency. Channels not in this map use only the
+        # global watchdog.
+        self._channel_thresholds: dict[str, float] = {}
+        # Initialised flag for the WS-auth path so a missing ``__init__``
+        # write doesn't surface as ``AttributeError`` on first reconnect.
+        self._authenticated_ws: bool = False
+        # H11: Deribit set_heartbeat interval. 0 disables; default 30s.
+        self._heartbeat_interval_seconds = int(heartbeat_interval_seconds)
+        # Stats counter for observability — bumped each time we reply
+        # to a server-pushed test_request.
+        self._heartbeat_test_responses_sent: int = 0
 
     @property
     def connected(self) -> bool:
@@ -136,6 +168,24 @@ class DeribitWebSocketClient:
             await self._ws.close()
             self._ws = None
 
+    def set_channel_threshold(self, channel: str, seconds: float) -> None:
+        """H5 (2026-05-06): set a per-channel max-staleness threshold.
+
+        When the watchdog is active, a per-channel threshold means the
+        WS will be force-reconnected if the named channel goes silent
+        for longer than ``seconds`` AFTER it has produced at least one
+        message. Channels without a registered threshold are governed
+        only by the global ``data_stale_seconds`` watchdog.
+
+        Typical use from engine.initialize:
+            ws.set_channel_threshold("deribit_price_index.btc_usd", 30.0)
+            ws.set_channel_threshold("trades.BTC-PERPETUAL.100ms", 120.0)
+        """
+        if seconds <= 0:
+            self._channel_thresholds.pop(channel, None)
+            return
+        self._channel_thresholds[channel] = float(seconds)
+
     async def subscribe(
         self,
         channels: list[str],
@@ -152,6 +202,12 @@ class DeribitWebSocketClient:
         channels (notably the ``.raw`` trade feeds).  We authenticate
         the WS session on the first subscribe call and cache the
         "authenticated" state until the next reconnect.
+
+        H6 (2026-05-06): verifies the server actually accepted the
+        requested channel set. Deribit returns the array of accepted
+        channels in the JSON-RPC ``result``; we diff against requested
+        and raise on mismatch so a typo / expired option / server-side
+        rejection fails LOUD instead of leaving the engine flying blind.
         """
         for channel in channels:
             self._handlers[channel] = handler
@@ -168,7 +224,8 @@ class DeribitWebSocketClient:
 
         is_private = any(ch.startswith("user.") for ch in channels)
         method = "private/subscribe" if is_private else "public/subscribe"
-        await self._send_rpc(method, {"channels": channels})
+        result = await self._send_rpc(method, {"channels": channels})
+        self._verify_subscribe_ack(method, channels, result)
 
     async def _auth_ws_if_needed(self) -> None:
         """Authenticate the current WS session via client_credentials.
@@ -263,6 +320,11 @@ class DeribitWebSocketClient:
                 # starts with a clean slate; the watchdog will only fire
                 # if NEW messages stop arriving after this point.
                 self._last_message_ts = time.monotonic()
+                # H5: clear per-channel timestamps so the per-channel
+                # watchdog doesn't trip on the carry-over from the dead
+                # connection. Repopulated as messages arrive on the new
+                # session.
+                self._last_message_ts_per_channel.clear()
                 # Start the background reader so future RPC responses
                 # are consumed.
                 self._start_reader_task()
@@ -270,6 +332,26 @@ class DeribitWebSocketClient:
                 # already running).
                 self._start_watchdog_task()
                 self._authenticated_ws = False  # fresh connection
+                # H11: enable Deribit-side heartbeat so the server
+                # actively probes us with test_request and tears down
+                # the connection if we don't respond. Best-effort —
+                # failure to enable is logged and ignored, the
+                # data-stale watchdog still protects us.
+                if self._heartbeat_interval_seconds > 0:
+                    try:
+                        await self._send_rpc(
+                            "public/set_heartbeat",
+                            {"interval": self._heartbeat_interval_seconds},
+                        )
+                        logger.info(
+                            "Deribit set_heartbeat enabled: interval=%ds",
+                            self._heartbeat_interval_seconds,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Failed to enable set_heartbeat — "
+                            "data-stale watchdog still active",
+                        )
                 return
             except (OSError, WebSocketException) as exc:
                 if _RECONNECT_MAX_ATTEMPTS and attempt >= _RECONNECT_MAX_ATTEMPTS:
@@ -329,10 +411,21 @@ class DeribitWebSocketClient:
         in a row, only recovered when the underlying TCP finally
         died. This watchdog cuts that detection time from ``hours``
         to ``threshold + check_interval`` (under 2 minutes by default).
+
+        H5 (2026-05-06): also detects PARTIAL silence — a single
+        channel going quiet while others keep flowing (the global
+        watchdog can't see this case). Per-channel thresholds set via
+        ``set_channel_threshold``; a channel-stale event force-closes
+        the WS the same way as a global stale.
         """
+        # Check cadence: bounded by both the global threshold AND any
+        # per-channel threshold (whichever is smallest), so a channel
+        # configured with 30s staleness gets checked at least every 10s.
+        all_thresholds = [self._data_stale_seconds, *self._channel_thresholds.values()]
+        smallest = min(t for t in all_thresholds if t > 0) if all_thresholds else self._data_stale_seconds
         check_interval = max(
             _WATCHDOG_CHECK_FLOOR_SECONDS,
-            self._data_stale_seconds / 3.0,
+            smallest / 3.0,
         )
         try:
             while not self._shutdown.is_set():
@@ -351,7 +444,10 @@ class DeribitWebSocketClient:
                     # restart us. Exit cleanly.
                     return
 
-                stale = time.monotonic() - self._last_message_ts
+                now = time.monotonic()
+
+                # Global staleness check
+                stale = now - self._last_message_ts
                 if stale > self._data_stale_seconds:
                     logger.warning(
                         "WS data-stale watchdog: %.0fs since last message "
@@ -365,6 +461,31 @@ class DeribitWebSocketClient:
                     except Exception:  # noqa: BLE001 - best-effort close
                         logger.exception("Watchdog: ws.close raised")
                     return  # reconnect path will respawn us
+
+                # H5: per-channel staleness check. Only fires for
+                # channels we've SEEN at least once — never-bound
+                # channels are the subscribe-ACK problem (H6 catches
+                # those at subscribe time). Once seen, a channel
+                # stopping is a strong signal of partial blindness.
+                for ch, thresh in list(self._channel_thresholds.items()):
+                    last = self._last_message_ts_per_channel.get(ch)
+                    if last is None:
+                        continue
+                    ch_stale = now - last
+                    if ch_stale > thresh:
+                        logger.warning(
+                            "WS per-channel watchdog: channel %s stale "
+                            "%.0fs (threshold %.0fs) — forcing reconnect",
+                            ch, ch_stale, thresh,
+                        )
+                        try:
+                            await ws.close(
+                                code=1011,
+                                reason=f"channel-stale {ch}",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception("Watchdog: ws.close raised")
+                        return  # reconnect path will respawn us
         except asyncio.CancelledError:
             pass
 
@@ -392,11 +513,51 @@ class DeribitWebSocketClient:
         """
         await self._auth_ws_if_needed()
 
+    @staticmethod
+    def _verify_subscribe_ack(
+        method: str, requested: list[str], result: Any,
+    ) -> None:
+        """H6: raise on subscribe ACK mismatch.
+
+        Deribit's ``public/subscribe`` and ``private/subscribe`` return
+        the JSON array of channels the server bound. If a channel
+        was rejected (typo, expired option, server-side migration), it
+        is silently dropped from the array. Pre-H6 the result was
+        discarded — our engine would happily run with one or more
+        channels missing, blind to the gap until the kill-switch
+        eventually noticed lower data volume than expected.
+
+        Now: diff requested vs accepted; raise DeribitWebSocketError
+        on any missing channels so the caller (engine.initialize or
+        the reconnect path) fails LOUD.
+        """
+        if not isinstance(result, list):
+            logger.warning(
+                "%s ACK was not a list: %r — skipping verification",
+                method, result,
+            )
+            return
+        accepted = {str(c) for c in result}
+        missing = [c for c in requested if c not in accepted]
+        if missing:
+            extra = sorted(accepted - set(requested))
+            raise DeribitWebSocketError(
+                f"{method} ACK mismatch: server did not bind {missing} "
+                f"(requested {len(requested)}, got {len(accepted)}; "
+                f"extra={extra})",
+                data={"requested": list(requested), "accepted": sorted(accepted)},
+            )
+        logger.debug(
+            "%s ACK OK: %d channel(s) bound", method, len(accepted),
+        )
+
     async def _resubscribe_all(self) -> None:
         """Re-send subscribe for every channel we had before the disconnect.
 
         Authenticates the fresh WS session first — Deribit gates ``.raw``
         channels behind WS auth even though they are "public".
+
+        H6: verifies ACKs (see ``_verify_subscribe_ack``).
         """
         if not self._active_channels:
             return
@@ -407,9 +568,15 @@ class DeribitWebSocketClient:
         private = [ch for ch in self._active_channels if ch.startswith("user.")]
         try:
             if public:
-                await self._send_rpc("public/subscribe", {"channels": public})
+                result = await self._send_rpc(
+                    "public/subscribe", {"channels": public},
+                )
+                self._verify_subscribe_ack("public/subscribe", public, result)
             if private:
-                await self._send_rpc("private/subscribe", {"channels": private})
+                result = await self._send_rpc(
+                    "private/subscribe", {"channels": private},
+                )
+                self._verify_subscribe_ack("private/subscribe", private, result)
         except DeribitWebSocketError:
             logger.exception(
                 "Resubscribe failed after reconnect — will retry on next cycle",
@@ -460,7 +627,8 @@ class DeribitWebSocketClient:
         # "the connection is alive". Anything that reaches us through
         # the socket reader counts; JSON errors only trigger if a
         # genuine frame arrived.
-        self._last_message_ts = time.monotonic()
+        now = time.monotonic()
+        self._last_message_ts = now
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -487,6 +655,11 @@ class DeribitWebSocketClient:
         if msg.get("method") == "subscription":
             params = msg.get("params", {})
             channel = params.get("channel")
+            # H5: per-channel staleness tracking. Stamp BEFORE handler
+            # dispatch so a slow / failing handler doesn't backdate the
+            # channel's last-seen timestamp.
+            if channel:
+                self._last_message_ts_per_channel[channel] = now
             if channel in self._handlers:
                 try:
                     await self._handlers[channel](params)
@@ -499,7 +672,46 @@ class DeribitWebSocketClient:
                 logger.debug("Received message for unhandled channel %s", channel)
             return
 
+        # H11: Deribit heartbeat ``test_request`` — server probing us
+        # for liveness. Must reply with public/test within the timeout
+        # or the server kills the connection. ``heartbeat`` (no
+        # ``test_request``) is a no-op informational ping.
+        if msg.get("method") == "heartbeat":
+            params = msg.get("params", {})
+            if params.get("type") == "test_request":
+                try:
+                    await self._send_test_response()
+                    self._heartbeat_test_responses_sent += 1
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to send public/test response — server may "
+                        "drop the connection",
+                    )
+            # ``type=heartbeat`` is informational: server is alive.
+            # No action required.
+            return
+
         logger.debug("Deribit WS unhandled message: %s", msg)
+
+    async def _send_test_response(self) -> None:
+        """H11: respond to a server-pushed ``test_request`` with
+        ``public/test``. Fire-and-forget JSON-RPC notification; we do
+        NOT await a response (the heartbeat exchange is one-shot per
+        interval, and ``_send_rpc`` would block until the response
+        arrives, which is wasteful for every heartbeat tick).
+        """
+        if self._ws is None:
+            return
+        async with self._rpc_id_lock:
+            self._rpc_id += 1
+            rpc_id = self._rpc_id
+        payload = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "public/test",
+            "params": {},
+        }
+        await self._ws.send(json.dumps(payload))
 
     @staticmethod
     def _backoff_delay(attempt: int) -> float:

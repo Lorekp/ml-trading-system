@@ -245,5 +245,41 @@ class ProfitScaleEstimator:
                     hedge_per_btc - self._hedge_per_btc_ema_usd
                 )
 
+    # ── H4: state persistence ────────────────────────────────────────
+
+    def state_dict(self) -> dict:
+        """Return the Bayesian state as a plain dict for SQLite persistence.
+
+        H4 (2026-05-06): EMAs were lost on every restart, dropping
+        ``_gross_count`` to 0 and collapsing the shrinkage weight λ to
+        zero — the live engine fell back to the theoretical estimate
+        for the first ~200 trades after every restart, drifting away
+        from V2-parity. Persisting (gross_ema, gross_count, hedge_ema)
+        and reloading on init keeps the live estimator continuous
+        across restarts.
+        """
+        return {
+            "gross_per_btc_ema_usd": self._gross_per_btc_ema_usd,
+            "gross_count": self._gross_count,
+            "hedge_per_btc_ema_usd": self._hedge_per_btc_ema_usd,
+        }
+
+    def load_state(self, state: dict) -> None:
+        """Restore EMAs from a previously-saved ``state_dict()``.
+
+        Defensive: non-finite floats and negative counts are ignored
+        (i.e. fall back to cold-start values) so a corrupt persistence
+        row doesn't poison a fresh run.
+        """
+        gross = state.get("gross_per_btc_ema_usd")
+        count = state.get("gross_count")
+        hedge = state.get("hedge_per_btc_ema_usd")
+        if gross is not None and math.isfinite(float(gross)):
+            self._gross_per_btc_ema_usd = float(gross)
+        if count is not None and int(count) >= 0:
+            self._gross_count = int(count)
+        if hedge is not None and math.isfinite(float(hedge)) and float(hedge) >= 0.0:
+            self._hedge_per_btc_ema_usd = float(hedge)
+
 
 __all__ = ["ProfitScaleEstimator", "bsm_vega_per_vol_pt"]

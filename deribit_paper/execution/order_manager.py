@@ -35,6 +35,10 @@ from deribit_paper.client.errors import (
     DeribitRateLimitError,
 )
 from deribit_paper.client.rest import DeribitRESTClient
+from deribit_paper.execution.amounts import (
+    OPTION_MIN_CONTRACT_BTC,
+    option_amount_btc,
+)
 from deribit_paper.execution.idempotency import (
     IdempotencyGuard,
     new_client_order_id,
@@ -523,8 +527,26 @@ class OrderManager:
             label=f"{label}_t1", reduce_only=reduce_only,
             timeout_seconds=10.0,
         )
-        residual = amount - r1.filled_amount
-        if residual <= 1e-9:
+        residual_raw = amount - r1.filled_amount
+        # H3 (2026-05-06): round residual to Deribit's 0.1-BTC option grid
+        # before submitting tier-2. Without rounding, a partial tier-1 fill
+        # left a non-grid residual (e.g. 0.57 BTC after tier-1 filled 0.43);
+        # Deribit rejects with min_size/increment error, the tier-2 attempt
+        # counts as a DeribitOrderRejected, and 3 of those in a row trips
+        # the kill-switch on a moving market. option_amount_btc returns
+        # 0.0 if abs(residual) < OPTION_MIN_CONTRACT_BTC.
+        residual = option_amount_btc(residual_raw)
+        if abs(residual_raw - residual) > 1e-9:
+            logger.debug(
+                "Tiered IOC %s %s tier-2 residual rounded: %.6f -> %.4f "
+                "(0.1-BTC grid)",
+                side, instrument_name, residual_raw, residual,
+            )
+        if residual < OPTION_MIN_CONTRACT_BTC:
+            # Either tier-1 fully filled (residual_raw <= 1e-9 → rounded to
+            # 0), or the partial leftover is below the minimum contract
+            # size (e.g. 0.05 BTC). Either way we cannot legally submit
+            # tier-2; treat as fully filled-enough.
             return _stamp_total(r1)
 
         # ── Tier 2 ──
@@ -540,8 +562,15 @@ class OrderManager:
             label=f"{label}_t2", reduce_only=reduce_only,
             timeout_seconds=10.0,
         )
-        residual2 = residual - r2.filled_amount
-        if residual2 <= 1e-9:
+        residual2_raw = residual - r2.filled_amount
+        # H3: round tier-3 residual to grid as well.
+        residual2 = option_amount_btc(residual2_raw)
+        if abs(residual2_raw - residual2) > 1e-9:
+            logger.debug(
+                "Tiered IOC %s %s tier-3 residual rounded: %.6f -> %.4f",
+                side, instrument_name, residual2_raw, residual2,
+            )
+        if residual2 < OPTION_MIN_CONTRACT_BTC:
             # Aggregate filled_amount + average_price across tiers 1+2.
             return _stamp_total(_merge_tier_results(r1, r2))
 

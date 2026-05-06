@@ -128,6 +128,26 @@ class SQLiteStore:
         """Open the connection and ensure schema is in place."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(str(self.db_path))
+        # H14 (2026-05-06): WAL + busy_timeout + NORMAL synchronous.
+        # Default DELETE journal mode raises ``database is locked`` on
+        # any concurrent write contention; the live engine has multiple
+        # asyncio tasks (trade-close persistence, kill-switch persist,
+        # equity snapshots, profit-scale persist) hitting the DB
+        # concurrently. WAL allows readers to coexist with writers and
+        # busy_timeout=5000 makes contention block briefly instead of
+        # raising. synchronous=NORMAL is safe for the engine's restart
+        # idempotency model (bar_cursor + reconciliation) and ~3x
+        # faster on every commit.
+        for pragma in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA busy_timeout=5000",
+        ):
+            try:
+                async with self._conn.execute(pragma) as cur:
+                    await cur.fetchone()  # journal_mode returns the new mode
+            except Exception:  # noqa: BLE001
+                logger.exception("SQLite pragma failed: %s", pragma)
         await self._conn.executescript(_CREATE_TABLES_SQL)
         # Seed kill switch state if empty
         async with self._conn.execute(
@@ -140,7 +160,10 @@ class SQLiteStore:
                     "VALUES (1, 0, NULL, NULL)",
                 )
         await self._conn.commit()
-        logger.info("SQLiteStore opened at %s", self.db_path)
+        logger.info(
+            "SQLiteStore opened at %s (WAL mode, busy_timeout=5s)",
+            self.db_path,
+        )
 
     async def close(self) -> None:
         if self._conn is not None:

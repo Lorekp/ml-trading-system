@@ -9,17 +9,34 @@ once the paper run has enough samples.
 Implementation: buffer rows in memory, flush to parquet every N rows
 or on explicit :meth:`flush`.  Flushing appends a new row group to
 the parquet file (creates it on first write).
+
+Tier 2 / Bonus (2026-05-06): writes are now atomic via tmp + os.replace
+so a crash mid-write doesn't corrupt the existing file.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Write DataFrame to parquet atomically: write to .tmp, then os.replace.
+
+    On Windows, ``os.replace`` is the cross-platform atomic rename; on
+    POSIX it's an alias for ``os.rename`` with overwrite semantics. A
+    crash between the .tmp write and the rename leaves the original
+    file intact (if it existed) — no partial-write corruption.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp)
+    os.replace(tmp, path)
 
 
 class MetricsSink:
@@ -61,15 +78,15 @@ class MetricsSink:
             try:
                 existing = pd.read_parquet(self.path)
                 combined = pd.concat([existing, new_df], ignore_index=True)
-                combined.to_parquet(self.path)
+                _atomic_write_parquet(combined, self.path)
             except Exception:  # noqa: BLE001 - log + overwrite
                 logger.exception(
                     "MetricsSink: failed to read existing %s — overwriting with new buffer",
                     self.path,
                 )
-                new_df.to_parquet(self.path)
+                _atomic_write_parquet(new_df, self.path)
         else:
-            new_df.to_parquet(self.path)
+            _atomic_write_parquet(new_df, self.path)
         logger.info("MetricsSink flushed %d rows → %s", n, self.path)
         return n
 

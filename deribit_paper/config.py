@@ -277,6 +277,20 @@ class PaperConfig:
     allow_stale_features: bool = False
     allow_stale_svi_features: bool = False
 
+    # H15 caps (Tier 2 hardening, 2026-05-06). Defence-in-depth on top
+    # of the existing per-trade and position-count caps.
+    # max_trades_per_hour: 0 disables; recommended 6 for V2 (which
+    # fires ~4 trades/day on average; 6/hour = 1.5×/15min bar = ~9×
+    # natural rate, so it only catches runaway signals not legit bursts).
+    max_trades_per_hour: int = 6
+    # max_gross_notional_usd: 0 disables; recommended 30k (~30% of the
+    # default $100k paper equity, in line with margin_util_hard=0.20
+    # but expressed in dollar notional).
+    max_gross_notional_usd: float = 30_000.0
+    # H15: send a daily P&L summary at 00:00 UTC. The summary helper
+    # already exists on TelegramNotifier (line 245); this enables it.
+    daily_summary_enabled: bool = True
+
     def __post_init__(self) -> None:
         """Resolve sentinel defaults from (currency, bar_minutes)."""
         ccy_lower = self.currency.lower()

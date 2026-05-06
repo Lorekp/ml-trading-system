@@ -11,15 +11,24 @@ Checks:
 - ``max_single_trade_btc`` — single-trade size cap
 - ``dte_band`` — no 0DTE, no super-long-dated (default 1-14 days)
 - ``min_index_price`` — sanity check (refuse to trade if spot looks bogus)
+- ``max_trades_per_hour`` (H15) — burst-rate cap on signal firing.
+  A bug in the signal pipeline could fire dozens of trades in minutes;
+  this cap is the last line of defence.
+- ``max_gross_notional_usd`` (H15) — hard cap on total open USD notional.
+  Independent of position-count + per-trade caps; defends against the
+  edge case where N open trades each within per-trade limit still
+  exceed the operator's intended total exposure.
 
 The :class:`RiskLimits` object is stateless except for the config
-thresholds; it queries the :class:`PositionTracker` and
+thresholds and a rolling deque of recent trade timestamps (for
+the per-hour cap); it queries the :class:`PositionTracker` and
 :class:`EquityTracker` for current state at each check.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 
 import pandas as pd
@@ -61,6 +70,9 @@ class RiskLimits:
         dte_max_days: float = 14.0,
         min_index_price: float = 1_000.0,
         im_fraction: float = 0.20,
+        # H15: new caps
+        max_trades_per_hour: int = 0,    # 0 = disabled
+        max_gross_notional_usd: float = 0.0,   # 0 = disabled
     ):
         self._positions = position_tracker
         self._equity = equity_tracker
@@ -72,6 +84,17 @@ class RiskLimits:
         self.dte_max_days = dte_max_days
         self.min_index_price = min_index_price
         self.im_fraction = im_fraction
+        # H15: per-hour signal burst cap. A bug in the predictor or
+        # signal-stack could fire dozens of trades within minutes; this
+        # cap is the last line of defence between a runaway signal and
+        # the venue. Disabled by default (0) so existing tests stay
+        # green; engine populates from cfg.
+        self.max_trades_per_hour = int(max_trades_per_hour)
+        self._recent_trade_timestamps: deque[pd.Timestamp] = deque(maxlen=512)
+        # H15: hard cap on total open USD notional. Independent of the
+        # position-count cap (max_open_positions) — N small positions
+        # could still aggregate above the operator's intended exposure.
+        self.max_gross_notional_usd = float(max_gross_notional_usd)
 
     def check_signal(
         self,
@@ -154,4 +177,43 @@ class RiskLimits:
                 f"margin_util {margin_util:.3f} > hard cap {self.max_margin_util_hard:.3f}",
             )
 
+        # H15: gross notional cap (total open USD across all positions
+        # plus the proposed trade). Only checked when configured > 0.
+        if self.max_gross_notional_usd > 0:
+            if total_notional_usd > self.max_gross_notional_usd:
+                return RiskCheck(
+                    False,
+                    f"gross_notional ${total_notional_usd:,.0f} > "
+                    f"hard cap ${self.max_gross_notional_usd:,.0f}",
+                )
+
+        # H15: per-hour rate cap. Counts trade-fire events recorded via
+        # ``record_trade_fired`` within the last 60 minutes. Only
+        # checked when configured > 0.
+        if self.max_trades_per_hour > 0:
+            cutoff = now - pd.Timedelta(hours=1)
+            recent = sum(
+                1 for ts in self._recent_trade_timestamps if ts >= cutoff
+            )
+            if recent >= self.max_trades_per_hour:
+                return RiskCheck(
+                    False,
+                    f"max_trades_per_hour: {recent} fired in past 1h "
+                    f">= cap {self.max_trades_per_hour} — burst-rate "
+                    f"defence engaged",
+                )
+
         return RiskCheck(True, "all checks passed")
+
+    def record_trade_fired(self, at: pd.Timestamp | None = None) -> None:
+        """H15: record a trade-fire event for the per-hour cap.
+
+        Engine calls this after a signal passes the risk gate AND has
+        actually been scheduled for execution. Rejected signals do NOT
+        count against the cap (otherwise a buggy predictor that always
+        fires would silently hit the cap and stay there).
+        """
+        if self.max_trades_per_hour <= 0:
+            return
+        ts = at or pd.Timestamp.now(tz="UTC")
+        self._recent_trade_timestamps.append(ts)

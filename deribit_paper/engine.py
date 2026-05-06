@@ -730,6 +730,9 @@ class TradingEngine:
             dte_min_days=cfg.dte_min_days,
             dte_max_days=cfg.dte_max_days,
             im_fraction=cfg.im_fraction,
+            # H15 (2026-05-06): defence-in-depth caps.
+            max_trades_per_hour=getattr(cfg, "max_trades_per_hour", 0),
+            max_gross_notional_usd=getattr(cfg, "max_gross_notional_usd", 0.0),
         )
         # H1 (2026-05-06): persist kill-switch state across restarts.
         # The store has had get/set_kill_switch_state methods since
@@ -766,6 +769,21 @@ class TradingEngine:
                 return
             self._ks_persist_tasks.add(task)
             task.add_done_callback(self._ks_persist_tasks.discard)
+            # H15 (2026-05-06): emit a Telegram alert on RESET as well as
+            # trip. Pre-H15, only the trip path notified (via
+            # ``alert_callback`` -> ``telegram.kill_switch``); the reset
+            # was silent. Operators want visibility on both transitions
+            # so they can correlate clearings with deploys / restarts.
+            if not halted and self.telegram is not None:
+                try:
+                    self.telegram.send(
+                        "info",
+                        f"✓ Kill-switch RESET (was: {reason or 'no reason recorded'})",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "KillSwitch reset Telegram alert failed",
+                    )
 
         self.kill_switch = KillSwitch(
             equity_tracker=self.equity_tracker,
@@ -950,6 +968,10 @@ class TradingEngine:
             asyncio.create_task(
                 self._bar_advance_watchdog(), name="bar_advance_watchdog",
             ),
+            # H15 (2026-05-06): daily P&L summary at 00:00 UTC.
+            asyncio.create_task(
+                self._daily_summary_loop(), name="daily_summary",
+            ),
         ]
         if self.vpin_stream is not None:
             self._background_tasks.append(
@@ -959,6 +981,66 @@ class TradingEngine:
         logger.info("TradingEngine running — waiting for stop signal")
         await self._stop.wait()
         logger.info("TradingEngine received stop — shutting down")
+
+    async def _daily_summary_loop(self) -> None:
+        """H15 (2026-05-06): emit a daily P&L summary at 00:00 UTC.
+
+        ``TelegramNotifier.daily_summary`` was defined in monitoring/
+        telegram.py but never called by the engine. Wire it now: at
+        00:00 UTC each day, query SQLite for the last 24h of trades and
+        send a one-line summary (count, win rate, realized PnL,
+        equity).
+
+        Sleeps until next 00:00 UTC; uses ``asyncio.wait_for`` against
+        the stop event so the engine can shutdown cleanly even mid-day.
+        """
+        while not self._stop.is_set():
+            now = pd.Timestamp.now(tz="UTC")
+            tomorrow_midnight = (
+                now.normalize() + pd.Timedelta(days=1)
+            )
+            sleep_seconds = (tomorrow_midnight - now).total_seconds()
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=sleep_seconds,
+                )
+                return  # stop signaled during sleep
+            except asyncio.TimeoutError:
+                pass
+
+            if self.telegram is None or not self.telegram.enabled:
+                continue
+            if not getattr(self.config, "daily_summary_enabled", True):
+                continue
+
+            try:
+                # Query last 24h of trades from SQLite
+                yesterday = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+                cursor = await self.store._conn.execute(  # noqa: SLF001
+                    "SELECT COUNT(*), "
+                    "SUM(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END), "
+                    "COALESCE(SUM(realized_pnl_usd), 0.0) "
+                    "FROM trades WHERE ended_at >= ? "
+                    "AND status = 'completed'",
+                    (yesterday.isoformat(),),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                n_trades = int(row[0] or 0)
+                wins = int(row[1] or 0)
+                realized = float(row[2] or 0.0)
+                win_rate = (100.0 * wins / n_trades) if n_trades > 0 else 0.0
+                equity = self.equity_tracker.current_equity if self.equity_tracker else 0.0
+                date_str = yesterday.strftime("%Y-%m-%d")
+                self.telegram.daily_summary(
+                    date=date_str,
+                    n_trades=n_trades,
+                    win_rate_pct=win_rate,
+                    realized_pnl_usd=realized,
+                    equity_usd=equity,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Daily summary task failed")
 
     async def _bar_advance_watchdog(self) -> None:
         """H10 (2026-05-06): alert when bars stop advancing.
@@ -1660,6 +1742,10 @@ class TradingEngine:
         # Tracked in self._trade_tasks so shutdown() can await completion
         # (E.1.4 2026-05-01).
         self.stats.signals_executed += 1
+        # H15: feed the rate limiter BEFORE scheduling the trade so a
+        # signal that would push us past the cap is rejected on the
+        # next bar.
+        self.risk_limits.record_trade_fired(at=bar.timestamp)
         trade_task = asyncio.create_task(
             self._execute_and_persist(
                 signal, n_contracts,

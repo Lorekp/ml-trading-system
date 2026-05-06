@@ -349,7 +349,29 @@ class DeribitRESTClient:
                 code = err.get("code")
                 message = err.get("message", "unknown error")
                 if code == _RATE_LIMIT_CODE and attempt < self._max_retries:
+                    # H17 (2026-05-06): honor Deribit's rate-limit hint
+                    # when present. Deribit's 10028 error sometimes
+                    # carries a ``data.wait`` field with milliseconds to
+                    # wait. Pre-H17 we ignored this and used generic
+                    # exponential backoff — too short for matching-engine
+                    # bursts during volatile minutes. If the hint is
+                    # absent or smaller than our computed backoff, fall
+                    # back to the computed value.
                     delay = self._backoff_delay(attempt)
+                    err_data = err.get("data") if isinstance(err, dict) else None
+                    if isinstance(err_data, dict):
+                        wait_hint_ms = err_data.get("wait")
+                        if isinstance(wait_hint_ms, (int, float)) and wait_hint_ms > 0:
+                            hint_seconds = float(wait_hint_ms) / 1000.0
+                            # Cap at 30s to avoid pathological hints
+                            hint_seconds = min(hint_seconds, 30.0)
+                            if hint_seconds > delay:
+                                delay = hint_seconds
+                                logger.info(
+                                    "Deribit rate limit: honoring server "
+                                    "wait hint %.2fs (computed=%.2fs)",
+                                    hint_seconds, self._backoff_delay(attempt),
+                                )
                     logger.warning(
                         "Deribit rate limit — retry %d/%d in %.2fs",
                         attempt, self._max_retries, delay,

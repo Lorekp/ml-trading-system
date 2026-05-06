@@ -252,7 +252,10 @@ class TradingEngine:
                 )
 
         self.ws = DeribitWebSocketClient(
-            cfg.ws_url, auth=self.auth, on_reconnect=_on_ws_reconnect,
+            cfg.ws_url,
+            auth=self.auth,
+            on_reconnect=_on_ws_reconnect,
+            data_stale_seconds=float(cfg.ws_data_stale_seconds),
         )
         # Paper mode uses the 100ms aggregated trade channels which work
         # without WS auth; production runs use .raw which Deribit gates

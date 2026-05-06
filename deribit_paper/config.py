@@ -146,6 +146,13 @@ class PaperConfig:
     # mainnet operators should set ~3000ms.
     kill_switch_latency_ms: float = float("inf")
     network_outage_seconds: int = 120         # halt if no WS messages for this long
+    # WS data-stale watchdog: forcibly close + reconnect the WS if no
+    # subscription message arrives in this many seconds. Sits BELOW
+    # ``network_outage_seconds`` so the watchdog triggers a recovery
+    # BEFORE the kill switch halts trading. ``0`` disables it (rely on
+    # TCP-level ping/pong only — NOT recommended on mainnet, where
+    # zombie connections have been observed).
+    ws_data_stale_seconds: float = 90.0
     max_consecutive_empty_bars: int = 3       # trip kill switch after N bars with zero trades
     min_perp_trades_per_bar: int = 5          # skip signal if bar has fewer perp trades
     max_orphan_close_retries: int = 3         # C1: retry orphaned position closes on startup

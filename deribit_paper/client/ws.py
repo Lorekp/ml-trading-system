@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from typing import Any, Awaitable, Callable
 
 import websockets
@@ -41,9 +42,22 @@ _RECONNECT_INITIAL_DELAY = 1.0
 _RECONNECT_MAX_DELAY = 30.0
 _RECONNECT_MAX_ATTEMPTS = 0  # 0 = forever
 
-# Deribit default ping/pong keepalive handled by websockets library
+# TCP-level ping/pong keepalive handled by the websockets library.
+# Useful when the underlying socket is gone, but does NOT detect the
+# "zombie connection" failure mode where the server keeps answering
+# pings while no longer pushing subscription data — see watchdog below.
 _PING_INTERVAL = 20
 _PING_TIMEOUT = 15
+
+# App-level data-stale watchdog. Unlike ping/pong (TCP liveness), this
+# proactively forces a reconnect when NO subscription messages have
+# arrived for ``_DATA_STALE_SECONDS_DEFAULT``, which catches the
+# Deribit-zombie pattern observed 2026-05-06: WS open + pings OK but
+# no trades/index updates flowing for 2h+. Threshold sits BELOW the
+# kill-switch network-outage trip (default 120s) so the watchdog
+# triggers a reconnect BEFORE the engine halts trading.
+_DATA_STALE_SECONDS_DEFAULT = 90.0
+_WATCHDOG_CHECK_FLOOR_SECONDS = 15.0
 
 
 ChannelHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -67,6 +81,7 @@ class DeribitWebSocketClient:
         ws_url: str,
         auth: DeribitAuth | None = None,
         on_reconnect: Callable[[], None] | None = None,
+        data_stale_seconds: float = _DATA_STALE_SECONDS_DEFAULT,
     ):
         self._ws_url = ws_url
         self._auth = auth
@@ -84,6 +99,14 @@ class DeribitWebSocketClient:
         # Background reader task — started in _connect_with_backoff so
         # RPC responses are consumed even before dispatch_forever() is called
         self._reader_task: asyncio.Task | None = None
+        # Data-stale watchdog: tracks ``time.monotonic()`` of last received
+        # message of any kind. The watchdog task closes the WS once the
+        # gap exceeds ``_data_stale_seconds`` so the existing reconnect
+        # logic kicks in. Callers can raise/lower the threshold via the
+        # constructor; passing 0 disables the watchdog.
+        self._data_stale_seconds = float(data_stale_seconds)
+        self._last_message_ts: float = time.monotonic()
+        self._watchdog_task: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -95,6 +118,13 @@ class DeribitWebSocketClient:
 
     async def close(self) -> None:
         self._shutdown.set()
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await asyncio.wait_for(self._watchdog_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        self._watchdog_task = None
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -229,9 +259,16 @@ class DeribitWebSocketClient:
                     "Deribit WS connected to %s (attempt %d)",
                     self._ws_url, attempt,
                 )
+                # Reset the data-stale tracker so a fresh connection
+                # starts with a clean slate; the watchdog will only fire
+                # if NEW messages stop arriving after this point.
+                self._last_message_ts = time.monotonic()
                 # Start the background reader so future RPC responses
                 # are consumed.
                 self._start_reader_task()
+                # Start the app-level watchdog (no-op if disabled or
+                # already running).
+                self._start_watchdog_task()
                 self._authenticated_ws = False  # fresh connection
                 return
             except (OSError, WebSocketException) as exc:
@@ -259,6 +296,77 @@ class DeribitWebSocketClient:
         self._reader_task = asyncio.create_task(
             self._read_forever(), name="ws_reader",
         )
+
+    def _start_watchdog_task(self) -> None:
+        """Spawn the data-stale watchdog if not already running.
+
+        The watchdog is a single coroutine that periodically compares
+        ``time.monotonic() - self._last_message_ts`` against
+        ``self._data_stale_seconds``. When the gap exceeds the
+        threshold it forcibly closes the WS (via ``self._ws.close``),
+        which causes ``_read_forever`` to exit and the outer
+        ``dispatch_forever`` loop to reconnect + resubscribe.
+
+        Threshold ``0`` disables the watchdog (useful for unit tests
+        and integration runs where stalls are expected).
+        """
+        if self._data_stale_seconds <= 0:
+            return
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(), name="ws_watchdog",
+        )
+
+    async def _watchdog_loop(self) -> None:
+        """Force-reconnect when no message has arrived for too long.
+
+        Why this exists: Deribit's WS occasionally enters a "zombie"
+        state where the underlying TCP connection stays alive (so the
+        websockets-library keepalive ping/pong succeeds) but the
+        server stops pushing subscription data. Observed 2026-05-06:
+        no trade/index updates for ~2h, six 15-min bars kill-switched
+        in a row, only recovered when the underlying TCP finally
+        died. This watchdog cuts that detection time from ``hours``
+        to ``threshold + check_interval`` (under 2 minutes by default).
+        """
+        check_interval = max(
+            _WATCHDOG_CHECK_FLOOR_SECONDS,
+            self._data_stale_seconds / 3.0,
+        )
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(),
+                        timeout=check_interval,
+                    )
+                    return  # shutdown
+                except asyncio.TimeoutError:
+                    pass
+
+                ws = self._ws
+                if ws is None or getattr(ws, "close_code", None):
+                    # Connection already gone — reconnect path will
+                    # restart us. Exit cleanly.
+                    return
+
+                stale = time.monotonic() - self._last_message_ts
+                if stale > self._data_stale_seconds:
+                    logger.warning(
+                        "WS data-stale watchdog: %.0fs since last message "
+                        "(threshold %.0fs) — forcing reconnect",
+                        stale, self._data_stale_seconds,
+                    )
+                    try:
+                        await ws.close(
+                            code=1011, reason="data-stale watchdog",
+                        )
+                    except Exception:  # noqa: BLE001 - best-effort close
+                        logger.exception("Watchdog: ws.close raised")
+                    return  # reconnect path will respawn us
+        except asyncio.CancelledError:
+            pass
 
     async def _read_forever(self) -> None:
         """Continuously read frames from the current socket + dispatch.
@@ -348,6 +456,11 @@ class DeribitWebSocketClient:
 
     async def _handle_message(self, raw: str | bytes) -> None:
         """Parse a WS frame and dispatch to handlers or pending RPCs."""
+        # Stamp BEFORE JSON-parsing so even malformed frames count as
+        # "the connection is alive". Anything that reaches us through
+        # the socket reader counts; JSON errors only trigger if a
+        # genuine frame arrived.
+        self._last_message_ts = time.monotonic()
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:

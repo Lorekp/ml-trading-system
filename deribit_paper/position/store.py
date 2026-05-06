@@ -84,6 +84,22 @@ CREATE TABLE IF NOT EXISTS open_positions (
     entry_call_price REAL NOT NULL DEFAULT 0.0,
     entry_put_price REAL NOT NULL DEFAULT 0.0
 );
+
+-- H8 (2026-05-06): bar_cursor records every bar timestamp that has
+-- finished _on_bar_close. On restart, the engine skips bars whose
+-- timestamps are already in this table, providing defence-in-depth
+-- against re-processing a bar (e.g., a buggy aggregator re-firing a
+-- past bar, or a manual replay accidentally hitting a live engine).
+-- Bar timestamp is canonical exchange UTC (set by BarClock); same
+-- timestamp from two restarts is byte-identical.
+CREATE TABLE IF NOT EXISTS bar_cursor (
+    bar_timestamp TEXT PRIMARY KEY,
+    signal_direction INTEGER NOT NULL,
+    signal_reason TEXT,
+    fired_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bar_cursor_fired_at ON bar_cursor(fired_at);
 """
 
 
@@ -349,3 +365,64 @@ class SQLiteStore:
             (int(halted), reason, halted_at),
         )
         await self._conn.commit()
+
+    # ── bar cursor (H8) ──────────────────────────────────────────────
+
+    async def is_bar_processed(self, bar_timestamp: pd.Timestamp) -> bool:
+        """Return True iff a row exists in bar_cursor for this timestamp.
+
+        Used by the engine on every ``_on_bar_close`` to refuse to
+        re-process a bar it has already handled. Defence-in-depth
+        against aggregator bugs / accidental replay against a live
+        engine. The bar timestamp is the canonical exchange UTC
+        boundary (set by BarClock); same restart, same boundary →
+        same primary key.
+        """
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM bar_cursor WHERE bar_timestamp = ?",
+            (bar_timestamp.isoformat(),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row is not None
+
+    async def mark_bar_processed(
+        self,
+        bar_timestamp: pd.Timestamp,
+        *,
+        signal_direction: int,
+        signal_reason: str | None = None,
+    ) -> None:
+        """Record that a bar has finished its signal evaluation.
+
+        Idempotent — repeated calls for the same bar timestamp are no-ops
+        (``INSERT OR IGNORE``). Called from ``_on_bar_close`` AFTER the
+        signal direction is decided but BEFORE any trade task is
+        scheduled, so a crash mid-execution still leaves a cursor row
+        and the next restart will skip the bar.
+        """
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO bar_cursor "
+            "(bar_timestamp, signal_direction, signal_reason, fired_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                bar_timestamp.isoformat(),
+                int(signal_direction),
+                signal_reason,
+                pd.Timestamp.now(tz="UTC").isoformat(),
+            ),
+        )
+        await self._conn.commit()
+
+    async def count_bars_processed(self) -> int:
+        """Count of rows in bar_cursor — useful for stats/diagnostics."""
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        cursor = await self._conn.execute("SELECT COUNT(*) FROM bar_cursor")
+        row = await cursor.fetchone()
+        await cursor.close()
+        return int(row[0]) if row else 0

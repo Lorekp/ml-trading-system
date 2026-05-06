@@ -261,6 +261,21 @@ class PaperConfig:
     # When True, the check downgrades to a WARN and the lookup falls
     # back to the most-recent-prior β* month.
     allow_stale_aligner: bool = False
+    # H1 escape hatch (set via CLI ``--clear-kill-state``). When True
+    # AND the SQLite ``kill_switch_state`` row is halted=True at engine
+    # startup, the engine clears the row to ``halted=False`` BEFORE
+    # constructing the in-memory KillSwitch, so the engine starts in a
+    # clean state. Without this flag, a tripped kill-switch from a
+    # previous run is restored on startup and the engine refuses
+    # signals until the operator clears the state explicitly.
+    clear_kill_state: bool = False
+    # H9 escape hatches (per-sidecar staleness override). Default off —
+    # engine refuses to start when a sidecar is older than the per-
+    # sidecar max_age_days. Mirrors the aligner pattern.
+    allow_stale_kelly: bool = False
+    allow_stale_slip: bool = False
+    allow_stale_features: bool = False
+    allow_stale_svi_features: bool = False
 
     def __post_init__(self) -> None:
         """Resolve sentinel defaults from (currency, bar_minutes)."""

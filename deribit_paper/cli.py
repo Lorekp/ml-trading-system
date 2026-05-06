@@ -132,6 +132,37 @@ def _parse_args() -> argparse.Namespace:
             "a refreshed sidecar is unavailable (e.g. testnet smoke run)."
         ),
     )
+    parser.add_argument(
+        "--clear-kill-state",
+        action="store_true",
+        help=(
+            "Clear a previously-tripped kill-switch state at startup. "
+            "Without this flag, an engine that crashed/restarted while "
+            "halted will RESTORE the halted state from SQLite and refuse "
+            "to trade. Pass --clear-kill-state when the operator has "
+            "verified the original trip cause is resolved (H1)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-stale-kelly",
+        action="store_true",
+        help="Bypass kelly_mult sidecar staleness gate (H9).",
+    )
+    parser.add_argument(
+        "--allow-stale-slip",
+        action="store_true",
+        help="Bypass bar_execution_quality sidecar staleness gate (H9).",
+    )
+    parser.add_argument(
+        "--allow-stale-features",
+        action="store_true",
+        help="Bypass historical features parquet staleness gate (H9).",
+    )
+    parser.add_argument(
+        "--allow-stale-svi-features",
+        action="store_true",
+        help="Bypass SVI features parquet staleness gate (H9).",
+    )
     return parser.parse_args()
 
 
@@ -216,6 +247,36 @@ def main() -> None:
         logging.getLogger("cli").warning(
             "--allow-stale-aligner: bypassing β* staleness check "
             "(predictions may be biased toward older regime)",
+        )
+    if args.clear_kill_state:
+        cfg.clear_kill_state = True
+        logging.getLogger("cli").warning(
+            "--clear-kill-state: any previously-tripped kill-switch will "
+            "be cleared on engine startup",
+        )
+    if args.allow_stale_kelly:
+        cfg.allow_stale_kelly = True
+        logging.getLogger("cli").warning(
+            "--allow-stale-kelly: bypassing Kelly K1 sidecar staleness "
+            "check (sizing may be calibrated to a stale regime)",
+        )
+    if args.allow_stale_slip:
+        cfg.allow_stale_slip = True
+        logging.getLogger("cli").warning(
+            "--allow-stale-slip: bypassing bar_execution_quality "
+            "sidecar staleness check",
+        )
+    if args.allow_stale_features:
+        cfg.allow_stale_features = True
+        logging.getLogger("cli").warning(
+            "--allow-stale-features: bypassing historical features "
+            "parquet staleness check",
+        )
+    if args.allow_stale_svi_features:
+        cfg.allow_stale_svi_features = True
+        logging.getLogger("cli").warning(
+            "--allow-stale-svi-features: bypassing SVI features "
+            "parquet staleness check",
         )
     if args.paper and args.live:
         print(

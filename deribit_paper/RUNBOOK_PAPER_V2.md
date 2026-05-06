@@ -90,27 +90,33 @@ ssh monitor "tmux kill-session -t deribit; \
 30 6 5 * * cd /path/to/ml-trading-system && PYTHONPATH=. python3 scripts/refresh_aligner_monthly.py >> logs/aligner_refresh.log 2>&1
 ```
 
-## Launch (testnet, dry-run)
+## Launch (mainnet quotes, paper-mode, simulated fills, auto-restart)
 
 ```sh
 cd C:/Claude/ml-trading-system
-PYTHONPATH=. python -m deribit_paper \
-    --run-paper \
+PYTHONPATH=. bash deribit_paper/scripts/run_engine.sh \
+    --paper \
     --config-preset v2 \
-    --venue testnet \
     --duration-minutes 0 \
     --log-level INFO \
     > deribit_paper/logs/paper_v2_$(date +%Y%m%d).log 2>&1 &
 ```
 
+* `--paper` connects to Deribit MAINNET public WS (no credentials,
+  no real orders). Implies `--venue prod` and `--dry-run`. Mutually
+  exclusive with `--live`.
 * `--config-preset v2` activates the production parity stack:
   `entry_threshold_long=12`, `target_margin_utilization=0.15`, contango
   filter, β\*, Kelly K1, realistic_taker slippage. Logged at startup
   as `Applied --config-preset=v2 (production parity stack)`.
 * `--duration-minutes 0` runs forever (until SIGTERM / Ctrl-C).
-* Dry-run is the default; the engine talks to Deribit testnet but the
-  REST client short-circuits orders to stub fills. To enable real
-  testnet orders pass `--live` (requires the `GO LIVE` passphrase).
+* `run_engine.sh` auto-restarts on crash with exponential backoff
+  (5s → 300s max). Stops permanently on rc=0 (clean stop) or rc=42
+  (operator-requested permanent shutdown). To stop without restart:
+  ``kill -TERM <engine_pid>``; to drain: ``touch deribit_paper/state/drain``.
+* To eventually enable real mainnet orders pass `--live` (requires
+  the `GO LIVE` passphrase + `DERIBIT_PROD_CLIENT_ID` /
+  `DERIBIT_PROD_CLIENT_SECRET` in env). Out of scope for this run.
 
 Output paths:
 

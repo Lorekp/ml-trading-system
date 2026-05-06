@@ -128,6 +128,7 @@ SOURCE_FILES=(
     # Live engine — engine-internal scripts
     "deribit_paper/scripts/__init__.py"
     "deribit_paper/scripts/validate_dry_run.py"
+    "deribit_paper/scripts/run_engine.sh"               # H2: auto-restart wrapper
 
     # Scripts (sidecar refresh + harness + beta extract)
     "scripts/extract_aligner_betas.py"                 # C2
@@ -255,13 +256,14 @@ print(\"All remote validations passed.\")
 echo ""
 echo "=== Deploy complete ==="
 echo ""
-echo "To restart paper trader (dry-run, V2 preset):"
+echo "To restart paper trader (mainnet quotes, simulated fills, auto-restart):"
 echo "  ssh $HOST \"tmux kill-session -t deribit 2>/dev/null; \\"
 echo "    tmux new-session -d -s deribit -c $REMOTE_DIR \\"
-echo "    'PYTHONPATH=. python3 -m deribit_paper --run-paper \\"
-echo "       --config-preset v2 --venue testnet --duration-minutes 0 \\"
-echo "       --log-level INFO --allow-stale-aligner \\"
+echo "    'PYTHONPATH=. bash deribit_paper/scripts/run_engine.sh \\"
+echo "       --paper --config-preset v2 --duration-minutes 0 \\"
+echo "       --log-level INFO \\"
 echo "       2>&1 | tee deribit_paper/logs/paper_v2_\$(date +%Y%m%d_%H%M).log'\""
 echo ""
-echo "(Drop --allow-stale-aligner once aligner_betas_by_month.json is"
-echo "refreshed for the current month — see scripts/extract_aligner_betas.py.)"
+echo "(run_engine.sh auto-restarts on crash with exponential backoff and"
+echo "stops cleanly on rc=0 or rc=42. Use --allow-stale-aligner if the"
+echo "aligner_betas_by_month.json is older than 1 month.)"

@@ -26,7 +26,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import secrets
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +69,73 @@ from deribit_paper.signal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_sidecar_fresh(
+    path: str | Path,
+    *,
+    name: str,
+    max_age_days: int,
+    allow_stale: bool,
+) -> None:
+    """H9 (2026-05-06): refuse to start when a sidecar is too old.
+
+    Mirrors the aligner-β* staleness pattern (engine.initialize() lines
+    353-393) but generalised to any file-based sidecar by using
+    ``os.path.getmtime``. Per-sidecar override flags on ``PaperConfig``
+    (e.g., ``allow_stale_kelly``) downgrade the refusal to a WARNING.
+
+    Why this matters: before H9, a 6-month-old `kelly_mult` parquet
+    silently flowed into live sizing because no mtime check existed.
+    Same for ``bar_execution_quality`` (slippage), the historical
+    features parquet, and the SVI features parquet. The aligner had a
+    refusal but the four other sidecars did not.
+
+    Parameters
+    ----------
+    path : str | Path
+        File whose mtime is checked. Missing files are NOT a staleness
+        failure here — the caller's existence check (or downstream
+        load) catches that.
+    name : str
+        Short label for log + error messages (e.g. ``"kelly K1"``).
+    max_age_days : int
+        Refusal threshold. The sidecar is allowed up to and including
+        ``max_age_days`` days old; refusal triggers strictly above.
+    allow_stale : bool
+        When True, downgrade refusal to a WARNING. Set via the
+        per-sidecar CLI override flag (e.g. ``--allow-stale-kelly``).
+    """
+    p = Path(path)
+    if not p.exists():
+        # Existence is enforced elsewhere; just skip silently.
+        return
+    age_seconds = time.time() - os.path.getmtime(p)
+    age_days = age_seconds / 86400.0
+    if age_days <= max_age_days:
+        logger.info(
+            "Sidecar %s fresh: %s (age=%.1f days, threshold=%d)",
+            name, p, age_days, max_age_days,
+        )
+        return
+    msg = (
+        f"Sidecar '{name}' at {p} is stale: age={age_days:.1f} days, "
+        f"threshold={max_age_days} days. The live engine is about to "
+        f"trade against a sidecar last regenerated more than {max_age_days} "
+        f"days ago — its calibration is unlikely to match the current "
+        f"market regime."
+    )
+    if not allow_stale:
+        logger.error(msg)
+        raise RuntimeError(
+            msg + f" Refresh the sidecar OR pass --allow-stale-{name.replace(' ', '-').lower()} "
+            f"to override (degrading sidecar fidelity)."
+        )
+    logger.warning(
+        "%s — OVERRIDDEN by --allow-stale flag; engine will proceed "
+        "with stale sidecar.",
+        msg,
+    )
 
 
 @dataclass
@@ -315,6 +384,15 @@ class TradingEngine:
                 "re-run the batch feature engineering pipeline before starting "
                 "the live engine",
             )
+        # H9: features parquet is regenerated when monthly aligner refresh
+        # runs. 45 days = 1.5 months gives slack for an aligner refresh
+        # being a few days late.
+        _assert_sidecar_fresh(
+            features_parquet,
+            name="features",
+            max_age_days=45,
+            allow_stale=getattr(cfg, "allow_stale_features", False),
+        )
         svi_features_parquet = Path(cfg.svi_features_parquet)
         if not svi_features_parquet.exists():
             raise FileNotFoundError(
@@ -322,6 +400,12 @@ class TradingEngine:
                 "re-run vol_arb/run_pipeline.py --svi to regenerate the "
                 "constant-maturity SVI features the T2.1 models depend on",
             )
+        _assert_sidecar_fresh(
+            svi_features_parquet,
+            name="svi-features",
+            max_age_days=45,
+            allow_stale=getattr(cfg, "allow_stale_svi_features", False),
+        )
         self.feature_assembler = FeatureAssembler(
             features_parquet=features_parquet,
             svi_features_parquet=svi_features_parquet,
@@ -397,9 +481,29 @@ class TradingEngine:
                 logger.exception(
                     "Aligner β* staleness check failed (advisory only)"
                 )
+        # H9: Kelly K1 sidecar staleness — regenerated alongside the
+        # aligner. 45 days for the same reason as features.
+        if cfg.kelly_mult_path:
+            _assert_sidecar_fresh(
+                cfg.kelly_mult_path,
+                name="kelly-K1",
+                max_age_days=45,
+                allow_stale=getattr(cfg, "allow_stale_kelly", False),
+            )
         self._kelly_mult_series = (
             _load_kelly(cfg.kelly_mult_path) if cfg.kelly_mult_path else None
         )
+        # H9: bar_execution_quality slip sidecar — empirical from the
+        # backtester's IOC-ladder fill-quality model. Updated less
+        # frequently than aligner because liquidity-conditioned slip is
+        # more stable. 90 days = 3 months.
+        if cfg.bar_exec_quality_path:
+            _assert_sidecar_fresh(
+                cfg.bar_exec_quality_path,
+                name="bar-exec-quality",
+                max_age_days=90,
+                allow_stale=getattr(cfg, "allow_stale_slip", False),
+            )
         self._bar_slip_series = (
             _load_slip(cfg.bar_exec_quality_path)
             if cfg.bar_exec_quality_path else None
@@ -586,13 +690,82 @@ class TradingEngine:
             dte_max_days=cfg.dte_max_days,
             im_fraction=cfg.im_fraction,
         )
+        # H1 (2026-05-06): persist kill-switch state across restarts.
+        # The store has had get/set_kill_switch_state methods since
+        # Phase 6, but engine.initialize() never read or wrote them.
+        # An engine that tripped (e.g., daily-DD limit) and restarted
+        # would silently come back unhalted, losing the operator's
+        # signal-to-stop. Now: trip/reset persist via callback, and
+        # initialize() restores prior halted state unless
+        # --clear-kill-state was passed.
+        self._ks_persist_tasks: set[asyncio.Task] = set()
+
+        def _persist_ks(halted: bool, reason: str | None) -> None:
+            # Sync wrapper invoked by KillSwitch.trip / .reset; we must
+            # be inside the event loop here (the engine init runs under
+            # asyncio.run). Best-effort: if scheduling itself raises,
+            # log and swallow — persistence failure must NEVER mask the
+            # in-memory trip.
+            if self.store is None:
+                return
+            try:
+                task = asyncio.create_task(
+                    self.store.set_kill_switch_state(halted, reason=reason),
+                    name=f"persist_ks_{int(halted)}",
+                )
+            except RuntimeError:
+                # No running loop — extremely unlikely from engine code,
+                # but possible from a unit test that constructs KillSwitch
+                # outside an event loop. Drop silently.
+                logger.warning(
+                    "KillSwitch persist callback fired with no event loop "
+                    "(halted=%s reason=%s) — state NOT persisted",
+                    halted, reason,
+                )
+                return
+            self._ks_persist_tasks.add(task)
+            task.add_done_callback(self._ks_persist_tasks.discard)
+
         self.kill_switch = KillSwitch(
             equity_tracker=self.equity_tracker,
             max_daily_drawdown_pct=cfg.kill_switch_daily_dd_pct,
             max_consecutive_errors=cfg.kill_switch_consecutive_errors,
             network_outage_seconds=cfg.network_outage_seconds,
             alert_callback=lambda reason: self.telegram.kill_switch(reason) if self.telegram else None,
+            persist_callback=_persist_ks,
         )
+
+        # H1: restore prior halt state (or clear if --clear-kill-state).
+        prior_halted, prior_reason, prior_at = await self.store.get_kill_switch_state()
+        if prior_halted and getattr(cfg, "clear_kill_state", False):
+            logger.warning(
+                "Kill-switch was halted at last shutdown (reason=%s, at=%s) "
+                "but --clear-kill-state was passed — clearing state and "
+                "starting clean",
+                prior_reason, prior_at,
+            )
+            await self.store.set_kill_switch_state(False, reason=None)
+            if self.telegram is not None:
+                self.telegram.send(
+                    "info",
+                    f"Kill-switch CLEARED on startup (was: {prior_reason})",
+                )
+        elif prior_halted:
+            restored_msg = (
+                f"[restored from {prior_at}] {prior_reason}"
+                if prior_reason
+                else f"[restored from {prior_at}] (no reason recorded)"
+            )
+            logger.error(
+                "Kill-switch state RESTORED from SQLite: halted=True, "
+                "reason=%s — engine will refuse new signals until "
+                "operator clears state via --clear-kill-state",
+                restored_msg,
+            )
+            self.kill_switch.trip(restored_msg)
+        else:
+            logger.info("Kill-switch state at startup: clean")
+
         # Wire kill switch into the subscriber so mark_ws_message is called
         # on actual WS data arrival, not on bar ticks.
         self.subscriber.set_kill_switch(self.kill_switch)
@@ -887,6 +1060,24 @@ class TradingEngine:
             await self.rest.close()
         if self.auth is not None:
             await self.auth.close()
+        # H1: drain in-flight kill-switch persistence tasks BEFORE
+        # closing the store — otherwise a task firing right at shutdown
+        # could try to write to a closed connection. Bounded wait
+        # because each task is a single UPDATE.
+        if getattr(self, "_ks_persist_tasks", None):
+            pending_persists = [t for t in self._ks_persist_tasks if not t.done()]
+            if pending_persists:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending_persists, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Shutdown: %d kill-switch persist task(s) still pending "
+                        "after 5s timeout",
+                        len(pending_persists),
+                    )
         if self.store is not None:
             await self.store.close()
 
@@ -908,7 +1099,37 @@ class TradingEngine:
     # ── Bar-close handler (driven by BarClock via BarAggregator) ──
 
     async def _on_bar_close(self, bar: Bar) -> None:
-        """Main per-bar logic — signal → risk → execute → persist."""
+        """Main per-bar logic — signal → risk → execute → persist.
+
+        H8 (2026-05-06): consults the bar_cursor table at the top of the
+        method and refuses to re-process a bar it has already handled.
+        This is defence-in-depth against:
+        * a buggy aggregator that re-fires a past bar timestamp,
+        * an accidental ``replay`` mode running against a live engine,
+        * a manual debugger session that re-invokes ``_on_bar_close``
+          for an already-processed bar.
+
+        Marks the cursor AFTER ``process_bar`` returns successfully —
+        if process_bar itself raises, the bar is NOT marked, and the
+        operator can fix the underlying cause and replay safely.
+        """
+        # H8: refuse to re-process a bar already in the cursor.
+        if self.store is not None:
+            try:
+                already = await self.store.is_bar_processed(bar.timestamp)
+            except Exception:  # noqa: BLE001 - cursor lookup non-fatal
+                logger.exception(
+                    "H8: bar_cursor lookup failed for %s — proceeding "
+                    "without idempotency guard", bar.timestamp,
+                )
+                already = False
+            if already:
+                logger.warning(
+                    "H8: bar %s already in bar_cursor — skipping "
+                    "(restart-idempotency guard)", bar.timestamp,
+                )
+                return
+
         self.stats.bars_processed += 1
         self.stats.last_bar_timestamp = bar.timestamp
         logger.info(
@@ -924,6 +1145,27 @@ class TradingEngine:
             if self.telegram is not None:
                 self.telegram.error(f"bar {bar.timestamp} failed: {exc}")
             self.kill_switch.on_trade_result(success=False)
+            # Do NOT mark the cursor — operator may want to replay.
+            return
+
+        # H8: mark the bar as processed now that signal evaluation
+        # completed (even if no trade fired — the cursor is bar-level,
+        # not trade-level). Best-effort: failure to persist must not
+        # break the bar loop. signal_direction=0 here is a placeholder
+        # — process_bar updates EngineStats.signals_long/short but
+        # doesn't expose this bar's direction back to the caller, so we
+        # keep the cursor row diagnostic-poor but idempotency-correct.
+        if self.store is not None:
+            try:
+                await self.store.mark_bar_processed(
+                    bar.timestamp,
+                    signal_direction=0,
+                    signal_reason=self.stats.last_signal_reason or None,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "H8: mark_bar_processed failed for %s", bar.timestamp,
+                )
 
     async def process_bar(self, bar: Bar) -> None:
         """Run the signal → risk → execute pipeline for one bar.

@@ -36,27 +36,45 @@ TRACKED_TREES: list[tuple[str, str]] = [
 
 
 def _parse_manifest_paths() -> set[str]:
-    """Pull every quoted ``"...py"`` token out of SOURCE_FILES + MODEL_FILES.
+    """Pull every quoted ``"...py"`` or ``"...sh"`` token out of
+    SOURCE_FILES + MODEL_FILES.
 
     Robust to comments, conditional logic, and trailing whitespace —
     we just regex-match the quoted paths. Strings that don't end in
-    ``.py`` (data files, JSONs, .zip) are filtered out by the caller
-    using the per-tree path prefix.
+    ``.py`` / ``.sh`` (data files, JSONs, .zip) are filtered out by
+    the caller using the per-tree path prefix.
+
+    H2 (2026-05-06): extended to ``.sh`` so engine-internal shell
+    wrappers under ``deribit_paper/scripts/`` are part of the
+    completeness contract. The wrapper ``run_engine.sh`` was missing
+    on the homeserver because the prior regex only matched ``.py``.
     """
     text = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    return set(re.findall(r'"([^"]+\.py)"', text))
+    return set(re.findall(r'"([^"]+\.(?:py|sh))"', text))
 
 
 def _walk_source_tree(tree_root: Path) -> set[str]:
-    """Return every ``.py`` file under ``tree_root`` as a repo-relative
-    POSIX path. Skips ``__pycache__`` and ``tests`` subdirectories
-    (tests have their own dev-time gate)."""
+    """Return every ``.py`` and (under ``deribit_paper/scripts/``)
+    ``.sh`` file under ``tree_root`` as a repo-relative POSIX path.
+    Skips ``__pycache__`` and ``tests`` subdirectories (tests have
+    their own dev-time gate).
+
+    Shell wrappers are intentionally tracked only inside
+    ``deribit_paper/scripts/`` because that's where engine-internal
+    operational helpers live (auto-restart wrapper, dry-run
+    validator). General ``scripts/`` files are not part of the live
+    engine contract.
+    """
     out: set[str] = set()
-    for p in tree_root.rglob("*.py"):
-        parts = p.relative_to(REPO_ROOT).parts
-        if "__pycache__" in parts or "tests" in parts:
-            continue
-        out.add(p.relative_to(REPO_ROOT).as_posix())
+    for pattern in ("*.py", "*.sh"):
+        for p in tree_root.rglob(pattern):
+            parts = p.relative_to(REPO_ROOT).parts
+            if "__pycache__" in parts or "tests" in parts:
+                continue
+            # Only track .sh under deribit_paper/scripts/
+            if p.suffix == ".sh" and "scripts" not in parts:
+                continue
+            out.add(p.relative_to(REPO_ROOT).as_posix())
     return out
 
 

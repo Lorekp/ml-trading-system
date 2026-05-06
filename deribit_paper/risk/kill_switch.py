@@ -69,12 +69,20 @@ class KillSwitch:
         max_consecutive_errors: int = 3,
         network_outage_seconds: float = 120.0,
         alert_callback: Callable[[str], None] | None = None,
+        persist_callback: Callable[[bool, str | None], None] | None = None,
     ):
         self._equity = equity_tracker
         self.max_daily_dd_pct = max_daily_drawdown_pct
         self.max_consecutive_errors = max_consecutive_errors
         self.network_outage_seconds = network_outage_seconds
         self._alert_callback = alert_callback
+        # H1 (2026-05-06): persist_callback writes (halted, reason) to the
+        # SQLite store so a tripped kill-switch survives process restart.
+        # Called from trip() and reset() in best-effort fashion — failure
+        # to persist must not mask the trip itself, so any callback
+        # exception is logged and swallowed (mirroring alert_callback).
+        # Sync signature; engine wraps an asyncio.create_task internally.
+        self._persist_callback = persist_callback
         self._state = KillSwitchState(halted=False, reason=None, halted_at=None)
         self._consecutive_errors = 0
         self._last_ws_message_at: pd.Timestamp | None = None
@@ -195,6 +203,12 @@ class KillSwitch:
                 self._alert_callback(reason)
             except Exception:  # noqa: BLE001 - alert failure must not mask the trip
                 logger.exception("KillSwitch alert callback raised")
+        # H1: best-effort persist; failure must not mask the trip.
+        if self._persist_callback is not None:
+            try:
+                self._persist_callback(True, reason)
+            except Exception:  # noqa: BLE001
+                logger.exception("KillSwitch persist callback raised on trip")
         return True
 
     def reset(self, *, operator: str = "manual") -> None:
@@ -212,3 +226,9 @@ class KillSwitch:
         )
         self._state = KillSwitchState(halted=False, reason=None, halted_at=None)
         self._consecutive_errors = 0
+        # H1: persist the cleared state so the next restart starts clean.
+        if self._persist_callback is not None:
+            try:
+                self._persist_callback(False, None)
+            except Exception:  # noqa: BLE001
+                logger.exception("KillSwitch persist callback raised on reset")

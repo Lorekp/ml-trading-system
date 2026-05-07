@@ -43,6 +43,11 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from deribit_paper.features.har_pd_live import (
+    HAR_PD_RAW_FEATURES,
+    K_BARS_DEFAULT as HAR_PD_K_BARS_DEFAULT,
+    HARPDState,
+)
 from deribit_paper.features.tsrv_live import BarTSRV
 from deribit_paper.market_data.aggregator import Bar
 
@@ -61,11 +66,19 @@ class AssemblerContext:
     Kept minimal: only the fields a handler actually needs.  Pass-
     through objects (``svi_calibrator``, baseline row) are available
     for handlers that need them.
+
+    ``har_pd_features`` is a per-bar precomputed dict of the 6 HAR-PD
+    feature values populated by :meth:`FeatureAssembler.build_row`
+    BEFORE the handler loop fires; the 6 HAR-PD live handlers just
+    look up by name. Empty dict during HAR-PD warmup; in that case
+    the handlers fall back to the historical baseline value, matching
+    the rest of the assembler's fail-soft behaviour.
     """
     bar: Bar
     bar_tsrv: BarTSRV
     svi_calibrator: Any | None       # LiveSVICalibrator, late-bound
     baseline_row: pd.Series          # historical baseline for fallbacks
+    har_pd_features: dict[str, float] = field(default_factory=dict)
 
 
 def _h_tsrv(ctx: AssemblerContext) -> float:
@@ -145,6 +158,26 @@ def _h_tsrv_mean_1d(ctx: AssemblerContext) -> float:
     return float(ctx.baseline_row.get("tsrv_mean_1d", 0.0) or 0.0)
 
 
+def _make_har_pd_handler(name: str) -> Callable[[AssemblerContext], float]:
+    """Return a live handler that reads the named HAR-PD feature from
+    ``ctx.har_pd_features`` (precomputed once per bar by the assembler).
+
+    During HAR-PD warmup (first 96 bars before pre-warm seed completes,
+    or when no `bar_tsrv` was passed in), ``har_pd_features`` is empty
+    and the handler falls back to the historical baseline value —
+    matching the same fail-soft behaviour as ``svi_atm_1d`` when the
+    SVI calibrator hasn't yet produced live params.
+    """
+    def _handler(ctx: AssemblerContext) -> float:
+        live = ctx.har_pd_features.get(name)
+        if live is None or not np.isfinite(live):
+            return float(ctx.baseline_row.get(name, 0.0) or 0.0)
+        return float(live)
+
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
 def _h_svi_atm_1d(ctx: AssemblerContext) -> float:
     """1-day constant-maturity ATM implied vol (percent units).
 
@@ -184,6 +217,11 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "n_bars_in_window": _h_n_bars_in_window,
     "tsrv_mean_1d": _h_tsrv_mean_1d,
     "svi_atm_1d": _h_svi_atm_1d,
+    # C (parity 2026-05-07) — HAR-PD path-dependent live features.
+    # Each handler is a closure that reads its slot from
+    # ``ctx.har_pd_features`` (precomputed once per bar before the
+    # handler loop fires; see ``FeatureAssembler.build_row``).
+    **{name: _make_har_pd_handler(name) for name in HAR_PD_RAW_FEATURES},
 }
 
 
@@ -244,6 +282,7 @@ class FeatureAssembler:
         bundle,  # ModelBundle — late binding to avoid circular import
         svi_calibrator: Any | None = None,
         rolling_history_bars: int = 672,  # 7 days at 15min
+        har_pd_k_bars: int = HAR_PD_K_BARS_DEFAULT,
     ):
         self._features_parquet_path = Path(features_parquet)
         self._svi_features_parquet_path = (
@@ -252,6 +291,12 @@ class FeatureAssembler:
         self._bundle = bundle
         self._svi_calibrator = svi_calibrator
         self._rolling_history_bars = rolling_history_bars
+        # C (parity 2026-05-07): live HAR-PD state. Each call to
+        # ``build_row`` reads strict-past values from this buffer
+        # BEFORE appending the current bar. The engine pre-warms the
+        # buffer from the historical TSRV parquet at startup so the
+        # first live bar produces non-NaN HAR-PD features.
+        self._har_pd_state = HARPDState(k_bars=har_pd_k_bars)
 
         if not self._features_parquet_path.exists():
             raise FileNotFoundError(
@@ -315,6 +360,55 @@ class FeatureAssembler:
     def baseline_timestamp(self) -> pd.Timestamp:
         return self._baseline_ts
 
+    @property
+    def har_pd_state(self) -> HARPDState:
+        """Expose the HAR-PD circular buffer for testing / pre-warm."""
+        return self._har_pd_state
+
+    def prewarm_har_pd_from_tsrv(
+        self,
+        tsrv_parquet_path: str | Path,
+    ) -> int:
+        """Bulk-feed the last ``k_bars`` rows of an offline TSRV
+        parquet into the HAR-PD buffer so the first live bar produces
+        non-NaN HAR-PD features instead of waiting 24h.
+
+        Returns the number of rows fed. Does NOT raise if the parquet
+        is missing — engine's startup logger will warn and HAR-PD
+        will warmup from live data over the first 96 bars.
+        """
+        p = Path(tsrv_parquet_path)
+        if not p.exists():
+            logger.warning(
+                "HAR-PD pre-warm: TSRV parquet %s does not exist; "
+                "buffer will warmup from live bars (96 bar / ~24h delay)",
+                p,
+            )
+            return 0
+        df = pd.read_parquet(p)
+        required = {"rs_up", "rs_down", "rv_ann"}
+        missing = required - set(df.columns)
+        if missing:
+            logger.warning(
+                "HAR-PD pre-warm: TSRV parquet %s missing columns %s; "
+                "buffer will warmup from live bars",
+                p, missing,
+            )
+            return 0
+        k = self._har_pd_state.k_bars
+        tail = df[["rs_up", "rs_down", "rv_ann"]].tail(k)
+        rows = (
+            (float(r.rs_up), float(r.rs_down), float(r.rv_ann))
+            for r in tail.itertuples()
+        )
+        n = self._har_pd_state.prewarm(rows)
+        logger.info(
+            "HAR-PD pre-warm: seeded buffer with %d rows from %s "
+            "(window: %s → %s)",
+            n, p.name, tail.index[0], tail.index[-1],
+        )
+        return n
+
     def _validate_manifest(self, feature_names: list[str]) -> None:
         """Raise ValueError listing any features we cannot produce."""
         missing: list[str] = []
@@ -360,11 +454,18 @@ class FeatureAssembler:
         values = np.zeros(n, dtype=np.float64)
         as_dict: dict[str, float] = {}
 
+        # C (parity 2026-05-07): compute HAR-PD features ONCE per bar
+        # from the strict-past buffer BEFORE the handler loop. The
+        # handlers just look up their slot. Must happen BEFORE we
+        # append the current bar's TSRV — strict-past contract.
+        har_pd_features = self._har_pd_state.compute_features()
+
         ctx = AssemblerContext(
             bar=bar,
             bar_tsrv=bar_tsrv,
             svi_calibrator=self._svi_calibrator,
             baseline_row=self._baseline_row,
+            har_pd_features=har_pd_features,
         )
 
         for i, name in enumerate(feature_names):
@@ -389,6 +490,27 @@ class FeatureAssembler:
                 # Baseline fallback (validated in __init__, so this is safe)
                 values[i] = float(self._baseline_row.get(name, 0.0) or 0.0)
             as_dict[name] = values[i]
+
+        # C (parity 2026-05-07): append the current bar's TSRV to the
+        # HAR-PD buffer AFTER the handler loop has consumed the
+        # strict-past features. This makes the current bar's TSRV
+        # available as strict-past for the NEXT bar's HAR-PD
+        # computation. Before the buffer is warm we still append (the
+        # warmup-fallback path returns NaN until 96 entries observed).
+        try:
+            self._har_pd_state.append(
+                rs_up=float(bar_tsrv.rs_up),
+                rs_down=float(bar_tsrv.rs_down),
+                rv_ann=float(bar_tsrv.rv_ann),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            # Defensive: a malformed BarTSRV (or a test stub missing a
+            # field) shouldn't poison the buffer. Skip the append and
+            # continue — handlers will fall back to baseline next bar.
+            logger.warning(
+                "HAR-PD append failed at %s (%s); buffer not advanced",
+                bar.timestamp, exc,
+            )
 
         # R1: Fail fast on NaN/inf features instead of silently zeroing.
         # TransVol slots (tv_*) are allowed to be zero-filled from baseline

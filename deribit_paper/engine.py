@@ -468,6 +468,18 @@ class TradingEngine:
             svi_calibrator=self.svi_calibrator,
             rolling_history_bars=cfg.bars_per_day * 7,
         )
+        # C (parity 2026-05-07): pre-warm the HAR-PD circular buffer
+        # from the offline TSRV parquet so the first live bar emits
+        # non-NaN HAR-PD features. Without this the buffer would need
+        # ~24h of live data before HAR-PD features go non-NaN, which
+        # would silently disable the HAR-PD model variant on launch.
+        # No-op + warning when the parquet is missing; HAR-PD only
+        # affects 6 of 50 features and the assembler falls back to
+        # baseline if compute_features returns NaN.
+        tsrv_parquet = Path(
+            f"TSRV/output/{cfg.asset_pair}_tsrv_{cfg.bar_minutes}m.parquet"
+        )
+        self.feature_assembler.prewarm_har_pd_from_tsrv(tsrv_parquet)
         # ── V2 sidecar loads (aligner β* + Kelly K1) ──
         # Aligner β*: per-month QLIKE-optimal scalar bias on log-vol
         # predictions (C2 2026-04-26). Empty dict → predictor passes raw

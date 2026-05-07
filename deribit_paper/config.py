@@ -192,8 +192,15 @@ class PaperConfig:
     # ── Model inference ────────────────────────────────────────────
     # lgbm_models_dir holds the LightGBM ``.txt`` + ``_features.json``
     # manifests for the walk-forward variant in use.  W3.1 (2026-04-11)
-    # switched this to the Stage 18 T2.1 pruned+SVI variant.
-    lgbm_models_dir: str = "vol_model/output/models/expanding_pruned_svi_v1"
+    # switched this to the Stage 18 T2.1 pruned+SVI variant. C
+    # (parity 2026-05-07) flips the default to the 50-feature HAR-PD
+    # variant (``_pruned_svi_har_pd_v1``) — the model the V2 backtest
+    # was trained against and which the aligner β* was calibrated for.
+    # The 6 extra features are computed live by the FeatureAssembler
+    # (see deribit_paper/features/har_pd_live.py); the byte-identity
+    # test ``tests/test_har_pd_live_byte_identity.py`` locks the
+    # numerical equivalence vs the offline parquet.
+    lgbm_models_dir: str = "vol_model/output/models/expanding_pruned_svi_har_pd_v1"
     # The pruned+SVI variant reuses TransVol checkpoints from the
     # earlier ``expanding_hybrid/`` run — no TransVol re-training was
     # needed because T2.1 only prunes LightGBM-level features.  So the

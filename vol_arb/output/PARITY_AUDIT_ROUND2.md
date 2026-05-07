@@ -28,10 +28,10 @@ the team has observed.
 |---|---|---|---|---|
 | F1 | SVI parquet integer-position join → 100% NaN baseline → silent `svi_atm_1d=0` (verified empirically) | **P0** | **DONE** (f901b50) | 10 |
 | F2 | `_h_vol_ann` returns continuous_var-based; offline parquet uses tsrv-based — 12% gap on jump bars | **P0** | **DONE** (f901b50) | 1 |
-| F3 | 24 of 48 manifest features fall through to a STATIC baseline frozen at engine startup (incl. `vpin`, `time_to_funding`, all `*_ema/_lag` variants) | **P0** | **DEFER (R3)** | 50-100 + retrain |
-| F4 | `_h_duration_s` semantics: live=mean inter-trade gap; offline=last sub-bar's duration | P0 | DEFER (R3) | ~15 (or retrain) |
-| F5 | `_h_n_trades` semantics: live=15min total; offline=last sub-bar count | P0 | DEFER (R3) | ~15 (or retrain) |
-| F6 | Live perp feed = Deribit; offline TSRV/features parquet = Binance — different venues | **P0** | **DEFER (R3)** | ~150 (multi-day) |
+| F3 | 24 of 48 manifest features fall through to a STATIC baseline frozen at engine startup (incl. `vpin`, `time_to_funding`, all `*_ema/_lag` variants) | **P0** | **DONE** (Tier 1-6 commits f15b58e..e8595d2) | ~3000 LOC |
+| F4 | `_h_duration_s` semantics: live=mean inter-trade gap; offline=last sub-bar's duration | P0 | **DONE** (Tier 3, 1a2c8f9) | ~15 |
+| F5 | `_h_n_trades` semantics: live=15min total; offline=last sub-bar count | P0 | **DONE** (Tier 3, 1a2c8f9) | ~15 |
+| F6 | Live perp feed = Deribit; offline TSRV/features parquet = Binance — different venues | **P0** | **PARTIAL** (F3 added Binance spot dollar-bar feed for the 24 features; Deribit perp still used elsewhere) | ~150 |
 | F7 | SVI `atm_vol_at_dte(1d)` collapses to nearest-slice ATM when only 1 expiry cached | P1 | **DONE** (c9d41fc) | ~10 |
 | F8 | HAR-PD pre-warm reads Binance TSRV; live appends Deribit-derived TSRV (transient venue boundary) | P1 | (closes when F6 closes) | — |
 | F9 | `or 0.0` fallback in handlers masks the line-519 NaN guard; couples with F1 to silence the bug | **P0** | **DONE** (f901b50) | 5 |
@@ -122,6 +122,56 @@ every cheap P2/P3 hygiene win:
 After round-3, every parity gap that does NOT require a retrain or new
 venue subscription is closed. Test count: 748/748 deribit_paper, 43/43
 V2 byte-identity, 12/12 cross-system DRL parity tests green.
+
+---
+
+## F3 (24 missing live handlers) — SHIPPED 2026-05-07 in 6 tiers
+
+User chose the architecturally honest path: build dollar-bar
+reconstruction in the live engine + switch live VPIN to spot dollar-bar
+VPIN, instead of the partial-fix alternatives. 6 tiers across 6
+commits, all byte-identity-tested where the offline architecture
+permits:
+
+| Tier | Commit | Scope | New tests | LOC |
+|---|---|---|---|---|
+| 1 | f15b58e | DollarBarAggregator + Binance spot REST client + byte-identity test | 8 | 740 |
+| 2 | 69a30b2 | DollarBarBuffer + DollarBarSpotStream + spot-VPIN byte-identity | 16 | 1024 |
+| 3 | 1a2c8f9 | 16 dollar-bar handlers + F4/F5 fixes + 10 byte-identity tests | 32 | 1055 |
+| 4 | 216f97d | Warm-start sidecar (vol_arb/output/BTC_dollar_bar_cache.parquet) | 8 | 522 |
+| 5 | f86858c | 6 TSRV-grid handlers (tsrv_mean_*, tsrv_ffd, up_jump_frac_ema50, bpv_tsrv_ratio_ema50) | 19 | 692 |
+| 6 | e8595d2 | time_to_funding{,_lag1} + engine wiring + deploy | 15 | 240 |
+
+**Test totals after F3 ship**: 846/846 deribit_paper green (was 748,
++98 new). 43/43 V2 byte-identity preserved.
+
+**Live deploy verified 2026-05-07 21:08 UTC**:
+- DollarBarBuffer ready: 300 bars prewarmed
+- TSRVHistoryBuffer ready: 672 rows prewarmed
+- DollarBarSpotStream polling api.binance.com/api/v3/aggTrades every 3s
+- Existing LiveVPINStream (Futures perp) running in parallel
+
+**Documented deviations from offline byte-identity**:
+
+1. **Tier 5 TSRV-grid features** (`tsrv_mean_*`, `tsrv_ffd`,
+   `up_jump_frac_ema50`, `bpv_tsrv_ratio_ema50`) compute on the live
+   15-min TSRV grid directly, not on offline's dollar-bar grid (which
+   would require a 1750-bar dollar buffer + per-handler ffill of
+   TSRV onto dollar-bar timestamps). Mathematically equivalent under
+   constant-rate trading; deviates under bursty volume. Substantially
+   better than baseline-frozen.
+
+2. **Tier 3 dollar-bar features**: byte-identity to offline pandas
+   reference at 1e-12 relative on real 200K-trade slices.
+
+3. **Volume-sum precision**: dollar_volume / buy_volume / sell_volume
+   match offline to 1e-12 relative (float64 ULP from numpy pairwise
+   summation vs Python left-to-right accumulation).
+
+**Round-4 outstanding**:
+- F6/F8: live Deribit perp vs offline Binance spot for the rest of the
+  pipeline (TSRV, etc.). F3's spot dollar-bar feed is a partial fix.
+- Round-4 model retrain on the post-F3 live feature distribution.
 
 ---
 

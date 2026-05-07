@@ -2463,8 +2463,48 @@ class VolArbBacktester:
         r_t: np.ndarray,
         trade_pnl: np.ndarray,
         initial_equity: float,
+        bar_minutes: int = 15,
     ) -> dict:
-        """Compute tearsheet metrics from compounded equity curve."""
+        """Compute tearsheet metrics from a (compound or NC) equity curve.
+
+        **Sharpe / Sortino convention (2026-05-07 fix)**: the headline
+        ``sharpe_ratio`` is now a **daily-resampled** Sharpe, the
+        industry-standard quant convention used by funds, papers, and
+        ``vol_arb.metrics.risk_adjusted_metrics.sharpe_daily``:
+
+            daily_returns = sum of r_t over each calendar day
+                          (= ``bars_per_day`` consecutive bars)
+            sharpe = mean(daily_returns) / std(daily_returns)
+                     * sqrt(365.25)            # crypto 24/7 calendar
+
+        This captures intraday return clustering correctly (per-bar
+        Sharpe over-states risk-adjusted performance when trades
+        cluster within days). For an i.i.d. return stream the per-bar
+        and daily Sharpes are mathematically equal; for real strategies
+        with positive autocorrelation in fired-bar locations, the
+        daily Sharpe is LOWER and more honest.
+
+        Two diagnostic Sharpes are reported alongside the headline:
+
+        - ``sharpe_ratio_per_bar``: full-series per-bar Sharpe
+          ``mean(r_t) / std(r_t) * sqrt(bars_per_year)``. Same data,
+          different aggregation grid; equal to ``sharpe_ratio`` for
+          i.i.d. returns.
+        - ``sharpe_ratio_trades_only``: legacy convention used pre-fix.
+          Filtered to fired bars only (``r_t[r_t != 0]``), annualized
+          by ``sqrt(bars_per_year)``. This OVERSTATES Sharpe by roughly
+          ``sqrt(bars_per_year / trades_per_year)`` because the
+          annualization counts every calendar bar but the std is
+          computed only over the fired-bar return distribution. For
+          V2 BTC the overstatement is ~sqrt(23.6) ≈ 4.86×. Kept as a
+          diagnostic so historical comparisons against pre-fix logs
+          remain interpretable.
+
+        Crypto markets are 24/7 → ``bars_per_day = 1440 / bar_minutes``,
+        ``bars_per_year = 365.25 * bars_per_day``. At ``bar_minutes=15``
+        (V2 default): bars_per_day=96, bars_per_year=35,064.
+        """
+        n_bars = len(r_t)
         trade_returns = r_t[r_t != 0]
         trade_dollars = trade_pnl[trade_pnl != 0]
         n_trades = len(trade_returns)
@@ -2475,23 +2515,82 @@ class VolArbBacktester:
         total_pnl = float(equity_curve[-1] - initial_equity)
         total_return = (equity_curve[-1] / initial_equity - 1.0)
 
-        # Sharpe/Sortino from trade returns (percentage, not dollars)
-        bars_per_year = 365.25 * 24 * 4
-        mean_r = float(trade_returns.mean())
-        std_r = float(trade_returns.std(ddof=1)) if n_trades > 1 else 1e-10
+        # Annualization factors — crypto 24/7.
+        bars_per_day = max(int(1440 // max(bar_minutes, 1)), 1)
+        bars_per_year = 365.25 * bars_per_day
+        days_per_year = 365.25
 
-        sharpe = (mean_r / std_r) * np.sqrt(bars_per_year) if std_r > 0 else 0.0
+        # Proper quant Sharpe: daily-resampled, sqrt(365.25) annualised.
+        # Reshape r_t into (n_days, bars_per_day) chunks and SUM within
+        # each day → arithmetic daily returns. Trailing partial day is
+        # truncated to keep the rectangular-array math clean; with
+        # multi-year backtests the truncation is at most ``bars_per_day``
+        # samples (negligible).
+        n_full_days = n_bars // bars_per_day
+        if n_full_days >= 2:
+            daily_r = r_t[: n_full_days * bars_per_day].reshape(
+                n_full_days, bars_per_day,
+            ).sum(axis=1)
+            mean_daily = float(daily_r.mean())
+            std_daily = float(daily_r.std(ddof=1))
+            sharpe = (
+                (mean_daily / std_daily) * np.sqrt(days_per_year)
+                if std_daily > 0 else 0.0
+            )
+            downside_daily = daily_r[daily_r < 0]
+            down_std_daily = (
+                float(downside_daily.std(ddof=1))
+                if len(downside_daily) > 1 else 0.0
+            )
+            sortino = (
+                (mean_daily / down_std_daily) * np.sqrt(days_per_year)
+                if down_std_daily > 0 else 0.0
+            )
+        else:
+            sharpe = 0.0
+            sortino = 0.0
 
-        downside_r = trade_returns[trade_returns < 0]
-        down_std = float(downside_r.std(ddof=1)) if len(downside_r) > 1 else 1e-10
-        sortino = (mean_r / down_std) * np.sqrt(bars_per_year) if down_std > 0 else 0.0
+        # Diagnostic: per-bar Sharpe on the FULL r_t series.
+        mean_r_full = float(r_t.mean()) if n_bars > 0 else 0.0
+        std_r_full = float(r_t.std(ddof=1)) if n_bars > 1 else 0.0
+        sharpe_per_bar = (
+            (mean_r_full / std_r_full) * np.sqrt(bars_per_year)
+            if std_r_full > 0 else 0.0
+        )
+        downside_full = r_t[r_t < 0]
+        down_std_full = (
+            float(downside_full.std(ddof=1)) if len(downside_full) > 1 else 0.0
+        )
+        sortino_per_bar = (
+            (mean_r_full / down_std_full) * np.sqrt(bars_per_year)
+            if down_std_full > 0 else 0.0
+        )
 
-        # Max drawdown from compounded equity curve
+        # Diagnostic: legacy fired-bar-only Sharpe (overstated).
+        mean_r_trades = float(trade_returns.mean())
+        std_r_trades = (
+            float(trade_returns.std(ddof=1)) if n_trades > 1 else 0.0
+        )
+        sharpe_trades_only = (
+            (mean_r_trades / std_r_trades) * np.sqrt(bars_per_year)
+            if std_r_trades > 0 else 0.0
+        )
+        downside_trades = trade_returns[trade_returns < 0]
+        down_std_trades = (
+            float(downside_trades.std(ddof=1))
+            if len(downside_trades) > 1 else 0.0
+        )
+        sortino_trades_only = (
+            (mean_r_trades / down_std_trades) * np.sqrt(bars_per_year)
+            if down_std_trades > 0 else 0.0
+        )
+
+        # Max drawdown from equity curve.
         running_max = np.maximum.accumulate(equity_curve)
         drawdowns = (equity_curve - running_max) / running_max
         max_dd = float(drawdowns.min())
 
-        # Win rate and profit factor (from dollar trade PnL)
+        # Win rate and profit factor (from dollar trade PnL).
         wins = trade_dollars[trade_dollars > 0]
         losses = trade_dollars[trade_dollars < 0]
         win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
@@ -2504,8 +2603,15 @@ class VolArbBacktester:
             "n_trades": n_trades,
             "total_pnl": total_pnl,
             "total_return_pct": total_return * 100,
+            # Headline (proper, daily-resampled, sqrt(365.25) annualised).
             "sharpe_ratio": float(sharpe),
             "sortino_ratio": float(sortino),
+            # Diagnostic: per-bar full-series (intraday-grid Sharpe).
+            "sharpe_ratio_per_bar": float(sharpe_per_bar),
+            "sortino_ratio_per_bar": float(sortino_per_bar),
+            # Diagnostic: pre-2026-05-07 fired-bar-only convention.
+            "sharpe_ratio_trades_only": float(sharpe_trades_only),
+            "sortino_ratio_trades_only": float(sortino_trades_only),
             "max_drawdown_pct": float(max_dd * 100),
             "win_rate_pct": float(win_rate * 100),
             "profit_factor": float(profit_factor),
@@ -2573,6 +2679,7 @@ class VolArbBacktester:
             metrics = self.compute_metrics(
                 result["equity"].values, result["r_t"].values,
                 result["net_pnl"].values, self.cfg.initial_equity,
+                bar_minutes=self.cfg.holding_minutes,
             )
             active = result[result["signal"] != 0]
             rows.append({
@@ -2612,6 +2719,7 @@ class VolArbBacktester:
         metrics = self.compute_metrics(
             df["equity"].values, df["r_t"].values,
             df["net_pnl"].values, self.cfg.initial_equity,
+            bar_minutes=self.cfg.holding_minutes,
         )
 
         # 7b. Metrics — non-compound (fixed-notional view)
@@ -2619,6 +2727,7 @@ class VolArbBacktester:
             metrics["non_compounding"] = self.compute_metrics(
                 df["equity_nc"].values, df["r_t_nc"].values,
                 df["net_pnl_nc"].values, self.cfg.initial_equity,
+                bar_minutes=self.cfg.holding_minutes,
             )
 
         return metrics, df
@@ -2652,8 +2761,13 @@ def print_tearsheet(metrics: dict, config: BacktestConfig) -> None:
     print(f"  Total PnL:          ${metrics['total_pnl']:>12,.2f}")
     print(f"  Total Return:       {metrics['total_return_pct']:>12.2f}%")
     print("-" * 55)
-    print(f"  Sharpe Ratio:       {metrics['sharpe_ratio']:>12.2f}")
-    print(f"  Sortino Ratio:      {metrics['sortino_ratio']:>12.2f}")
+    print(f"  Sharpe (daily):     {metrics['sharpe_ratio']:>12.2f}   "
+          "[daily-resampled, sqrt(365.25) — proper quant]")
+    print(f"  Sortino (daily):    {metrics['sortino_ratio']:>12.2f}")
+    print(f"  Sharpe (per-bar):   {metrics.get('sharpe_ratio_per_bar', 0):>12.2f}   "
+          "[full r_t, sqrt(bars/yr) — diagnostic]")
+    print(f"  Sharpe (trades):    {metrics.get('sharpe_ratio_trades_only', 0):>12.2f}   "
+          "[fired-bars only — legacy diagnostic]")
     print(f"  Max Drawdown:       {metrics['max_drawdown_pct']:>12.2f}%")
     print("-" * 55)
     print(f"  Win Rate:           {metrics['win_rate_pct']:>12.1f}%")
@@ -2674,8 +2788,12 @@ def print_tearsheet(metrics: dict, config: BacktestConfig) -> None:
         print(f"  Total PnL:          ${nc['total_pnl']:>12,.2f}")
         print(f"  Total Return:       {nc['total_return_pct']:>12.2f}%")
         print("-" * 55)
-        print(f"  Sharpe Ratio:       {nc['sharpe_ratio']:>12.2f}")
-        print(f"  Sortino Ratio:      {nc['sortino_ratio']:>12.2f}")
+        print(f"  Sharpe (proper):    {nc['sharpe_ratio']:>12.2f}   "
+              "[full r_t, sqrt(bars/yr) annualised]")
+        print(f"  Sortino (proper):   {nc['sortino_ratio']:>12.2f}")
+        print(f"  Sharpe (trades):    {nc.get('sharpe_ratio_trades_only', 0):>12.2f}   "
+              "[fired-bars only — legacy diagnostic]")
+        print(f"  Sortino (trades):   {nc.get('sortino_ratio_trades_only', 0):>12.2f}")
         print(f"  Max Drawdown:       {nc['max_drawdown_pct']:>12.2f}%")
         print("-" * 55)
         print(f"  Win Rate:           {nc['win_rate_pct']:>12.1f}%")

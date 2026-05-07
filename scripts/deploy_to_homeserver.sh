@@ -78,6 +78,7 @@ SOURCE_FILES=(
     "deribit_paper/execution/order_manager.py"
     "deribit_paper/execution/perp_hedger.py"
     "deribit_paper/execution/profit_scale.py"          # E.1.1 NEW
+    "deribit_paper/execution/pnl_decomp.py"            # parity-2 E4 (2026-05-07)
     "deribit_paper/execution/slippage_calc.py"         # C4
     "deribit_paper/execution/straddle_flow.py"
 
@@ -126,6 +127,10 @@ SOURCE_FILES=(
     "deribit_paper/monitoring/logger.py"
     "deribit_paper/monitoring/metrics_sink.py"
     "deribit_paper/monitoring/telegram.py"
+
+    # Utils (parity-2 round 3)
+    "deribit_paper/utils/__init__.py"
+    "deribit_paper/utils/sidecar_staleness.py"         # parity-2 S4 (2026-05-07)
 
     # Live engine — engine-internal scripts
     "deribit_paper/scripts/__init__.py"

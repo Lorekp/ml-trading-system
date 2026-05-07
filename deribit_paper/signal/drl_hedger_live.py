@@ -176,10 +176,19 @@ class LiveDRLHedger:
         bundle: ModelBundle,
         n_steps_per_episode: int = 10,
         bar_minutes: int = 15,
+        dust_threshold_btc: float = 0.01,
     ):
         self._bundle = bundle
         self._n_steps = n_steps_per_episode
         self._bar_minutes = bar_minutes
+        # D4 (parity-cycle round 2 — 2026-05-07): the dust threshold the
+        # downstream PerpHedger uses to skip sub-dust orders. ``step()``
+        # mirrors the skip on the inventory-update path so internal
+        # state doesn't drift from actual perp position when the policy
+        # emits a sub-dust action. Pre-D4 the inventory update fired
+        # unconditionally; over many sub-dust ticks the drift compounds
+        # and the obs vector goes out of training distribution.
+        self._dust_threshold_btc = float(dust_threshold_btc)
         self._trades: dict[str, _LiveTradeState] = {}
 
     def active_trade_count(self) -> int:
@@ -363,6 +372,15 @@ class LiveDRLHedger:
         delta_required = target_H_full - t.hedge_inventory_btc
         sign = 1.0 if delta_required >= 0 else -1.0
         trade_size = a * abs(delta_required) * sign
+
+        # D4 (parity-cycle round 2 — 2026-05-07): skip the inventory
+        # update on sub-dust trades. The downstream ``PerpHedger`` will
+        # also skip the order, so updating internal inventory here would
+        # silently drift the policy's hedge_inventory_btc away from the
+        # actual perp position by exactly the sub-dust amount per tick.
+        # Over a 10-tick window (or many trades), the drift compounds.
+        if abs(trade_size) < self._dust_threshold_btc:
+            trade_size = 0.0
 
         # Update state
         t.hedge_inventory_btc += trade_size

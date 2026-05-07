@@ -236,6 +236,15 @@ class LiveSVICalibrator:
         slices (see ``ArbitrageFreeSVI.total_variance`` for the math).
         If the calibrator has no cached params yet (warmup), returns
         ``float('nan')``.
+
+        F7 (parity-cycle round 2 — 2026-05-07): when the latest bucket
+        has fewer than 2 expiries, the ``ArbitrageFreeSVI`` surface
+        degenerates — ``atm_vol_pct(T)`` returns the single slice's
+        ATM regardless of the requested ``T``. That's a silent
+        approximation error on the warmup path (and on intra-day
+        windows when only 1 expiry has enough strikes to calibrate).
+        Return ``NaN`` instead so the F9 baseline-fallback path takes
+        over rather than emitting a misleading value.
         """
         if self._params_df is None or self._params_df.empty:
             return float("nan")
@@ -245,6 +254,13 @@ class LiveSVICalibrator:
         bucket = self._params_df[self._params_df["timestamp"] == latest_ts]
         if bucket.empty:
             return float("nan")
+        # F7: refuse to interpolate when only one expiry is present.
+        # A single slice cannot bracket the requested DTE, so the
+        # surface evaluation collapses to that one expiry's ATM.
+        if "expiry_dt" in bucket.columns:
+            n_expiries = bucket["expiry_dt"].nunique()
+            if n_expiries < 2:
+                return float("nan")
         try:
             surface = surface_from_params_group(bucket)
             T = float(dte_days) / 365.25
@@ -376,22 +392,46 @@ class LiveSVICalibrator:
         return evaluate_surface_batch(self._params_df, query_df)
 
     def _persist_cache(self) -> None:
-        """Write the current params_df + meta to disk."""
+        """Write the current params_df + meta to disk atomically.
+
+        S7 (parity-cycle round 2 — 2026-05-07): pre-S7 the params and
+        meta parquets were written sequentially. A crash between the
+        two writes left stale-meta-with-fresh-params (or vice versa),
+        which the freshness guards then mis-diagnosed because the
+        timestamps in meta no longer matched the params snapshot.
+
+        Atomic write pattern: write to ``*.tmp`` files, then
+        ``os.replace`` for both. ``os.replace`` is atomic on POSIX
+        and Windows.
+        """
         if self._params_df is None or self._meta is None:
             return
+        import os as _os
+        params_tmp = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
+        meta_path = self.cache_path.with_suffix(".meta.parquet")
+        meta_tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._params_df.to_parquet(self.cache_path)
-            meta_path = self.cache_path.with_suffix(".meta.parquet")
+            self._params_df.to_parquet(params_tmp)
             pd.DataFrame([{
                 "last_recalibrated_at": self._meta.last_recalibrated_at,
                 "n_buckets": self._meta.n_buckets,
                 "n_params_rows": self._meta.n_params_rows,
                 "window_start": self._meta.window_start,
                 "window_end": self._meta.window_end,
-            }]).to_parquet(meta_path)
+            }]).to_parquet(meta_tmp)
+            # Both temp files exist now → replace atomically.
+            _os.replace(params_tmp, self.cache_path)
+            _os.replace(meta_tmp, meta_path)
         except Exception as exc:  # noqa: BLE001 - log + continue, cache is best-effort
             logger.warning("Failed to persist SVI cache: %s", exc)
+            # Clean up any leftover temp files so we don't accumulate cruft.
+            for _tmp in (params_tmp, meta_tmp):
+                try:
+                    if _tmp.exists():
+                        _tmp.unlink()
+                except OSError:
+                    pass
 
 
 def _empty_meta(at: pd.Timestamp) -> SVICacheMeta:

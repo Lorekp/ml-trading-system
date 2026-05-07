@@ -110,7 +110,17 @@ def _assert_sidecar_fresh(
     if not p.exists():
         # Existence is enforced elsewhere; just skip silently.
         return
-    age_seconds = time.time() - os.path.getmtime(p)
+    # S4 (parity-cycle round 2 — 2026-05-07): prefer parquet data-age
+    # over file mtime. A ``cp`` deploy of older data refreshes mtime,
+    # which masked the staleness pre-S4. ``data_age_seconds`` reads
+    # parquet row-group statistics for a recognised time column and
+    # falls back to mtime when no time column is present (CSV / pickle
+    # sidecars, or parquets without a timestamp column).
+    if p.suffix == ".parquet":
+        from deribit_paper.utils.sidecar_staleness import data_age_seconds
+        age_seconds = data_age_seconds(p)
+    else:
+        age_seconds = time.time() - os.path.getmtime(p)
     age_days = age_seconds / 86400.0
     if age_days <= max_age_days:
         logger.info(
@@ -620,6 +630,12 @@ class TradingEngine:
             bundle=self.model_bundle,
             n_steps_per_episode=cfg.intra_bar_hedge_ticks,
             bar_minutes=cfg.bar_minutes,
+            # D4 (parity-cycle round 2 — 2026-05-07): align internal
+            # inventory updates with the dust filter the PerpHedger
+            # applies downstream so policy hedge_inventory_btc doesn't
+            # drift on sub-dust ticks. Same threshold both layers use
+            # (PerpHedger.dust_threshold_btc=cfg.delta_hedge_band per E2).
+            dust_threshold_btc=cfg.delta_hedge_band,
         )
 
         # ── E.2.2: DRL policy bar-minutes manifest check ──

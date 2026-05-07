@@ -111,3 +111,68 @@ def test_string_path_works(tmp_path):
     _assert_sidecar_fresh(
         str(f), name="test", max_age_days=30, allow_stale=False,
     )
+
+
+# ── S4 (parity-cycle round 2 — 2026-05-07): parquet data-age vs mtime ──
+
+
+import pandas as pd
+
+from deribit_paper.utils.sidecar_staleness import data_age_seconds
+
+
+def test_data_age_with_timestamp_column(tmp_path):
+    """Parquet with a ``timestamp`` column → data-age from the youngest row."""
+    p = tmp_path / "with_ts.parquet"
+    now = pd.Timestamp.now(tz="UTC")
+    df = pd.DataFrame({
+        "timestamp": [
+            now - pd.Timedelta(hours=2),
+            now - pd.Timedelta(hours=1),
+        ],
+        "value": [1.0, 2.0],
+    })
+    df.to_parquet(p)
+    age = data_age_seconds(p)
+    # Within 60s tolerance of "1 hour"
+    assert 3540 <= age <= 3660
+
+
+def test_data_age_falls_back_to_mtime_when_no_time_column(tmp_path):
+    """Parquet without a recognised time column → mtime-based age."""
+    p = tmp_path / "no_ts.parquet"
+    df = pd.DataFrame({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})
+    df.to_parquet(p)
+    target_mtime = time.time() - 3600
+    os.utime(p, (target_mtime, target_mtime))
+    age = data_age_seconds(p)
+    assert 3500 <= age <= 3700
+
+
+def test_data_age_missing_file_returns_inf(tmp_path):
+    p = tmp_path / "does_not_exist.parquet"
+    assert data_age_seconds(p) == float("inf")
+
+
+def test_data_age_no_fallback_raises_when_disabled(tmp_path):
+    """fallback_to_mtime=False → raise when no recognised time column."""
+    p = tmp_path / "no_ts_strict.parquet"
+    df = pd.DataFrame({"a": [1, 2, 3]})
+    df.to_parquet(p)
+    with pytest.raises(RuntimeError, match="no recognised time column"):
+        data_age_seconds(p, fallback_to_mtime=False)
+
+
+def test_data_age_masks_cp_deploy_attack(tmp_path):
+    """The whole point of S4: a `cp` of an old parquet refreshes mtime,
+    but data_age_seconds reads the actual data-age from the column stats."""
+    p = tmp_path / "cp_attack.parquet"
+    old = pd.Timestamp("2024-01-01", tz="UTC")
+    df = pd.DataFrame({"timestamp": [old], "v": [1.0]})
+    df.to_parquet(p)
+    # Simulate `cp` deploy: mtime refreshed to "now"
+    now = time.time()
+    os.utime(p, (now, now))
+    age = data_age_seconds(p)
+    # Data is from 2024-01-01; we're somewhere in 2026 → at least a year
+    assert age > 365 * 86400

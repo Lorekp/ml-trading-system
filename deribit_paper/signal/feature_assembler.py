@@ -406,18 +406,27 @@ class FeatureAssembler:
         else:
             full_df = base_df
 
-        # Keep the last N bars for the rolling buffer (memory-bounded)
-        self._historical_buffer = full_df.tail(rolling_history_bars).copy()
+        # F10 (parity-cycle round 2 — 2026-05-07): pre-F10 the assembler
+        # kept ``self._historical_buffer = full_df.tail(672)`` as a
+        # persistent field, but no handler ever read it after init —
+        # only the LAST row was used to seed ``_baseline_row``. The
+        # 672-bar buffer was dead memory that misleadingly suggested
+        # live rolling-lookback computation existed when in fact every
+        # ``*_lag`` / ``*_ema`` family member is baseline-frozen (see
+        # F3 in the audit). Re-introduce a buffer with a real read path
+        # only when F3 is picked up. For now, derive the baseline row
+        # inline and let ``full_df`` go out of scope.
+        baseline_window = full_df.tail(rolling_history_bars)
         logger.info(
-            "  Loaded %d merged rows, kept %d for the rolling buffer",
-            len(full_df), len(self._historical_buffer),
+            "  Loaded %d merged rows; baseline derived from last %d",
+            len(full_df), len(baseline_window),
         )
 
         # Baseline = most recent NON-NaN-rich row we have.  Use the
-        # final row of the buffer as a pragmatic default — downstream
-        # fail-fast will catch any feature that ends up NaN here.
-        self._baseline_row = self._historical_buffer.iloc[-1].copy()
-        self._baseline_ts = self._historical_buffer.index[-1]
+        # final row of the recent slice as a pragmatic default —
+        # downstream fail-fast will catch any feature that ends up NaN.
+        self._baseline_row = baseline_window.iloc[-1].copy()
+        self._baseline_ts = baseline_window.index[-1]
         logger.info(
             "  Baseline row timestamp: %s (%d columns)",
             self._baseline_ts, len(self._baseline_row),

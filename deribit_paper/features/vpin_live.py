@@ -49,6 +49,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WS_URL = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
 
 
+def _isclose_float(a: float, b: float, *, rel: float = 1e-9, abs_: float = 1e-9) -> bool:
+    """Tight float-equality probe for VPIN bucket-size comparison.
+
+    The saved JSON ``bucket_volume_btc`` is written as a float literal
+    by ``scripts/recompute_vpin.py``; users will commonly construct
+    the live accumulator with the same nominal value. Allow a tiny
+    tolerance for representation drift.
+    """
+    return abs(a - b) <= max(rel * max(abs(a), abs(b)), abs_)
+
+
 def _default_binance_ws_url(currency: str = "BTC") -> str:
     """Build Binance Futures aggTrade WebSocket URL for any asset."""
     return f"wss://fstream.binance.com/ws/{currency.lower()}usdt@aggTrade"
@@ -85,7 +96,32 @@ class _LiveBucketAccumulator:
         self._buckets_closed = 0
 
     def load_state(self, state: dict) -> None:
-        """Restore carry-forward state from a deserialized JSON dict."""
+        """Restore carry-forward state from a deserialized JSON dict.
+
+        D3 (parity-cycle round 2 — 2026-05-07): if the saved state was
+        produced with different ``bucket_volume_btc`` or ``rolling_window``
+        args than this accumulator was constructed with, the loaded
+        imbalances are silently mis-indexed (a 50-element deque seeded
+        from a 100-element rolling window leaves out half the history;
+        a different bucket size means the imbalances themselves are on
+        an incompatible scale). Pre-D3 ``load_state`` swallowed the
+        mismatch; now we fail-fast so the operator regenerates the
+        sidecar with the right args.
+        """
+        saved_V = state.get("bucket_volume_btc")
+        saved_N = state.get("rolling_window")
+        if saved_V is not None and not _isclose_float(float(saved_V), self.V):
+            raise ValueError(
+                f"VPIN warm-start state bucket_volume_btc mismatch: "
+                f"saved={saved_V}, accumulator={self.V}. Regenerate via "
+                f"scripts/recompute_vpin.py with matching args."
+            )
+        if saved_N is not None and int(saved_N) != self.N:
+            raise ValueError(
+                f"VPIN warm-start state rolling_window mismatch: "
+                f"saved={saved_N}, accumulator={self.N}. Regenerate via "
+                f"scripts/recompute_vpin.py with matching args."
+            )
         self._partial_vol = float(state["partial_vol"])
         self._partial_buy = float(state["partial_buy"])
         self._partial_sell = float(state["partial_sell"])

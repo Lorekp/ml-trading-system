@@ -69,6 +69,24 @@ class BarTSRV:
     vol_ann: float              # annualised √tsrv
     vol_ann_continuous: float   # annualised √continuous_var (used by backtester)
 
+    @property
+    def rv_ann(self) -> float:
+        """Annualised realised VARIANCE = ``vol_ann ** 2``.
+
+        Round-4 follow-up (2026-05-08): the offline HAR-PD pipeline
+        (vol_model/features/har_pd.py) reads a column called ``rv_ann``
+        from the TSRV parquet. The live HAR-PD live-state buffer
+        (``feature_assembler.py:_har_pd_state.append``) needs the same
+        scalar — but the BarTSRV dataclass only carried ``vol_ann``
+        (the square root). Pre-round-4 the live append ran inside a
+        try/except that swallowed the AttributeError every bar with
+        a warning ("HAR-PD append failed"); the buffer never advanced
+        from its prewarm seed in production. Adding ``rv_ann`` as a
+        derived property fixes the live HAR-PD circular buffer
+        without changing the dataclass storage layout.
+        """
+        return float(self.vol_ann) ** 2
+
     def to_dict(self) -> dict:
         return asdict(self)
 

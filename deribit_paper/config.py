@@ -197,6 +197,18 @@ class PaperConfig:
     binance_rest_url: str = "https://fapi.binance.com"
     vpin_poll_seconds: float = 3.0        # REST poll cadence
 
+    # ── Live dollar bars (F3 Tier 2, parity-cycle round 3 — 2026-05-07) ─
+    # The 24 dollar-bar-derived features need a live grid that mirrors
+    # the offline pipeline (Binance Vision spot aggTrades, $500K BTC
+    # threshold). These knobs feed ``DollarBarSpotStream`` +
+    # ``DollarBarAggregator`` + ``DollarBarBuffer``. Tier 6 will cut the
+    # legacy ``vpin_*`` futures knobs over to consume from the same
+    # spot grid; until then the two streams run in parallel.
+    dollar_bar_threshold_btc: float = 500_000.0
+    dollar_bar_history_bars: int = 300
+    spot_poll_seconds: float = 3.0
+    binance_spot_url: str = "https://api.binance.com"
+
     # ── Model inference ────────────────────────────────────────────
     # lgbm_models_dir holds the LightGBM ``.txt`` + ``_features.json``
     # manifests for the walk-forward variant in use.  W3.1 (2026-04-11)

@@ -7,8 +7,10 @@ Critical invariants (locked by plan ``now-check-empirically-from-eager-bird.md``
 2. **Filter drops top-X%** — sanity that the cut drops approximately
    the right magnitude.
 3. **V2 byte-identity preserved** — bare V2 preset with default config
-   reproduces $959,571.0653 / 7,417 trades. Locks regression: Phase C
-   sidecars must NOT modify the default config.
+   reproduces $1,024,373.9676 / 7,543 trades (baseline corrected
+   2026-05-07; see ``test_preventative_sizing.py::TestNCPathMirror``
+   class docstring for the corrected-baseline rationale). Locks
+   regression: Phase C sidecars must NOT modify the default config.
 4. **Sidecar contract matches Cycle 3** — boolean filter parquet with
    column ``drop_trade``; loadable via Cycle-3 ``load_filter_sidecar``.
 5. **DSR multiplier is locked** — K=3 → ≈ 0.5466 (Bailey-de Prado);

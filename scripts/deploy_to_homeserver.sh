@@ -92,6 +92,7 @@ SOURCE_FILES=(
     "deribit_paper/features/tsrv_live.py"
     "deribit_paper/features/straddle.py"
     "deribit_paper/features/vpin_live.py"
+    "deribit_paper/features/har_pd_live.py"             # parity-cycle C (2026-05-07)
 
     # Live engine — Deribit client (REST + WS + auth)
     "deribit_paper/client/__init__.py"
@@ -99,6 +100,7 @@ SOURCE_FILES=(
     "deribit_paper/client/errors.py"
     "deribit_paper/client/rest.py"
     "deribit_paper/client/ws.py"
+    "deribit_paper/client/binance_rest.py"              # parity-cycle E (2026-05-07)
 
     # Live engine — market data (bar clock, aggregator, buffers, subscriber)
     "deribit_paper/market_data/__init__.py"
@@ -129,6 +131,7 @@ SOURCE_FILES=(
     "deribit_paper/scripts/__init__.py"
     "deribit_paper/scripts/validate_dry_run.py"
     "deribit_paper/scripts/run_engine.sh"               # H2: auto-restart wrapper
+    "deribit_paper/scripts/probe_vpin_rest.py"          # parity-cycle E (2026-05-07)
 
     # Scripts (sidecar refresh + harness + beta extract)
     "scripts/extract_aligner_betas.py"                 # C2
@@ -143,6 +146,14 @@ MODEL_FILES=(
     "vol_arb/drl_hedging/models/production_sac_v4_final.zip"
     "vol_arb/drl_hedging/models/production_sac_v4_final_vecnormalize.pkl"
     "vol_arb/drl_hedging/models/production_sac_v4_final.manifest.json"   # E.2.2 NEW
+    # parity-cycle C (2026-05-07): HAR-PD LightGBM models (50 features).
+    # Engine flips to ``expanding_pruned_svi_har_pd_v1`` as the production
+    # variant — the model the V2 backtest's aligner β* was calibrated for.
+    # The TransVol .pt checkpoints are reused from ``expanding_hybrid/``.
+    "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-04.txt"
+    "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-04_features.json"
+    "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-03.txt"
+    "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-03_features.json"
 )
 
 # Heavy data + sidecars (large; toggleable via --skip-data when only
@@ -155,6 +166,10 @@ DATA_FILES=(
     "vol_arb/output/svi_surface_params_1h.parquet"     # ~22MB
     "vol_model/output/aligner_betas_by_month.json"      # dup is fine; idempotent
     "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"   # ~5.6MB
+    # parity-cycle C (2026-05-07): TSRV parquet seeds the HAR-PD live
+    # circular buffer at engine startup so the first live bar emits
+    # non-NaN HAR-PD features (otherwise warmup waits 96 bars / 24h).
+    "TSRV/output/BTCUSDT_tsrv_15m.parquet"
 )
 
 # ── 3. Sync ────────────────────────────────────────────────────────

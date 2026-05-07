@@ -1,0 +1,37 @@
+======================================================================
+  WALK-FORWARD PRUNED + svi_atm_1d (T2.1) @ 15m — BTCUSDT
+======================================================================
+  Drop features: ['ffd_rv', 'ffd_rv_lag3', 'ffd_rv_ema10', 'ffd_rv_ema50', 'noise_level', 'noise_level_lag1', 'noise_level_ema10', 'noise_level_ema50']
+  Add SVI: ['svi_atm_1d']
+  Reuse TransVol from: vol_model\output\models\expanding_hybrid
+  Save models to: vol_model\output\models\expanding_pruned_svi_v1
+  Optuna: 200 trials, patience 50
+======================================================================
+16:01:45 INFO: Loading base features + labels...
+16:01:45 INFO:   Loaded engineered features: 185945 rows, 126 cols
+16:01:46 INFO:   Filled 82629 rows of OI features with 0 (no data before May 2023)
+16:01:46 INFO:   Filled 185940 rows of OFI/depth features with 0 (partial L2 coverage)
+16:01:46 INFO:   Dataset: 185566 rows, 126 features (dropped 374 NaN warmup rows)
+16:01:46 INFO: Loaded 8 drop features for BTCUSDT from vol_model\output\BTCUSDT_drop_features.csv
+16:01:46 INFO: Pruned base (BTCUSDT): 35 -> 27 features (dropped 8: ['noise_level_lag1', 'noise_level_ema50', 'noise_level', 'ffd_rv', 'ffd_rv_ema50', 'ffd_rv_ema10', 'noise_level_ema10', 'ffd_rv_lag3'])
+16:01:46 INFO: Loaded SVI features (+15m aligned): 178007 rows, cols=['svi_atm_1d'], 100.0% coverage
+16:01:46 INFO: ============================================================
+16:01:46 INFO: [1/1] 2026-04: train=[2021-01, 2025-12), val=[2025-12, 2026-04), test=2026-04
+16:01:51 INFO:   Data: train=162652, val=11607, test=2876, features=44
+C:\Users\laure\AppData\Roaming\Python\Python314\site-packages\lightgbm\basic.py:2535: UserWarning: Overriding the parameters from Reference Dataset.
+  _log_warning("Overriding the parameters from Reference Dataset.")
+C:\Users\laure\AppData\Roaming\Python\Python314\site-packages\lightgbm\basic.py:2535: UserWarning: Overriding the parameters from Reference Dataset.
+  _log_warning("Overriding the parameters from Reference Dataset.")
+16:13:00 INFO:   [1/1] 2026-04: qlike=0.5283  base=0.7638  delta=-30.8%  rank_ic=0.624  trials=60  (674s)
+
+======================================================================
+  PRUNED+SVI WALK-FORWARD — 1 months retrained
+  Total elapsed: 0.19h
+======================================================================
+     Month    Baseline  Pruned+SVI     Delta    RankIC   Feats   Trials
+----------------------------------------------------------------------
+   2026-04      0.7638      0.5283    -30.8%     0.624      44       60
+----------------------------------------------------------------------
+       AVG      0.7638      0.5283    -30.8%
+======================================================================
+16:13:00 INFO: Summary saved to vol_model\output\models\expanding_pruned_svi_v1\summary.json

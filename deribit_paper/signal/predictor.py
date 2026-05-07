@@ -56,6 +56,11 @@ class Signal:
     term_slope_1w_2w: float | None = None
     # Execution context (populated only when direction != 0 — else None)
     straddle: StraddleSelection | None = None
+    # D1 (parity-cycle round 2 — 2026-05-07): SVI slice params for the
+    # picked straddle's expiry, used by ``LiveDRLHedger`` to update IV
+    # at the trade's strike on every intra-bar hedge tick. ``None`` when
+    # the calibrator is uncalibrated (warmup) or no slice matches.
+    svi_slice: dict[str, float] | None = None
     reason: str = ""                   # human-readable explanation
 
     @property
@@ -285,6 +290,21 @@ class Predictor:
                 bar.timestamp, reason,
             )
 
+        # D1 (parity-cycle round 2 — 2026-05-07): pull the SVI slice
+        # params for the picked straddle's expiry so the DRL hedger can
+        # update IV per-tick. ``None`` is the safe degraded mode — the
+        # hedger falls back to the entry-time IV (``iv_entry``) for the
+        # whole 10-tick episode, matching pre-fix behaviour.
+        svi_slice_params: dict[str, float] | None = None
+        if (
+            direction != 0
+            and straddle is not None
+            and self._svi.has_params
+        ):
+            svi_slice_params = self._svi.slice_params_for_expiry(
+                straddle.expiry_dt,
+            )
+
         return Signal(
             timestamp=bar.timestamp,
             direction=direction,
@@ -294,6 +314,7 @@ class Predictor:
             bar_tsrv=bar_tsrv,
             term_slope_1w_2w=term_slope,
             straddle=straddle if direction != 0 else None,
+            svi_slice=svi_slice_params,
             reason=reason,
         )
 

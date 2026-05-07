@@ -465,6 +465,12 @@ class StraddleFlow:
             (straddle.expiry_dt - started_at).total_seconds() / (365.25 * 24 * 3600),
             1e-6,
         )
+        # D1 (parity-cycle round 2 — 2026-05-07): plumb the SVI slice
+        # params populated by the predictor through to the DRL hedger so
+        # IV updates per-tick instead of staying frozen at ``iv_entry``
+        # for all 10 ticks. ``None`` is the safe degraded mode — the
+        # hedger falls back to ``iv_entry`` (matches pre-fix behaviour
+        # under uncalibrated SVI / missing-expiry).
         trade_id = self._drl.begin_trade(
             signal=signal.direction,
             S_entry=spot,
@@ -475,6 +481,7 @@ class StraddleFlow:
             V_bg=float(trailing_1h_volume_btc) if trailing_1h_volume_btc else 100.0,
             jump_fraction=float(signal.bar_tsrv.jump_fraction) if signal.bar_tsrv else 0.0,
             vpin=self._vpin_provider() if self._vpin_provider else 0.5,
+            svi_slice_params=signal.svi_slice,
         )
 
         # ── 2b. Notify position opened (persist to DB + tracker) ──

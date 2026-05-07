@@ -719,6 +719,7 @@ class DRLHedger:
         signal: np.ndarray,
         *,
         n_steps: int = 10,
+        bar_minutes: float = 15.0,
         delta_hedge_band: float = 0.05,  # unused — kept for signature compat
         perp_fee: float = 0.0004,
         perp_slippage_bps: float = 2.0,  # unused — impact comes from sigmoid SRL
@@ -767,8 +768,12 @@ class DRLHedger:
         vol_bg = np.nan_to_num(vol_bg, nan=100.0)
         vol_bg = np.maximum(vol_bg, 1e-3)  # floor
 
-        # Time per step in years
-        dt_step = (15.0 / n_steps) / (365.25 * 24 * 60)
+        # Time per step in years.
+        # D5 (parity-cycle round 2 — 2026-05-07): pre-D5 the bar-minutes
+        # constant was hardcoded at 15.0 regardless of ``cfg.holding_minutes``.
+        # At the V2 default (15) this is byte-identical; for non-15-min
+        # cadences the path's per-step σ scaling and tau decay diverged.
+        dt_step = (float(bar_minutes) / n_steps) / (365.25 * 24 * 60)
         sqrt_dt = np.sqrt(dt_step)
         step_sigma = vol_ann * sqrt_dt  # (n,)
 

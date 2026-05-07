@@ -421,7 +421,14 @@ class TestNCPathMirror:
     # roll back every adopted sidecar to recover the legacy number,
     # we update the baseline to the actual current pipeline output
     # so the test does what its name says: detect drift.
-    V2_NC_PNL_BASELINE = 1_024_373.9676
+    # Updated 2026-05-07 (parity-cycle round 2) after D2 fix in commit
+    # 1790d05: V2 backtester now reads the true bucketed VPIN parquet
+    # (the same one SAC v4 was trained on) instead of the returns-proxy
+    # `compute_vpin_proxy_from_returns` (mean 0.5 vs train mean 0.19).
+    # The DRL hedger sees a different VPIN distribution → +$75.21 NC PnL
+    # drift, which matches the corrupted-obs-fix mechanism documented in
+    # ``vol_arb/output/PARITY_AUDIT_ROUND2.md``.
+    V2_NC_PNL_BASELINE = 1_024_449.1810
     V2_NC_TRADES_BASELINE = 7_543
 
     def test_preventative_sizing_actually_binds_on_NC(self):

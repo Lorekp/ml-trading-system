@@ -164,6 +164,63 @@ class LiveSVICalibrator:
         elapsed = now - self._meta.last_recalibrated_at
         return elapsed.total_seconds() / 3600.0
 
+    def slice_params_for_expiry(
+        self,
+        expiry_dt: pd.Timestamp,
+    ) -> dict[str, float] | None:
+        """Return the SVI slice params for a specific expiry, or ``None``.
+
+        Looks up the most-recent-bucket slice for the given expiry and
+        returns a dict ``{a, b, rho, m, sigma, T, F}`` matching the
+        signature consumed by
+        :class:`deribit_paper.signal.drl_hedger_live._TradeSliceSVI`. The
+        DRL hedger uses these to evaluate IV at the trade's strike on
+        every intra-bar tick (see ``LiveDRLHedger.step`` lines 299-303).
+
+        Pre-D1 (parity-cycle round 2 — 2026-05-07): the live engine
+        constructed ``LiveDRLHedger`` with the slice-evaluation
+        machinery wired up but never passed the slice in at
+        ``begin_trade``, so IV stayed constant for all 10 hedge ticks.
+        V2 ``DRLHedger.simulate`` updates IV per-tick from the trade's
+        SVI slice; this method closes that asymmetry.
+
+        Returns ``None`` when:
+        - the calibrator is uncalibrated (warmup), OR
+        - the latest bucket has no slice for the requested expiry.
+
+        Expiry matching is done on ``YYYY-MM-DD`` (Deribit's expiry
+        granularity) — same convention as ``evaluate_surface_batch``.
+        """
+        if self._params_df is None or self._params_df.empty:
+            return None
+        if "expiry_dt" not in self._params_df.columns:
+            # Older cached parquets pre-date the per-expiry split; can't match.
+            return None
+        latest_ts = self._params_df["timestamp"].max()
+        bucket = self._params_df[self._params_df["timestamp"] == latest_ts]
+        if bucket.empty:
+            return None
+        target_key = pd.to_datetime(expiry_dt, utc=True).strftime("%Y-%m-%d")
+        bucket_keys = pd.to_datetime(bucket["expiry_dt"], utc=True).dt.strftime(
+            "%Y-%m-%d",
+        )
+        matches = bucket[bucket_keys.values == target_key]
+        if matches.empty:
+            return None
+        row = matches.iloc[0]
+        try:
+            return {
+                "a": float(row["a"]),
+                "b": float(row["b"]),
+                "rho": float(row["rho"]),
+                "m": float(row["m"]),
+                "sigma": float(row["sigma"]),
+                "T": float(row["T"]),
+                "F": float(row["F"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def atm_vol_at_dte(self, dte_days: float) -> float:
         """Return the constant-maturity ATM implied vol at ``dte_days`` DTE.
 

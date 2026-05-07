@@ -709,6 +709,7 @@ def simulate_discrete_hedging(
     *,
     delta_entry: np.ndarray | None = None,
     gamma_entry: np.ndarray | None = None,
+    bar_minutes: float = 15.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Simulate path-dependent discrete delta hedging for all windows.
 
@@ -767,8 +768,12 @@ def simulate_discrete_hedging(
     n = len(S_entry)
     rng = np.random.RandomState(seed)
 
-    # Time per step (15 min / n_steps, in years)
-    dt_step = (15.0 / n_steps) / (365.25 * 24 * 60)
+    # Time per step (bar_minutes / n_steps, in years).
+    # D5 (parity-cycle round 2 — 2026-05-07): pre-D5 the bar-minutes
+    # constant was hardcoded at 15.0 regardless of ``cfg.holding_minutes``.
+    # At the V2 default (15) this is byte-identical; for non-15-min
+    # cadences the path's per-step σ scaling diverged.
+    dt_step = (float(bar_minutes) / n_steps) / (365.25 * 24 * 60)
     sqrt_dt = np.sqrt(dt_step)
 
     # Per-step volatility from realized vol
@@ -1633,6 +1638,7 @@ class VolArbBacktester:
                     vol_ann=vol_ann,
                     signal=signal,
                     n_steps=cfg.hedge_sim_steps,
+                    bar_minutes=float(cfg.holding_minutes),
                     perp_fee=cfg.perp_taker_fee,
                     perp_slippage_bps=cfg.perp_slippage_bps,
                     seed=cfg.hedge_sim_seed,
@@ -1696,6 +1702,7 @@ class VolArbBacktester:
                 perp_fee=cfg.perp_taker_fee,
                 perp_slippage_bps=cfg.perp_slippage_bps,
                 seed=cfg.hedge_sim_seed,
+                bar_minutes=float(cfg.holding_minutes),
                 **delta_kw,
             )
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -88,6 +89,81 @@ class DollarBarBuffer:
     def append(self, bar: DollarBar) -> None:
         """Append a bar; oldest is evicted if buffer is at ``max_size``."""
         self._bars.append(bar)
+
+    def prewarm_from_parquet(self, path: str | Path) -> int:
+        """Bulk-load dollar bars from a sidecar parquet (F3 Tier 4).
+
+        The parquet must have the schema produced by
+        :meth:`as_dataframe` (also written by
+        ``scripts/generate_dollar_bar_cache.py``):
+
+            columns: [close, open, high, low, duration_s, n_trades,
+                      dollar_volume, buy_volume, sell_volume,
+                      vov, imbalance, log_return, rv_bar]
+            index:   UTC DatetimeIndex
+
+        Bars are appended chronologically; ``max_size`` eviction
+        applies. Returns the number of bars loaded.
+
+        Fail-soft on missing file (returns 0 + WARN log) so the engine
+        can still start without a sidecar — the buffer will fill from
+        live trades over ~37 minutes.
+        """
+        p = Path(path)
+        if not p.exists():
+            logger.warning(
+                "DollarBarBuffer prewarm: sidecar %s does not exist; "
+                "buffer will fill from live trades (~37min for 250 bars)",
+                p,
+            )
+            return 0
+        try:
+            df = pd.read_parquet(p)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "DollarBarBuffer prewarm: failed to read %s (%s); "
+                "starting cold",
+                p, exc,
+            )
+            return 0
+        required = set(_COLUMNS)
+        missing = required - set(df.columns)
+        if missing:
+            logger.warning(
+                "DollarBarBuffer prewarm: %s missing columns %s; starting cold",
+                p, missing,
+            )
+            return 0
+        if df.index.tz is None:
+            df.index = pd.DatetimeIndex(df.index, tz="UTC")
+        n_loaded = 0
+        for ts, row in df.iterrows():
+            bar = DollarBar(
+                timestamp=pd.Timestamp(ts),
+                open=float(row["open"]),
+                close=float(row["close"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                duration_s=float(row["duration_s"]),
+                n_trades=int(row["n_trades"]),
+                dollar_volume=float(row["dollar_volume"]),
+                buy_volume=float(row["buy_volume"]),
+                sell_volume=float(row["sell_volume"]),
+                vov=float(row["vov"]),
+                imbalance=float(row["imbalance"]),
+                log_return=float(row["log_return"]),
+                rv_bar=float(row["rv_bar"]),
+            )
+            self._bars.append(bar)
+            n_loaded += 1
+        logger.info(
+            "DollarBarBuffer prewarm: loaded %d bars from %s "
+            "(window: %s → %s)",
+            n_loaded, p,
+            df.index[0] if n_loaded > 0 else "n/a",
+            df.index[-1] if n_loaded > 0 else "n/a",
+        )
+        return n_loaded
 
     def latest_bar(self) -> DollarBar | None:
         """Return the most recently appended bar, or ``None`` if empty."""

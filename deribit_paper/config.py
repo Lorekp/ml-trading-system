@@ -208,6 +208,12 @@ class PaperConfig:
     dollar_bar_history_bars: int = 300
     spot_poll_seconds: float = 3.0
     binance_spot_url: str = "https://api.binance.com"
+    # F3 Tier 4 (parity-cycle round 3 — 2026-05-07): warm-start sidecar
+    # so the live buffer is pre-filled with the last ~300 dollar bars
+    # at engine startup. Without this, the engine waits ~37 min before
+    # parkinson_1d and EMA50 features can fire. Regenerate via
+    # ``python scripts/generate_dollar_bar_cache.py``.
+    dollar_bar_cache_path: str = "vol_arb/output/BTC_dollar_bar_cache.parquet"
 
     # ── Model inference ────────────────────────────────────────────
     # lgbm_models_dir holds the LightGBM ``.txt`` + ``_features.json``

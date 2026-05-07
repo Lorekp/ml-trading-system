@@ -206,6 +206,7 @@ class TelegramNotifier:
         vpin_connected: bool | None = None,
         bars_processed: int = 0,
         svi_age_hours: float | None = None,
+        svi_recal_count: int | None = None,
         vpin_stale: bool = False,
         consecutive_empty_bars: int = 0,
         kill_switch_halted: bool = False,
@@ -225,7 +226,17 @@ class TelegramNotifier:
         # R4: Enriched diagnostics
         diag: list[str] = []
         if svi_age_hours is not None:
-            diag.append(f"svi_age={svi_age_hours:.1f}h")
+            # 2026-05-07: heartbeat and SVI recal cadences are both 60 min,
+            # so ``svi_age`` phase-locks at a constant value (e.g. 0.8h)
+            # for the engine's lifetime. ``svi_recal_count`` (monotonic
+            # success counter) is the actual health signal — if it stays
+            # the same across consecutive heartbeats, recal is broken.
+            if svi_recal_count is not None:
+                diag.append(
+                    f"svi_age={svi_age_hours:.1f}h(n={svi_recal_count})"
+                )
+            else:
+                diag.append(f"svi_age={svi_age_hours:.1f}h")
         if vpin_stale:
             diag.append("VPIN_STALE")
         if consecutive_empty_bars > 0:

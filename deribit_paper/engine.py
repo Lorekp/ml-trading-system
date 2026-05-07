@@ -257,6 +257,13 @@ class TradingEngine:
 
         # SVI recalibration failure tracking (R2)
         self._svi_recal_failures: int = 0
+        # 2026-05-07: success-counter for heartbeat. The svi_age field
+        # phase-locks at a constant value when heartbeat and recal
+        # cadences are both 60 min, so an operator can't distinguish
+        # "healthy" from "frozen". A monotonic count makes churn
+        # visible: if it stays the same across two consecutive
+        # heartbeats, recal is dead.
+        self._svi_recal_count: int = 0
 
         # Equity reconciliation counter (R3)
         self._bars_since_equity_reconcile: int = 0
@@ -1220,6 +1227,7 @@ class TradingEngine:
                 ),
                 bars_processed=self.stats.bars_processed,
                 svi_age_hours=svi_age_hours,
+                svi_recal_count=self._svi_recal_count,
                 vpin_stale=vpin_stale,
                 consecutive_empty_bars=self._consecutive_empty_bars,
                 kill_switch_halted=self.kill_switch.is_halted() if self.kill_switch else False,
@@ -1954,13 +1962,19 @@ class TradingEngine:
                     pnl_btc = -pnl_btc
                 option_pnl_usd = pnl_btc * index
                 # Deribit option fee: 0.03% of underlying per contract
-                # (same maker & taker for options). Four fills per
-                # round-trip straddle (2 entry + 2 exit), each priced
-                # against the index, scaled by N_contracts.
-                option_fees_usd = (
-                    4.0 * self.config.option_maker_fee * index
-                    * outcome.n_contracts_btc
-                )
+                # (same maker & taker for options), CAPPED at 12.5% of
+                # the option's premium (per Deribit schedule). Cap is
+                # applied PER FILL against the actual fill premium —
+                # using the recorded leg premiums (BTC) is more accurate
+                # than the backtester's Brenner-Subrahmanyam approximation.
+                _flat = self.config.option_maker_fee
+                option_fees_btc = (
+                    min(_flat, 0.125 * outcome.entry_call.average_price)
+                    + min(_flat, 0.125 * outcome.entry_put.average_price)
+                    + min(_flat, 0.125 * outcome.exit_call.average_price)
+                    + min(_flat, 0.125 * outcome.exit_put.average_price)
+                ) * outcome.n_contracts_btc
+                option_fees_usd = option_fees_btc * index
             else:
                 logger.warning(
                     "Skipping option PnL: missing leg fills "
@@ -2109,6 +2123,14 @@ class TradingEngine:
         try:
             await self.svi_calibrator.recalibrate_async(option_trades, now=now)
             self._svi_recal_failures = 0
+            # 2026-05-07: increment success counter so the operator-facing
+            # heartbeat can show recal CHURN. Without this, ``svi_age``
+            # appears stuck at a constant value when the heartbeat and
+            # recal cadences are both 60 min (phase-locked) — an
+            # operator can't distinguish "healthy 1h cadence" from
+            # "calibrator frozen since startup". A monotonic counter
+            # makes the difference unambiguous.
+            self._svi_recal_count += 1
         except Exception as exc:  # noqa: BLE001
             self._svi_recal_failures += 1
             logger.exception(

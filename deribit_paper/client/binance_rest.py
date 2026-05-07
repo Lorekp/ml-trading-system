@@ -127,12 +127,20 @@ class BinanceRESTClient:
         *,
         from_id: int | None = None,
         limit: int = _MAX_LIMIT,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> list[dict]:
         """Fetch a page of aggregated trades.
 
         ``from_id`` lets the caller resume from the last-seen aggTradeId
         (set ``from_id = last_seen + 1``). Without ``from_id`` the
         endpoint returns the most recent ``limit`` trades.
+
+        ``start_time_ms`` / ``end_time_ms`` (Round-4 F6/F8 — 2026-05-08):
+        time-range query for the warm-start sidecar generator. Binance
+        spec: the time range cannot exceed 1 hour. Mutually exclusive
+        with ``from_id``. When set, Binance returns up to ``limit``
+        trades whose ``T`` falls in ``[start_time_ms, end_time_ms]``.
 
         Returns the raw response array (each entry is a dict with
         keys ``a, p, q, f, l, T, m``). Empty list on no new trades.
@@ -146,10 +154,21 @@ class BinanceRESTClient:
             raise ValueError(
                 f"limit must be in (0, {_MAX_LIMIT}], got {limit}",
             )
+        if from_id is not None and (
+            start_time_ms is not None or end_time_ms is not None
+        ):
+            raise ValueError(
+                "fetch_agg_trades: from_id is mutually exclusive with "
+                "start_time_ms / end_time_ms (Binance spec)"
+            )
 
         params: dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
         if from_id is not None:
             params["fromId"] = int(from_id)
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
 
         backoff = _RETRY_BASE_S
         last_exc: Exception | None = None

@@ -177,40 +177,60 @@ async def rest_path(
     minutes: float,
     now: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Paginate Binance Spot REST backwards until window is filled."""
+    """Time-range queries against Binance Spot REST.
+
+    Uses ``startTime`` / ``endTime`` instead of ``fromId`` pagination so
+    a fresh dev box can pull ~20 minutes of trades in 1-2 round trips
+    instead of hundreds. Binance caps the time range at 1 hour per
+    request, so we chunk in 30-min slices to stay safely under that.
+    """
     from deribit_paper.client.binance_rest import BinanceRESTClient
 
     cutoff = now - pd.Timedelta(minutes=minutes)
+    end_ms = int(now.timestamp() * 1000)
+    cutoff_ms = int(cutoff.timestamp() * 1000)
+
     client = BinanceRESTClient.for_spot()
     await client.connect()
     try:
-        # Probe latest aggTradeId via a single page from the tail.
-        latest = await client.fetch_agg_trades(asset, from_id=None)
-        if not latest:
-            raise RuntimeError(
-                "Binance Spot returned no trades on initial probe"
-            )
-        max_id = max(int(t["a"]) for t in latest)
-        # Walk backwards 1000 trades at a time.
-        all_pages: list[list[dict]] = [latest]
-        cursor = max_id - len(latest)
-        while cursor > 0:
-            page = await client.fetch_agg_trades(
-                asset, from_id=max(cursor, 0),
-            )
-            if not page:
-                break
-            all_pages.append(page)
-            page_min_ts = min(int(t["T"]) for t in page)
-            page_min_dt = pd.Timestamp(page_min_ts, unit="ms", tz="UTC")
-            if page_min_dt <= cutoff:
-                break
-            cursor -= len(page)
+        all_rows: list[dict] = []
+        # Walk forward in 30-min chunks: [cutoff, cutoff+30m), [+30m, +60m), ...
+        chunk_ms = 30 * 60 * 1000
+        cursor = cutoff_ms
+        while cursor < end_ms:
+            chunk_end = min(cursor + chunk_ms, end_ms)
+            # Loop within a chunk in case >1000 trades fall in 30 min.
+            inner_cursor = cursor
+            seen_ids_in_chunk: set[int] = set()
+            while inner_cursor < chunk_end:
+                page = await client.fetch_agg_trades(
+                    asset,
+                    start_time_ms=inner_cursor,
+                    end_time_ms=chunk_end,
+                )
+                if not page:
+                    break
+                # Filter dedup against ids already seen in this chunk.
+                fresh = [t for t in page if int(t["a"]) not in seen_ids_in_chunk]
+                if not fresh:
+                    break
+                all_rows.extend(fresh)
+                for t in fresh:
+                    seen_ids_in_chunk.add(int(t["a"]))
+                # Advance inner_cursor past the latest ts in this page;
+                # +1ms so we don't re-fetch the boundary trade.
+                page_max_ts = max(int(t["T"]) for t in page)
+                if page_max_ts <= inner_cursor:
+                    # Defensive: avoid infinite loop on stuck cursor.
+                    break
+                inner_cursor = page_max_ts + 1
+                if len(page) < 1000:
+                    break
+            cursor = chunk_end
     finally:
         await client.close()
 
-    rows = [t for page in all_pages for t in page]
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(all_rows)
     return _normalize_to_buffer_schema(df)
 
 

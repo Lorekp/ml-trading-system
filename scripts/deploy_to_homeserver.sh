@@ -189,6 +189,12 @@ DATA_FILES=(
     # window (Tier 5) emit live values from the first bar instead of
     # waiting ~37 minutes for live trades to fill the buffer.
     "vol_arb/output/BTC_dollar_bar_cache.parquet"
+    # Round-4 F6/F8 (2026-05-08): spot-trade warm-start sidecar (~few MB).
+    # Pre-fills the spot_trade_buffer with the last ~20 min of Binance
+    # Spot aggTrades so compute_bar_tsrv has venue-correct input on the
+    # very first bar after restart instead of zero-fill. Regenerate via
+    # ``python scripts/warmstart_spot_trade_buffer.py``.
+    "vol_arb/output/spot_trade_buffer_warmstart.parquet"
 )
 
 # ── 3. Sync ────────────────────────────────────────────────────────

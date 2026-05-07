@@ -298,6 +298,45 @@ def _h_svi_atm_1d(ctx: AssemblerContext) -> float:
 # ``_baseline_or_nan`` — same fail-soft pattern as HAR-PD warmup.
 
 
+def _time_to_funding_seconds(ts: pd.Timestamp) -> float:
+    """Seconds until the next 8/16/24h UTC funding boundary.
+
+    Mirror of ``vol_model/features/engineer.py:417-419``::
+
+        h = ts.hour + ts.minute/60 + ts.second/3600
+        return (8 - h if h < 8 else
+                16 - h if h < 16 else
+                24 - h) * 3600
+    """
+    h = ts.hour + ts.minute / 60.0 + ts.second / 3600.0
+    if h < 8.0:
+        return (8.0 - h) * 3600.0
+    if h < 16.0:
+        return (16.0 - h) * 3600.0
+    return (24.0 - h) * 3600.0
+
+
+def _h_time_to_funding(ctx: AssemblerContext) -> float:
+    """F3 Tier 6 — seconds until next 8h funding boundary at bar T.
+
+    Pure datetime arithmetic; no buffer needed. Pre-Tier-6 this fell
+    through to the historical baseline, which gave the model a stale
+    funding-time-of-day for every signal.
+    """
+    return _time_to_funding_seconds(ctx.bar.timestamp)
+
+
+def _h_time_to_funding_lag1(ctx: AssemblerContext) -> float:
+    """F3 Tier 6 — time_to_funding at bar T-1 (15 min before T).
+
+    For a 15-min bar cadence, this is just ``time_to_funding(ts - 15min)``
+    — equivalent to offline's ``series.shift(1).iloc[-1]`` since the
+    function is deterministic in the timestamp.
+    """
+    prev_ts = ctx.bar.timestamp - pd.Timedelta(minutes=15)
+    return _time_to_funding_seconds(prev_ts)
+
+
 def _make_dollar_bar_handler(
     name: str,
     method: str,
@@ -404,6 +443,11 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "tsrv_ffd":             _make_tsrv_handler("tsrv_ffd", "tsrv_ffd"),
     "up_jump_frac_ema50":   _make_tsrv_handler("up_jump_frac_ema50", "up_jump_frac_ema50", 50),
     "bpv_tsrv_ratio_ema50": _make_tsrv_handler("bpv_tsrv_ratio_ema50", "bpv_tsrv_ratio_ema50", 50),
+    # F3 Tier 6 (parity-cycle round 3 — 2026-05-07): time-to-funding.
+    # Pure datetime arithmetic — no buffer needed. Mirrors offline
+    # ``vol_model/features/engineer.py:417-419``.
+    "time_to_funding":       _h_time_to_funding,
+    "time_to_funding_lag1":  _h_time_to_funding_lag1,
 }
 
 

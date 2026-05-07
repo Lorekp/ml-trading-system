@@ -46,6 +46,10 @@ from deribit_paper.execution.profit_scale import (
     bsm_vega_per_vol_pt,
 )
 from deribit_paper.features import LiveSVICalibrator, StrikePicker, compute_bar_tsrv
+from deribit_paper.features.dollar_bar import DollarBarAggregator
+from deribit_paper.features.dollar_bar_buffer import DollarBarBuffer
+from deribit_paper.features.dollar_bar_stream import DollarBarSpotStream
+from deribit_paper.features.tsrv_history import TSRVHistoryBuffer
 from deribit_paper.market_data import (
     Bar,
     BarAggregator,
@@ -479,11 +483,40 @@ class TradingEngine:
             max_age_days=45,
             allow_stale=getattr(cfg, "allow_stale_svi_features", False),
         )
+        # F3 Tier 6 (parity-cycle round 3 — 2026-05-07): live dollar-bar
+        # buffer + TSRV-history buffer. Both warm-started from offline
+        # sidecars so the 22 dollar-bar / TSRV-grid handlers (Tiers 3+5)
+        # produce live values from the first bar instead of falling
+        # through to baseline for ~37 min / ~1 week of warmup.
+        self.dollar_bar_buffer = DollarBarBuffer(
+            max_size=cfg.dollar_bar_history_bars,
+        )
+        n_dollar_bars = self.dollar_bar_buffer.prewarm_from_parquet(
+            cfg.dollar_bar_cache_path,
+        )
+        logger.info(
+            "DollarBarBuffer ready: max_size=%d, prewarmed=%d bars from %s",
+            cfg.dollar_bar_history_bars, n_dollar_bars, cfg.dollar_bar_cache_path,
+        )
+        self.tsrv_history_buffer = TSRVHistoryBuffer(max_size=672)
+        _tsrv_history_parquet = Path(
+            f"TSRV/output/{cfg.asset_pair}_tsrv_{cfg.bar_minutes}m.parquet"
+        )
+        n_tsrv_rows = self.tsrv_history_buffer.prewarm_from_parquet(
+            _tsrv_history_parquet,
+        )
+        logger.info(
+            "TSRVHistoryBuffer ready: max_size=672, prewarmed=%d rows from %s",
+            n_tsrv_rows, _tsrv_history_parquet,
+        )
+
         self.feature_assembler = FeatureAssembler(
             features_parquet=features_parquet,
             svi_features_parquet=svi_features_parquet,
             bundle=self.model_bundle,
             svi_calibrator=self.svi_calibrator,
+            dollar_bar_buffer=self.dollar_bar_buffer,
+            tsrv_history_buffer=self.tsrv_history_buffer,
             rolling_history_bars=cfg.bars_per_day * 7,
         )
         # C (parity 2026-05-07): pre-warm the HAR-PD circular buffer
@@ -709,6 +742,32 @@ class TradingEngine:
             )
         else:
             logger.info("LiveVPINStream disabled (vpin_state_path empty)")
+
+        # ── F3 Tier 6: Live dollar-bar spot stream ──
+        # Polls Binance spot aggTrades into the DollarBarAggregator,
+        # which emits dollar bars into self.dollar_bar_buffer (via
+        # on_bar_close). Tier 3+5 handlers consume from the buffer.
+        # Runs in parallel with the existing LiveVPINStream (Futures perp)
+        # — they feed independent layers; cutover happens once the live
+        # spot-VPIN has soaked.
+        from deribit_paper.client.binance_rest import BinanceRESTClient
+        self._dollar_bar_rest = BinanceRESTClient.for_spot()
+        self.dollar_bar_aggregator = DollarBarAggregator(
+            threshold=cfg.dollar_bar_threshold_btc,
+            on_bar_close=self.dollar_bar_buffer.append,
+        )
+        self.dollar_bar_stream = DollarBarSpotStream(
+            rest_client=self._dollar_bar_rest,
+            aggregator=self.dollar_bar_aggregator,
+            symbol=f"{cfg.currency.upper()}USDT",
+            poll_seconds=cfg.spot_poll_seconds,
+        )
+        logger.info(
+            "DollarBarSpotStream ready (symbol=%sUSDT, threshold=$%.0f, poll=%.1fs)",
+            cfg.currency.upper(),
+            cfg.dollar_bar_threshold_btc,
+            cfg.spot_poll_seconds,
+        )
 
         # ── Phase 5: Execution ──
         # E.2.8: latency-breach callback. Wired AFTER kill_switch is
@@ -1137,6 +1196,18 @@ class TradingEngine:
         if self.vpin_stream is not None:
             self._background_tasks.append(
                 asyncio.create_task(self.vpin_stream.run_forever(), name="vpin_ws"),
+            )
+
+        # F3 Tier 6: spawn the live dollar-bar spot stream alongside the
+        # VPIN stream. Lazy-connect the REST client (the stream calls
+        # connect() internally on first poll if needed).
+        if self.dollar_bar_stream is not None:
+            await self._dollar_bar_rest.connect()
+            self._background_tasks.append(
+                asyncio.create_task(
+                    self.dollar_bar_stream.run_forever(),
+                    name="dollar_bar_spot",
+                ),
             )
 
         logger.info("TradingEngine running — waiting for stop signal")
@@ -1594,6 +1665,16 @@ class TradingEngine:
             bar.perp_dataframe(),
             bar_seconds=float(self.config.bar_seconds),
         )
+
+        # F3 Tier 6: append this bar's TSRV to the history buffer so
+        # the 6 TSRV-grid handlers (tsrv_mean_*, tsrv_ffd, etc.) see
+        # the latest 15-min cadence value. Defensive — shouldn't raise
+        # but a bad ``bar_tsrv`` shouldn't break the bar loop.
+        try:
+            if self.tsrv_history_buffer is not None and bar_tsrv is not None:
+                self.tsrv_history_buffer.append_bar(bar.timestamp, bar_tsrv)
+        except Exception:  # noqa: BLE001
+            logger.exception("F3 Tier 6: tsrv_history_buffer append failed")
 
         # 1b. Stale-data guard — refuse to signal on bars where we
         # couldn't trade. E.3.5 (2026-05-01): treat low-volume AND

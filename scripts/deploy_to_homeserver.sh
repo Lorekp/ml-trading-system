@@ -94,6 +94,12 @@ SOURCE_FILES=(
     "deribit_paper/features/straddle.py"
     "deribit_paper/features/vpin_live.py"
     "deribit_paper/features/har_pd_live.py"             # parity-cycle C (2026-05-07)
+    "deribit_paper/features/dollar_bar.py"              # F3 Tier 1 (2026-05-07)
+    "deribit_paper/features/dollar_bar_buffer.py"       # F3 Tier 2 (2026-05-07)
+    "deribit_paper/features/dollar_bar_stream.py"       # F3 Tier 2 (2026-05-07)
+    "deribit_paper/features/dollar_bar_features.py"     # F3 Tier 3 (2026-05-07)
+    "deribit_paper/features/tsrv_history.py"            # F3 Tier 5 (2026-05-07)
+    "deribit_paper/features/tsrv_features.py"           # F3 Tier 5 (2026-05-07)
 
     # Live engine — Deribit client (REST + WS + auth)
     "deribit_paper/client/__init__.py"
@@ -174,7 +180,15 @@ DATA_FILES=(
     # parity-cycle C (2026-05-07): TSRV parquet seeds the HAR-PD live
     # circular buffer at engine startup so the first live bar emits
     # non-NaN HAR-PD features (otherwise warmup waits 96 bars / 24h).
+    # F3 Tier 5 (2026-05-07): same parquet now also seeds the
+    # TSRVHistoryBuffer for the 6 TSRV-grid handlers.
     "TSRV/output/BTCUSDT_tsrv_15m.parquet"
+    # F3 Tier 4 (2026-05-07): dollar-bar warm-start sidecar (~38KB).
+    # Pre-fills the DollarBarBuffer with the last 300 dollar bars so
+    # the 16 dollar-bar handlers (Tier 3) and parkinson_1d's 250-bar
+    # window (Tier 5) emit live values from the first bar instead of
+    # waiting ~37 minutes for live trades to fill the buffer.
+    "vol_arb/output/BTC_dollar_bar_cache.parquet"
 )
 
 # ── 3. Sync ────────────────────────────────────────────────────────

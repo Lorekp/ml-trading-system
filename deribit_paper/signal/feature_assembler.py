@@ -43,6 +43,8 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from deribit_paper.features.dollar_bar_buffer import DollarBarBuffer
+from deribit_paper.features.dollar_bar_features import DollarBarFeatures
 from deribit_paper.features.har_pd_live import (
     HAR_PD_RAW_FEATURES,
     K_BARS_DEFAULT as HAR_PD_K_BARS_DEFAULT,
@@ -79,6 +81,13 @@ class AssemblerContext:
     svi_calibrator: Any | None       # LiveSVICalibrator, late-bound
     baseline_row: pd.Series          # historical baseline for fallbacks
     har_pd_features: dict[str, float] = field(default_factory=dict)
+    # F3 Tier 3 (parity-cycle round 3 — 2026-05-07): dollar-bar buffer +
+    # cached-features view. Both ``None`` until Tier 6 wires the live
+    # ``DollarBarSpotStream``-fed buffer into the engine. While ``None``,
+    # the 16 dollar-bar-derived handlers fall back to the historical
+    # baseline (same fail-soft pattern as HAR-PD warmup / SVI cold start).
+    dollar_bar_buffer: Any | None = None        # DollarBarBuffer, late-bound
+    dollar_bar_features: Any | None = None      # DollarBarFeatures, late-bound
 
 
 def _h_tsrv(ctx: AssemblerContext) -> float:
@@ -143,10 +152,42 @@ def _h_vol_ann(ctx: AssemblerContext) -> float:
 
 
 def _h_n_trades(ctx: AssemblerContext) -> float:
+    """Last sub-bar's n_trades (F5, parity-cycle round 3 — 2026-05-07).
+
+    Pre-F5: returned the WALL-CLOCK 15-min total perp trade count.
+    Offline ``_window_and_aggregate`` takes ``series.groupby(window_labels).last()``
+    which is the LAST sub-bar's n_trades within the 15-min window —
+    a different quantity. With the dollar-bar buffer wired live, we
+    return the latest dollar bar's n_trades to match offline.
+
+    Fallback when buffer is None or empty (engine warmup / test fixtures
+    that don't wire a buffer): use the wall-clock count, matching
+    pre-F5 behaviour for backward compat.
+    """
+    buf = ctx.dollar_bar_buffer
+    if buf is not None and len(buf) > 0:
+        bar = buf.latest_bar()
+        if bar is not None:
+            return float(bar.n_trades)
     return float(ctx.bar.n_perp_trades)
 
 
 def _h_duration_s(ctx: AssemblerContext) -> float:
+    """Last sub-bar's duration_s (F4, parity-cycle round 3 — 2026-05-07).
+
+    Pre-F4: returned the MEAN inter-trade gap within the 15-min window.
+    Offline ``_window_and_aggregate`` uses ``series.groupby(window_labels).last()``
+    on the dollar-bar duration_s series — i.e. the last sub-bar's full
+    duration. With the dollar-bar buffer wired live, we mirror that.
+
+    Fallback when buffer is None or empty: use the existing mean
+    inter-trade gap calculation for backward compat.
+    """
+    buf = ctx.dollar_bar_buffer
+    if buf is not None and len(buf) > 0:
+        bar = buf.latest_bar()
+        if bar is not None and np.isfinite(bar.duration_s):
+            return float(bar.duration_s)
     if not ctx.bar.perp_trades:
         return float(ctx.baseline_row.get("duration_s", 1.0) or 1.0)
     first = ctx.bar.perp_trades[0].timestamp
@@ -228,6 +269,38 @@ def _h_svi_atm_1d(ctx: AssemblerContext) -> float:
     return float(live)
 
 
+# ── F3 Tier 3 (parity-cycle round 3 — 2026-05-07): 16 dollar-bar handlers ──
+# Each handler reads from ``ctx.dollar_bar_features`` (a per-bar cached
+# wrapper around the live ``DollarBarBuffer``). When the buffer is None
+# or too short for the underlying operation, the wrapper returns
+# ``None`` and the handler falls back to the historical baseline via
+# ``_baseline_or_nan`` — same fail-soft pattern as HAR-PD warmup.
+
+
+def _make_dollar_bar_handler(
+    name: str,
+    method: str,
+    *args: Any,
+) -> Callable[[AssemblerContext], float]:
+    """Build a handler that calls ``ctx.dollar_bar_features.<method>(*args)``
+    and falls back to the baseline row's ``name`` value when the wrapper
+    returns ``None`` or a non-finite result.
+    """
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = getattr(feats, method)(*args)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
 # Registry: feature name → handler.  Adding a new live-computable
 # feature is one line here, not a tuple edit + imperative loop edit.
 _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
@@ -254,6 +327,26 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     # ``ctx.har_pd_features`` (precomputed once per bar before the
     # handler loop fires; see ``FeatureAssembler.build_row``).
     **{name: _make_har_pd_handler(name) for name in HAR_PD_RAW_FEATURES},
+    # F3 Tier 3 (parity-cycle round 3 — 2026-05-07): 16 dollar-bar
+    # handlers. Each computes against ``ctx.dollar_bar_features``;
+    # when the buffer is None / underfull the handler falls back to
+    # the historical baseline via ``_baseline_or_nan``.
+    "vov":                 _make_dollar_bar_handler("vov", "latest_raw", "vov"),
+    "vov_ema10":           _make_dollar_bar_handler("vov_ema10", "ema", "vov", 10),
+    "vov_ema50":           _make_dollar_bar_handler("vov_ema50", "ema", "vov", 50),
+    "vov_lag3":            _make_dollar_bar_handler("vov_lag3", "lag", "vov", 3),
+    "vpin":                _make_dollar_bar_handler("vpin", "latest_raw", "vpin"),
+    "vpin_ema10":          _make_dollar_bar_handler("vpin_ema10", "ema", "vpin", 10),
+    "vpin_ema50":          _make_dollar_bar_handler("vpin_ema50", "ema", "vpin", 50),
+    "vpin_lag1":           _make_dollar_bar_handler("vpin_lag1", "lag", "vpin", 1),
+    "imbalance_ema50":     _make_dollar_bar_handler("imbalance_ema50", "ema", "imbalance", 50),
+    "duration_s_ema10":    _make_dollar_bar_handler("duration_s_ema10", "ema", "duration_s", 10),
+    "duration_s_ema50":    _make_dollar_bar_handler("duration_s_ema50", "ema", "duration_s", 50),
+    "duration_s_lag3":     _make_dollar_bar_handler("duration_s_lag3", "lag", "duration_s", 3),
+    "n_trades_ema10":      _make_dollar_bar_handler("n_trades_ema10", "ema", "n_trades", 10),
+    "n_trades_ema50":      _make_dollar_bar_handler("n_trades_ema50", "ema", "n_trades", 50),
+    "parkinson_1d":        _make_dollar_bar_handler("parkinson_1d", "parkinson_1d", 250),
+    "parkinson_1d_ema50":  _make_dollar_bar_handler("parkinson_1d_ema50", "parkinson_1d_ema", 50),
 }
 
 
@@ -313,6 +406,7 @@ class FeatureAssembler:
         svi_features_parquet: str | Path | None = None,
         bundle,  # ModelBundle — late binding to avoid circular import
         svi_calibrator: Any | None = None,
+        dollar_bar_buffer: DollarBarBuffer | None = None,
         rolling_history_bars: int = 672,  # 7 days at 15min
         har_pd_k_bars: int = HAR_PD_K_BARS_DEFAULT,
     ):
@@ -322,6 +416,11 @@ class FeatureAssembler:
         )
         self._bundle = bundle
         self._svi_calibrator = svi_calibrator
+        # F3 Tier 3 (parity-cycle round 3 — 2026-05-07): the live
+        # DollarBarBuffer fed by ``DollarBarSpotStream``. ``None`` until
+        # Tier 6 wires the engine; while None the 16 dollar-bar-derived
+        # handlers fall back to the historical baseline.
+        self._dollar_bar_buffer = dollar_bar_buffer
         self._rolling_history_bars = rolling_history_bars
         # C (parity 2026-05-07): live HAR-PD state. Each call to
         # ``build_row`` reads strict-past values from this buffer
@@ -540,12 +639,26 @@ class FeatureAssembler:
         # append the current bar's TSRV — strict-past contract.
         har_pd_features = self._har_pd_state.compute_features()
 
+        # F3 Tier 3 (parity-cycle round 3 — 2026-05-07): build a
+        # ``DollarBarFeatures`` cached view over the live buffer. Each
+        # of the 16 dollar-bar handlers reads from this view; the cache
+        # ensures ewm/lag/parkinson series are computed once per bar
+        # rather than per handler. ``None`` when no buffer is wired
+        # (engine warmup / test fixtures); handlers detect that and
+        # fall back to baseline.
+        dollar_bar_features = (
+            DollarBarFeatures(self._dollar_bar_buffer)
+            if self._dollar_bar_buffer is not None else None
+        )
+
         ctx = AssemblerContext(
             bar=bar,
             bar_tsrv=bar_tsrv,
             svi_calibrator=self._svi_calibrator,
             baseline_row=self._baseline_row,
             har_pd_features=har_pd_features,
+            dollar_bar_buffer=self._dollar_bar_buffer,
+            dollar_bar_features=dollar_bar_features,
         )
 
         for i, name in enumerate(feature_names):

@@ -29,7 +29,6 @@ import math
 import os
 import secrets
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -235,8 +234,23 @@ class TradingEngine:
             "vol_arb/output/live_trades_harness.parquet",
         )
 
-        # Rolling edge history for composite_v2 edge_scale (1 day of 15m bars)
-        self._edge_history: deque[float] = deque(maxlen=96)
+        # D4 (parity 2026-05-07): rolling-median-edge EMA matching V2
+        # backtester at ``vol_arb/backtester.py:1846-1847, 2205-2206``.
+        # Pre-D4 the live engine kept a 96-bar median-deque updated on
+        # every finite-edge bar; V2 keeps a 500-bar EMA (alpha=2/501)
+        # seeded from the median of the FIRST 96 bars and updated ONLY
+        # on traded bars (signal != 0 AND N > 0). Mirror exactly:
+        #   * ``_edge_warmup`` collects |edge| from every finite-edge
+        #     bar until 96 entries are seen.
+        #   * ``_edge_ema`` is then seeded with the median and starts
+        #     EMA updates after risk-check + size finalisation.
+        self._edge_warmup: list[float] = []
+        self._edge_ema: float | None = None
+        # Class-level constants matching V2 backtester. Kept as instance
+        # attrs for testability (a unit test can override the warmup
+        # length to exercise the seed transition without 96 bars).
+        self._EDGE_WARMUP_N: int = 96
+        self._EDGE_EMA_ALPHA: float = 2.0 / 501.0
 
         # Stale-data guard: consecutive bars with zero trades
         self._consecutive_empty_bars: int = 0
@@ -1629,10 +1643,28 @@ class TradingEngine:
             "drawdown_pct": self.equity_tracker.drawdown_pct,
         })
 
-        # Update rolling edge history for composite_v2 sizing (all non-NaN edges)
+        # D4 (parity 2026-05-07): warmup-buffer accumulation + EMA
+        # consumption. The post-trade EMA update happens AFTER
+        # risk-check passes and the trade actually fires (mirrors V2's
+        # ``signal[i] != 0 and N[i] > 0`` gating).
         if math.isfinite(signal.edge_vol_pts):
-            self._edge_history.append(abs(signal.edge_vol_pts))
-        rolling_median_edge = float(np.median(list(self._edge_history))) if self._edge_history else 1.0
+            abs_edge = abs(signal.edge_vol_pts)
+            if self._edge_ema is None:
+                self._edge_warmup.append(abs_edge)
+                if len(self._edge_warmup) >= self._EDGE_WARMUP_N:
+                    self._edge_ema = float(np.median(self._edge_warmup))
+                    logger.info(
+                        "Edge-EMA warmup complete (%d bars): seeded with "
+                        "median=%.3f, alpha=%.4f (500-bar EMA)",
+                        len(self._edge_warmup), self._edge_ema,
+                        self._EDGE_EMA_ALPHA,
+                    )
+                    self._edge_warmup.clear()
+        # During warmup return V2's <96-bar fallback (35.0); after,
+        # return the EMA. Mirrors backtester:1846 init.
+        rolling_median_edge = (
+            self._edge_ema if self._edge_ema is not None else 35.0
+        )
 
         # DVOL proxy: SVI ATM IV when calibrated, else realized vol from TSRV
         iv = signal.iv_used_pct
@@ -1763,6 +1795,17 @@ class TradingEngine:
         # signal that would push us past the cap is rejected on the
         # next bar.
         self.risk_limits.record_trade_fired(at=bar.timestamp)
+        # D4 (parity 2026-05-07): mirror V2 backtester at
+        # ``backtester.py:2205-2206`` — only update the edge EMA on
+        # bars where ``signal != 0 AND N > 0``. The check is
+        # implicit here: we passed the risk gate and are about to
+        # fire (n_contracts > 0 was already required upstream).
+        if (
+            self._edge_ema is not None
+            and math.isfinite(signal.edge_vol_pts)
+        ):
+            abs_edge = abs(signal.edge_vol_pts)
+            self._edge_ema += self._EDGE_EMA_ALPHA * (abs_edge - self._edge_ema)
         trade_task = asyncio.create_task(
             self._execute_and_persist(
                 signal, n_contracts,

@@ -189,20 +189,27 @@ class StraddleFlow:
 
         n = equity * dynamic_margin / (self._im_fraction * spot)
 
-        # Per-bar dynamic BTC cap (E.2.6 2026-05-01) — captured BEFORE
-        # any multiplier so we can re-clip after profit_scale and after
-        # Kelly. Mirrors backtester at ``vol_arb/backtester.py:1994 +
-        # 2005`` where N is re-clipped against ``dynamic_btc_cap[i]``
-        # at each Kelly / profit_scaling step. Pre-E.2.6 the live
-        # engine only re-clipped against ``self._max_trade_size``
-        # (static cap) — Kelly could push N past the bar's dynamic
-        # margin envelope.
-        dynamic_btc_cap = float(n)
-
-        # Participation cap (skipped if volume unknown)
+        # D3 (parity 2026-05-07): ``dynamic_btc_cap`` is the
+        # PARTICIPATION cap, mirroring V2 backtester at
+        # ``vol_arb/backtester.py:1796-1798``:
+        #     ``dynamic_btc_cap = clip(trailing_vol * max_participation_rate, 1.0, 50.0)``
+        # and ``vol_arb/sizing.py:_base_size`` where every strategy's
+        # base size is ``min(margin_envelope, dynamic_btc_cap)`` — i.e.
+        # the participation cap is the ceiling, not the margin envelope.
+        # Pre-D3 the live engine set this to ``float(n)`` (margin
+        # envelope), so subsequent re-clips at profit_scale (L236) and
+        # Kelly (L247) used the wrong ceiling, allowing N to drift from
+        # the V2 reference. Fall back to the margin envelope when
+        # trailing volume is unknown so early bars / venue outages
+        # don't allow unbounded sizing.
         if trailing_1h_volume_btc is not None and trailing_1h_volume_btc > 0:
-            cap = trailing_1h_volume_btc * self._max_participation
-            n = min(n, cap)
+            dynamic_btc_cap = float(np.clip(
+                trailing_1h_volume_btc * self._max_participation,
+                1.0, 50.0,
+            ))
+        else:
+            dynamic_btc_cap = float(n)
+        n = min(n, dynamic_btc_cap)
 
         # Short penalty
         if signal_direction == -1:
@@ -224,6 +231,11 @@ class StraddleFlow:
 
         # 4. Liquidity scale (supplied by caller from spread EMA vs current spread)
         n *= edge_scale * dd_scale * liq_scale
+        # D3: V2 backtester `size_composite_v2` returns
+        # `min(base * edge*dd*liq, dynamic_btc_cap)` at sizing.py:271.
+        # Mirror that re-cap here so profit_scale and Kelly operate on a
+        # participation-clipped value (was missing pre-D3).
+        n = min(n, dynamic_btc_cap)
 
         # 5. Profit scale (empirical-Bayes shrinkage, V2 only). Mirrors
         # backtester order: applied AFTER edge/dd/liq, BEFORE Kelly.

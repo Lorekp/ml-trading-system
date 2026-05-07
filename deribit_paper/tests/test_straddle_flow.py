@@ -118,6 +118,12 @@ def test_size_position_short_penalty_applied():
 
 
 def test_size_position_participation_cap():
+    """D3 (parity 2026-05-07): dynamic_btc_cap is the V2 participation
+    cap with floor=1.0 / ceiling=50.0. trailing_vol=5.0 BTC ×
+    max_participation=0.10 = 0.5 → clipped UP to 1.0 (V2 floor at
+    backtester.py:1796-1798). Pre-D3 the live engine produced 0.5
+    here; under V2-parity the cap floor binds at 1.0.
+    """
     flow = StraddleFlow(
         order_manager=None, live_drl_hedger=None,
         target_margin_utilization=0.02,
@@ -125,14 +131,16 @@ def test_size_position_participation_cap():
         max_participation_rate=0.10,
         max_trade_size_btc=10.0,
     )
-    # n formula → 3.33 BTC, but cap = 5 BTC * 0.10 = 0.5 BTC
+    # margin envelope: 1M * 0.02 / (0.10 * 60K) = 3.33 BTC
+    # participation cap: clip(5.0 * 0.10, 1.0, 50.0) = clip(0.5, 1.0, 50.0) = 1.0
+    # n = min(3.33, 1.0) = 1.0
     n = flow.size_position(
         equity=1_000_000.0,
         signal_direction=1,
         spot=60_000.0,
         trailing_1h_volume_btc=5.0,
     )
-    assert n == pytest.approx(0.5)
+    assert n == pytest.approx(1.0)
 
 
 def test_size_position_below_min_returns_zero():
@@ -304,7 +312,13 @@ def test_dvol_scaling_capped_at_target():
 
 
 def test_edge_scale_above_median_increases_size():
-    """edge_vp > rolling_median_edge → edge_scale > 1 → larger position."""
+    """edge_vp > rolling_median_edge → edge_scale > 1 → larger position.
+
+    D3 (parity 2026-05-07): pass ``trailing_1h_volume_btc=500.0`` so
+    the participation cap = 50.0 BTC (V2 ceiling), keeping the cap from
+    binding on the edge_scale=3 case (margin envelope 8.33 BTC × 3 = 25
+    BTC < 50 cap). Tests edge_scale in isolation.
+    """
     flow = StraddleFlow(
         order_manager=None, live_drl_hedger=None,
         target_margin_utilization=0.05,
@@ -315,11 +329,13 @@ def test_edge_scale_above_median_increases_size():
     # Baseline: edge = median → edge_scale = 1.0
     n_median = flow.size_position(
         equity=1_000_000.0, signal_direction=1, spot=60_000.0,
+        trailing_1h_volume_btc=500.0,  # cap = 50.0 (ceiling), non-binding
         edge_vp=30.0, rolling_median_edge=30.0,
     )
     # 3× median edge → edge_scale = 3.0 (capped at sizing_edge_cap)
     n_high = flow.size_position(
         equity=1_000_000.0, signal_direction=1, spot=60_000.0,
+        trailing_1h_volume_btc=500.0,
         edge_vp=90.0, rolling_median_edge=30.0,
     )
     assert n_high == pytest.approx(3.0 * n_median, rel=0.05)

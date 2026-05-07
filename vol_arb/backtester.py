@@ -1586,10 +1586,45 @@ class VolArbBacktester:
                     df["trailing_1h_volume"].values
                     if "trailing_1h_volume" in df.columns else None
                 )
-                # VPIN: compute on-the-fly from vol_ann via the returns-proxy.
-                # Phase 2 upgrade: read a precomputed vpin column from df.
-                from vol_arb.drl_hedging.vpin import compute_vpin_proxy_from_returns
-                vpin_arr = compute_vpin_proxy_from_returns(df).values
+                # D2 (parity-cycle round 2 — 2026-05-07): SAC v4 was trained
+                # on TRUE bucketed VPIN from ``vol_arb/output/vpin_btc_15m.parquet``
+                # column ``vpin_true`` (mean ~0.19, std ~0.03; per
+                # memory entry ``project_w5_v4_adopted.md``). Pre-fix the
+                # V2 backtester computed a logistic-z-scored returns
+                # PROXY via ``compute_vpin_proxy_from_returns`` — mean
+                # 0.5, completely different distribution. After
+                # VecNormalize the policy saw VPIN obs ≈ +10 σ
+                # (saturated) on every V2 backtest, while live (which
+                # uses the true VPIN feed) sees obs ≈ 0. Every V2 v4
+                # validation backtest was scored with a corrupted
+                # observation distribution.
+                #
+                # Fix: load ``vpin_true`` from the precomputed parquet
+                # and reindex to df.index (forward-fill for any
+                # extension beyond the parquet's coverage). Fall back
+                # to the proxy only if the parquet is missing.
+                _vpin_path = "vol_arb/output/vpin_btc_15m.parquet"
+                try:
+                    _vpin_df = pd.read_parquet(_vpin_path)
+                    vpin_arr = (
+                        _vpin_df["vpin_true"]
+                        .reindex(df.index, method="ffill")
+                        .fillna(0.189)  # training-distribution mean
+                        .to_numpy(dtype=float)
+                    )
+                    logger.info(
+                        "D2: loaded true VPIN from %s (%d rows reindexed to %d bars)",
+                        _vpin_path, len(_vpin_df), len(df),
+                    )
+                except (FileNotFoundError, OSError, KeyError) as _exc:
+                    from vol_arb.drl_hedging.vpin import compute_vpin_proxy_from_returns
+                    vpin_arr = compute_vpin_proxy_from_returns(df).values
+                    logger.warning(
+                        "D2: true VPIN parquet unavailable (%s); falling "
+                        "back to returns-proxy. SAC v4 expects vpin_true "
+                        "(mean 0.19); proxy (mean 0.5) corrupts the obs "
+                        "distribution.", _exc,
+                    )
                 delta_pnl_btc, hedge_costs_btc = self._drl_hedger.simulate(
                     S_entry=S_exec,
                     K=K,

@@ -8,6 +8,12 @@ because the offline pipeline trains on Binance Vision spot aggTrades
 the same source for the dollar-bar-derived features to byte-identity
 match offline.
 
+Round-4 F6/F8 (2026-05-07): the same poller now optionally fans every
+parsed trade out to a second consumer via ``extra_trade_sink`` so the
+live TSRV computation can read from the same Binance Spot trades the
+offline pipeline trains on (closing the Deribit-perp-vs-Binance-spot
+venue gap on TSRV-derived features).
+
 The architecture mirrors :class:`LiveVPINStream._run_rest_loop`:
 periodic ``GET /api/v3/aggTrades?fromId=last+1`` polling, feeding each
 trade into the aggregator, with thread-safe locks on the latest-bar
@@ -33,6 +39,7 @@ import asyncio
 import logging
 import threading
 import time
+from typing import Callable
 
 import pandas as pd
 
@@ -41,6 +48,12 @@ from deribit_paper.client.binance_rest import (
     BinanceRESTError,
 )
 from deribit_paper.features.dollar_bar import DollarBar, DollarBarAggregator
+from deribit_paper.market_data.buffer import Trade
+
+# Round-4 F6/F8: callback signature for trade fan-out.  Receives a
+# canonical :class:`Trade` for each Binance Spot aggTrade — used by
+# the engine to feed ``spot_trade_buffer`` for live TSRV computation.
+ExtraTradeSink = Callable[[Trade], None]
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +95,7 @@ class DollarBarSpotStream:
         symbol: str = "BTCUSDT",
         poll_seconds: float = 3.0,
         max_stale_seconds: float = 60.0,
+        extra_trade_sink: ExtraTradeSink | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError(f"poll_seconds must be positive, got {poll_seconds}")
@@ -94,6 +108,11 @@ class DollarBarSpotStream:
         self._symbol = symbol
         self._poll_seconds = float(poll_seconds)
         self._max_stale_seconds = float(max_stale_seconds)
+        # Round-4 F6/F8: optional fan-out to a second consumer (typically
+        # ``spot_trade_buffer.append`` on the engine).  Default ``None``
+        # preserves pre-round-4 behaviour byte-identically — the existing
+        # 846 deribit_paper tests don't need to know about this.
+        self._extra_trade_sink: ExtraTradeSink | None = extra_trade_sink
 
         self._lock = threading.Lock()
         self._shutdown = asyncio.Event()
@@ -242,6 +261,12 @@ class DollarBarSpotStream:
         :class:`LiveVPINStream._process_rest_page` pattern. Tracks the
         max ``aggTradeId`` seen so the next ``fetch_agg_trades`` call
         passes ``from_id = max + 1``.
+
+        Round-4 F6/F8: when ``extra_trade_sink`` is wired, each parsed
+        trade is also constructed into a canonical :class:`Trade` and
+        forwarded — typically to ``spot_trade_buffer.append`` for live
+        TSRV computation. Sink failures are logged and swallowed so a
+        broken downstream consumer cannot stop the bar pipeline.
         """
         max_id = self._last_agg_trade_id
         for tr in trades:
@@ -261,6 +286,27 @@ class DollarBarSpotStream:
                 dollar_volume=dollar_volume,
                 is_buyer_maker=is_buyer_maker,
             )
+            # Round-4 F6/F8 fan-out — feed the same trade into a second
+            # consumer (e.g., ``spot_trade_buffer`` for live TSRV).
+            # ``is_buyer_maker == True`` ⇒ taker is the SELLER ⇒
+            # direction = -1 (matches Deribit's perp ``direction`` sign
+            # convention so ``compute_bar_tsrv`` is venue-agnostic).
+            if self._extra_trade_sink is not None:
+                try:
+                    self._extra_trade_sink(
+                        Trade(
+                            trade_id=f"binance:{agg_id}",
+                            timestamp=ts,
+                            instrument_name=self._symbol,
+                            price=price,
+                            amount=qty,
+                            direction=-1 if is_buyer_maker else 1,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 — sink failure must not stop the stream
+                    logger.exception(
+                        "DollarBarSpotStream extra_trade_sink raised",
+                    )
             self._trades_processed += 1
             self._last_update_ts = time.time()
             if max_id is None or agg_id > max_id:

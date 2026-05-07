@@ -215,6 +215,21 @@ class PaperConfig:
     # ``python scripts/generate_dollar_bar_cache.py``.
     dollar_bar_cache_path: str = "vol_arb/output/BTC_dollar_bar_cache.parquet"
 
+    # ── Round-4 F6/F8 (parity-cycle round 4 — 2026-05-07) ──────────
+    # The fan-out hook on ``DollarBarSpotStream`` feeds raw Binance
+    # Spot aggTrades into ``self.spot_trade_buffer`` so the live
+    # ``compute_bar_tsrv`` reads from the venue the offline TSRV
+    # pipeline trains on (closing the Deribit-perp-vs-Binance-spot
+    # gap on TSRV-derived features). Buffer window matches
+    # ``tsrv_rolling_window_hours`` so the bar slice has enough
+    # context for K-subgrid TSRV. Empty path string skips warm-start;
+    # regenerate via ``python scripts/warmstart_spot_trade_buffer.py``.
+    spot_trade_buffer_hours: float = 2.0
+    spot_trade_buffer_warmstart_path: str = (
+        "vol_arb/output/spot_trade_buffer_warmstart.parquet"
+    )
+    spot_trade_buffer_warmstart_minutes: float = 20.0
+
     # ── Model inference ────────────────────────────────────────────
     # lgbm_models_dir holds the LightGBM ``.txt`` + ``_features.json``
     # manifests for the walk-forward variant in use.  W3.1 (2026-04-11)

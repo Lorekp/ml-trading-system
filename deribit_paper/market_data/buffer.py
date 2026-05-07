@@ -179,6 +179,119 @@ class TradeBuffer:
         ]
         return pd.DataFrame(rows)
 
+    def prewarm_from_parquet(
+        self,
+        path: str | "pathlib.Path",   # noqa: F821 — string forward-ref
+        *,
+        instrument_name: str = "BTCUSDT",
+        trade_id_prefix: str = "warmstart",
+        max_age_seconds: float | None = None,
+        now: pd.Timestamp | None = None,
+    ) -> int:
+        """Bulk-load trades from a sidecar parquet at engine start.
+
+        Round-4 F6/F8 (parity-cycle): the warm-start path for the live
+        Binance Spot trade buffer that drives :func:`compute_bar_tsrv`.
+        Mirrors :meth:`DollarBarBuffer.prewarm_from_parquet` (F3 Tier 4):
+        load fast, fail loud on missing files, no silent partial loads.
+
+        The parquet must carry, at minimum, ``timestamp``, ``price`` and
+        ``amount`` columns (a Binance Vision aggTrades dump or the
+        `scripts/warmstart_spot_trade_buffer.py` output both qualify).
+        ``direction`` is read from ``is_buyer_maker`` if present (Binance
+        Vision schema: ``+1`` when ``is_buyer_maker`` is False, ``-1``
+        when True), otherwise defaults to ``+1``.
+
+        ``trade_id`` is read from a ``trade_id`` or ``a`` (aggTradeId)
+        column when present; otherwise we synthesise a stable id of the
+        form ``f"{trade_id_prefix}:{i}"`` so dedup still works.
+
+        ``max_age_seconds`` (when set) drops rows older than
+        ``now - max_age_seconds``. Default ``None`` keeps every row.
+
+        Returns the number of trades appended.
+        """
+        from pathlib import Path as _Path
+        path = _Path(path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"TradeBuffer prewarm: sidecar not found at {path}. "
+                f"Run `scripts/warmstart_spot_trade_buffer.py` to generate it."
+            )
+
+        df = pd.read_parquet(path)
+        if df.empty:
+            logger.warning(
+                "%s prewarm: parquet at %s is empty — buffer remains empty",
+                self.name, path,
+            )
+            return 0
+
+        required = {"timestamp", "price", "amount"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"TradeBuffer prewarm parquet at {path} missing columns: {missing}"
+            )
+
+        # Coerce timestamp to UTC pd.Timestamp; tolerate ms-int or pd.Timestamp.
+        ts = df["timestamp"]
+        if pd.api.types.is_integer_dtype(ts):
+            ts = pd.to_datetime(ts, unit="ms", utc=True)
+        elif pd.api.types.is_datetime64_any_dtype(ts):
+            if getattr(ts.dtype, "tz", None) is None:
+                ts = ts.dt.tz_localize("UTC")
+        else:
+            ts = pd.to_datetime(ts, utc=True)
+
+        if max_age_seconds is not None:
+            ref = now or pd.Timestamp.now(tz="UTC")
+            cutoff = ref - pd.Timedelta(seconds=max_age_seconds)
+            keep = ts >= cutoff
+            df = df.loc[keep].reset_index(drop=True)
+            ts = ts.loc[keep].reset_index(drop=True)
+
+        prices = df["price"].to_numpy(dtype=float)
+        amounts = df["amount"].to_numpy(dtype=float)
+
+        # direction: prefer explicit column, fall back to is_buyer_maker
+        if "direction" in df.columns:
+            directions = df["direction"].to_numpy(dtype=int)
+        elif "is_buyer_maker" in df.columns:
+            directions = (~df["is_buyer_maker"].astype(bool)).astype(int) * 2 - 1
+            directions = directions.to_numpy(dtype=int)
+        else:
+            directions = [1] * len(df)
+
+        # trade_id: prefer explicit column, fall back to aggTradeId, then synth
+        if "trade_id" in df.columns:
+            ids = df["trade_id"].astype(str).tolist()
+        elif "a" in df.columns:
+            ids = [f"{trade_id_prefix}:{int(a)}" for a in df["a"].tolist()]
+        else:
+            ids = [f"{trade_id_prefix}:{i}" for i in range(len(df))]
+
+        added = 0
+        ts_list = ts.tolist()
+        for i in range(len(df)):
+            trade = Trade(
+                trade_id=ids[i],
+                timestamp=ts_list[i],
+                instrument_name=instrument_name,
+                price=float(prices[i]),
+                amount=float(amounts[i]),
+                direction=int(directions[i]),
+            )
+            if self.append(trade):
+                added += 1
+        logger.info(
+            "TradeBuffer[%s] prewarmed: %d/%d rows from %s "
+            "(window=%ds, dedup_pool=%d)",
+            self.name, added, len(df), path,
+            int(self.window_seconds), len(self._seen_set),
+        )
+        return added
+
     def clear(self) -> None:
         self._trades.clear()
         self._seen_ids.clear()

@@ -108,9 +108,14 @@ def compute_bar_tsrv(
     if len(perp_trades) < 2:
         return _zero_bar_tsrv(n_ticks=len(perp_trades))
 
-    # Sort by timestamp just in case the caller passed unsorted data
+    # Sort by timestamp just in case the caller passed unsorted data.
+    # Round-4 F6/F8 (parity-cycle 2026-05-07): stable mergesort so trades
+    # tied on a millisecond timestamp keep their feed-order. Critical for
+    # byte-identity vs the offline pipeline, which reads numpy arrays
+    # straight from parquet (i.e. no resort, just feed order). Default
+    # quicksort would reshuffle ties non-deterministically.
     if "timestamp" in perp_trades.columns:
-        perp_trades = perp_trades.sort_values("timestamp")
+        perp_trades = perp_trades.sort_values("timestamp", kind="mergesort")
 
     prices = perp_trades["price"].to_numpy(dtype=np.float64)
     amounts = perp_trades["amount"].to_numpy(dtype=np.float64)

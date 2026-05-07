@@ -389,6 +389,16 @@ class TradingEngine:
             window_seconds=cfg.option_buffer_hours * 3600.0,
         )
         self.index_buffer = IndexPriceBuffer(window_seconds=3600.0)
+        # Round-4 F6/F8 (parity-cycle 2026-05-07): Binance Spot trade
+        # buffer fed by ``DollarBarSpotStream``'s fan-out hook. Live
+        # ``compute_bar_tsrv`` reads from this buffer instead of the
+        # Deribit perp buffer so TSRV-derived features match the
+        # venue the offline pipeline (Binance Vision spot aggTrades)
+        # trains on. Window mirrors ``tsrv_rolling_window_hours``.
+        self.spot_trade_buffer = TradeBuffer(
+            name="spot",
+            window_seconds=float(cfg.spot_trade_buffer_hours) * 3600.0,
+        )
 
         def _on_ws_reconnect() -> None:
             if self.telegram is not None:
@@ -424,6 +434,7 @@ class TradingEngine:
             perp_buffer=self.perp_buffer,
             option_buffer=self.option_buffer,
             index_buffer=self.index_buffer,
+            tsrv_buffer=self.spot_trade_buffer,  # Round-4 F6/F8
         )
         self.aggregator.subscribe(self._on_bar_close)
         self.bar_clock.add_callback(self.aggregator.on_bar_close)
@@ -761,13 +772,56 @@ class TradingEngine:
             aggregator=self.dollar_bar_aggregator,
             symbol=f"{cfg.currency.upper()}USDT",
             poll_seconds=cfg.spot_poll_seconds,
+            # Round-4 F6/F8: fan out every parsed Binance Spot trade
+            # into the spot trade buffer so live TSRV reads from the
+            # same venue the offline pipeline trains on.
+            extra_trade_sink=self.spot_trade_buffer.append,
         )
         logger.info(
-            "DollarBarSpotStream ready (symbol=%sUSDT, threshold=$%.0f, poll=%.1fs)",
+            "DollarBarSpotStream ready (symbol=%sUSDT, threshold=$%.0f, "
+            "poll=%.1fs, fanout=spot_trade_buffer)",
             cfg.currency.upper(),
             cfg.dollar_bar_threshold_btc,
             cfg.spot_poll_seconds,
         )
+
+        # Round-4 F6/F8 warm-start: pre-fill spot_trade_buffer from
+        # the last ~20 min of Binance Spot aggTrades so the first bar
+        # after restart has TSRV input. Best-effort — a missing or
+        # stale sidecar simply leaves the buffer empty, in which case
+        # ``compute_bar_tsrv`` returns its existing zero-fill (same
+        # behaviour as today's first-bar Deribit-perp fallback) and
+        # the prewarmed ``TSRVHistoryBuffer`` (F3 Tier 5) keeps
+        # serving rolling features.
+        if cfg.spot_trade_buffer_warmstart_path:
+            try:
+                added = self.spot_trade_buffer.prewarm_from_parquet(
+                    cfg.spot_trade_buffer_warmstart_path,
+                    instrument_name=f"{cfg.currency.upper()}USDT",
+                    trade_id_prefix="warmstart",
+                    max_age_seconds=(
+                        float(cfg.spot_trade_buffer_warmstart_minutes) * 60.0
+                    ),
+                )
+                logger.info(
+                    "spot_trade_buffer warm-start: %d trades from %s "
+                    "(window=%.1fh, max_age=%.1fmin)",
+                    added,
+                    cfg.spot_trade_buffer_warmstart_path,
+                    float(cfg.spot_trade_buffer_hours),
+                    float(cfg.spot_trade_buffer_warmstart_minutes),
+                )
+            except FileNotFoundError as e:
+                logger.warning(
+                    "spot_trade_buffer warm-start skipped: %s. "
+                    "First bar after restart will have zero-fill TSRV.",
+                    e,
+                )
+            except Exception:  # noqa: BLE001 — warm-start failure must not block start
+                logger.exception(
+                    "spot_trade_buffer warm-start failed; first bar "
+                    "after restart will have zero-fill TSRV.",
+                )
 
         # ── Phase 5: Execution ──
         # E.2.8: latency-breach callback. Wired AFTER kill_switch is
@@ -1660,9 +1714,17 @@ class TradingEngine:
         Exposed as a public method so tests can drive the engine with
         synthetic bars without spinning up the WebSocket.
         """
-        # 1. Compute fresh TSRV for the bar
+        # 1. Compute fresh TSRV for the bar.
+        # Round-4 F6/F8 (parity-cycle 2026-05-07): switched from
+        # ``perp_dataframe()`` (Deribit perp trades) to
+        # ``tsrv_dataframe()`` (Binance Spot trades when wired,
+        # falling back to perp when not). This closes the venue gap
+        # vs the offline pipeline which trains TSRV on Binance Vision
+        # spot aggTrades. ``Bar.tsrv_dataframe()`` returns the perp
+        # DataFrame if ``Bar.tsrv_trades`` is None (back-compat for
+        # tests and any non-spot-wired path).
         bar_tsrv = compute_bar_tsrv(
-            bar.perp_dataframe(),
+            bar.tsrv_dataframe(),
             bar_seconds=float(self.config.bar_seconds),
         )
 

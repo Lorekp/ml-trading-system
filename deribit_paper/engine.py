@@ -759,6 +759,49 @@ class TradingEngine:
         self.store = SQLiteStore(cfg.sqlite_db)
         await self.store.open()
 
+        # S1+S3 (parity-cycle round 2 — 2026-05-07): restore engine
+        # state across restarts. Pre-fix the equity tracker, edge_ema,
+        # and exec_cost_ema all reset to constructor defaults at every
+        # restart, silently re-baselining the kill-switch daily-DD
+        # reference and re-warming the rolling EMAs. Mirror H4 pattern.
+        try:
+            persisted = await self.store.load_engine_state()
+        except Exception:  # noqa: BLE001 — defensive, never block startup
+            logger.exception("S1: failed to load engine_state; cold-start defaults")
+            persisted = None
+        if persisted is not None:
+            try:
+                self.equity_tracker.load_state({
+                    "current_equity_usd": persisted["current_equity_usd"],
+                    "peak_equity_usd": persisted["peak_equity_usd"],
+                    "realized_pnl_usd": persisted["realized_pnl_usd"],
+                    "n_trades_closed": persisted["n_trades_closed"],
+                })
+                self._exec_cost_ema = float(
+                    persisted["exec_cost_ema_usd_per_btc"]
+                )
+                if persisted.get("edge_ema") is not None:
+                    self._edge_ema = float(persisted["edge_ema"])
+                    self._edge_warmup = []  # warmup is complete
+                else:
+                    self._edge_ema = None
+                    self._edge_warmup = list(persisted.get("edge_warmup", []))
+                logger.info(
+                    "S1+S3: engine_state restored — equity=$%.2f peak=$%.2f "
+                    "n_trades=%d edge_ema=%s exec_cost_ema=%.2f "
+                    "(last_updated=%s)",
+                    persisted["current_equity_usd"],
+                    persisted["peak_equity_usd"],
+                    persisted["n_trades_closed"],
+                    persisted["edge_ema"],
+                    persisted["exec_cost_ema_usd_per_btc"],
+                    persisted["last_updated"],
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.exception(
+                    "S1: engine_state row malformed (%s); cold-start defaults", exc,
+                )
+
         self.telegram = TelegramNotifier(
             bot_token=cfg.telegram_bot_token,
             chat_id=cfg.telegram_chat_id,
@@ -2100,6 +2143,28 @@ class TradingEngine:
                 self._exec_cost_ema += self._exec_cost_alpha * (
                     fill_cost - self._exec_cost_ema
                 )
+
+            # S1+S3 (parity-cycle round 2 — 2026-05-07): persist engine
+            # state so a restart resumes equity / edge_ema / exec_cost_ema
+            # at their current values rather than re-baselining at
+            # constructor defaults. Best-effort — DB write failure must
+            # not block the trade close path. Mirrors H4 pattern.
+            if self.store is not None:
+                try:
+                    await self.store.save_engine_state({
+                        "current_equity_usd": self.equity_tracker.current_equity,
+                        "peak_equity_usd": self.equity_tracker.peak_equity,
+                        "realized_pnl_usd": self.equity_tracker.realized_pnl,
+                        "n_trades_closed": self.equity_tracker.n_trades_closed,
+                        "edge_ema": self._edge_ema,
+                        "edge_warmup": list(self._edge_warmup),
+                        "exec_cost_ema_usd_per_btc": self._exec_cost_ema,
+                    })
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "S1+S3: engine_state persist failed for trade %s",
+                        getattr(outcome, "trade_id", "?"),
+                    )
 
             if self.telegram is not None:
                 self.telegram.trade_close(

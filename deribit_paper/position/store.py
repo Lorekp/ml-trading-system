@@ -114,6 +114,38 @@ CREATE TABLE IF NOT EXISTS profit_scale_state (
     hedge_per_btc_ema_usd REAL NOT NULL,
     last_updated TEXT NOT NULL
 );
+
+-- S1+S3 (parity-cycle round 2 — 2026-05-07): engine_state persists
+-- per-process state that pre-fix was lost on every restart:
+--
+--   * EquityTracker (S1): current_equity, peak_equity, realized_pnl,
+--     n_trades_closed. Pre-fix every restart re-based at $100K,
+--     silently re-baselining the kill-switch daily-DD reference
+--     and producing different sizing decisions vs a continuous run.
+--
+--   * Edge-EMA (S3, D4): _edge_ema scalar + _edge_warmup buffer.
+--     Pre-fix the EMA cold-started, taking ~500 trades to reconverge
+--     to the V2 reference; live engine that restarts daily NEVER
+--     converged.
+--
+--   * Exec-cost-EMA (S3): _exec_cost_ema scalar. Pre-fix re-seeded
+--     at hardcoded 12.0 USD/BTC every restart.
+--
+-- Single-row table (id=1). Updated after every closed trade.
+CREATE TABLE IF NOT EXISTS engine_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    -- EquityTracker
+    current_equity_usd REAL NOT NULL,
+    peak_equity_usd REAL NOT NULL,
+    realized_pnl_usd REAL NOT NULL,
+    n_trades_closed INTEGER NOT NULL,
+    -- Edge EMA (D4 — composite_v2 sizing)
+    edge_ema REAL,                          -- nullable: None during 96-bar warmup
+    edge_warmup_json TEXT NOT NULL,          -- list of |edge| during warmup
+    -- Execution-cost EMA
+    exec_cost_ema_usd_per_btc REAL NOT NULL,
+    last_updated TEXT NOT NULL
+);
 """
 
 
@@ -507,6 +539,63 @@ class SQLiteStore:
                 float(state["gross_per_btc_ema_usd"]),
                 int(state["gross_count"]),
                 float(state["hedge_per_btc_ema_usd"]),
+                pd.Timestamp.now(tz="UTC").isoformat(),
+            ),
+        )
+        await self._conn.commit()
+
+    # ── engine_state (S1+S3 parity-cycle round 2) ──────────────────
+
+    async def load_engine_state(self) -> dict | None:
+        """Return persisted engine state (equity + edge_ema + exec_cost_ema), or None.
+
+        Engine reads at startup; if non-None, applies to ``EquityTracker``,
+        ``self._edge_ema`` / ``_edge_warmup``, and ``self._exec_cost_ema``.
+        Cold start (no row) → keep constructor defaults.
+        """
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        cursor = await self._conn.execute(
+            "SELECT current_equity_usd, peak_equity_usd, realized_pnl_usd, "
+            "n_trades_closed, edge_ema, edge_warmup_json, "
+            "exec_cost_ema_usd_per_btc, last_updated FROM engine_state "
+            "WHERE id = 1",
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        import json as _json
+        return {
+            "current_equity_usd": float(row[0]),
+            "peak_equity_usd": float(row[1]),
+            "realized_pnl_usd": float(row[2]),
+            "n_trades_closed": int(row[3]),
+            "edge_ema": float(row[4]) if row[4] is not None else None,
+            "edge_warmup": _json.loads(row[5]) if row[5] else [],
+            "exec_cost_ema_usd_per_btc": float(row[6]),
+            "last_updated": row[7],
+        }
+
+    async def save_engine_state(self, state: dict) -> None:
+        """Persist engine state. Idempotent (INSERT OR REPLACE at id=1)."""
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        import json as _json
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO engine_state "
+            "(id, current_equity_usd, peak_equity_usd, realized_pnl_usd, "
+            "n_trades_closed, edge_ema, edge_warmup_json, "
+            "exec_cost_ema_usd_per_btc, last_updated) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                float(state["current_equity_usd"]),
+                float(state["peak_equity_usd"]),
+                float(state["realized_pnl_usd"]),
+                int(state["n_trades_closed"]),
+                float(state["edge_ema"]) if state.get("edge_ema") is not None else None,
+                _json.dumps(state.get("edge_warmup", [])),
+                float(state["exec_cost_ema_usd_per_btc"]),
                 pd.Timestamp.now(tz="UTC").isoformat(),
             ),
         )

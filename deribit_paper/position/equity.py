@@ -186,3 +186,52 @@ class EquityTracker:
     def dropped_below_threshold(self, dd_pct_threshold: float) -> bool:
         """Return True if current drawdown is worse than ``-dd_pct_threshold``."""
         return self.drawdown_pct <= -abs(dd_pct_threshold)
+
+    # ── State persistence (S1 — parity-cycle round 2, 2026-05-07) ──
+
+    def state_dict(self) -> dict:
+        """Snapshot of fields needed to resume an EquityTracker after restart.
+
+        Pre-S1 every restart re-seeded ``current_equity`` at
+        ``cfg.paper_initial_equity_usd`` and ``peak_equity`` at the same,
+        silently re-baselining the kill-switch daily-DD reference and
+        producing different sizing decisions vs a continuous run.
+
+        ``initial_equity`` is NOT persisted — that's a constructor-time
+        choice; resuming with the same constructor + restored state is
+        what gives parity. The in-memory snapshot deque is also not
+        persisted (DB has the canonical equity_snapshots table).
+        """
+        return {
+            "current_equity_usd": self._current,
+            "peak_equity_usd": self._peak,
+            "realized_pnl_usd": self._realized_pnl,
+            "n_trades_closed": self._n_trades,
+        }
+
+    def load_state(self, state: dict) -> None:
+        """Restore from a ``state_dict()``. Replaces current/peak/realized
+        and trade count; the snapshot deque keeps only the seed point
+        until new trades fire.
+        """
+        self._current = float(state["current_equity_usd"])
+        self._peak = float(state["peak_equity_usd"])
+        self._realized_pnl = float(state["realized_pnl_usd"])
+        self._n_trades = int(state["n_trades_closed"])
+        # Rewrite the seed snapshot to reflect the restored state so the
+        # `daily_return_pct` "start of day" lookup doesn't return a
+        # stale initial equity.
+        self._snapshots.clear()
+        self._snapshots.append(EquitySnapshot(
+            timestamp=pd.Timestamp.now(tz="UTC"),
+            equity_usd=self._current,
+            realized_pnl_usd=self._realized_pnl,
+            peak_equity_usd=self._peak,
+            drawdown_pct=self.drawdown_pct,
+            n_trades_closed=self._n_trades,
+        ))
+        logger.info(
+            "EquityTracker restored from state: equity=%.2f peak=%.2f "
+            "realized_pnl=%+.2f n_trades=%d",
+            self._current, self._peak, self._realized_pnl, self._n_trades,
+        )

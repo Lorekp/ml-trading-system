@@ -32,9 +32,15 @@ import time
 from collections import deque
 from pathlib import Path
 from statistics import mean as _mean
+from typing import Literal
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
+
+from deribit_paper.client.binance_rest import (
+    BinanceRESTClient,
+    BinanceRESTError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +150,12 @@ class LiveVPINStream:
         fallback_vpin: float = 0.189,
         ws_url: str = _DEFAULT_WS_URL,
         stale_seconds: float = 600.0,
+        # E (parity 2026-05-07) — REST polling fallback for geo-blocked WS.
+        feed_kind: Literal["ws", "rest"] = "ws",
+        symbol: str = "BTCUSDT",
+        binance_rest_url: str = "https://fapi.binance.com",
+        poll_seconds: float = 3.0,
+        rest_client: BinanceRESTClient | None = None,
     ):
         self._acc = _LiveBucketAccumulator(bucket_volume_btc, rolling_window)
         self._fallback = float(fallback_vpin)
@@ -162,6 +174,17 @@ class LiveVPINStream:
         # Binance Futures returning zero messages) reads as "warming up"
         # forever and never trips the operator alert.
         self._stream_start_ts: float = time.time()
+        # E (parity 2026-05-07) — REST polling state.
+        self._feed_kind = feed_kind
+        self._symbol = symbol
+        self._poll_seconds = float(poll_seconds)
+        self._last_agg_trade_id: int | None = None
+        # The REST client is owned by the stream when ``rest_client`` is
+        # not supplied (we connect/close in run_forever). When supplied
+        # (e.g. by tests), the caller is responsible for the lifecycle.
+        self._rest_client: BinanceRESTClient | None = rest_client
+        self._owns_rest_client: bool = rest_client is None
+        self._rest_base_url = binance_rest_url
 
         # Warm-start from serialized state
         if state_path is not None:
@@ -234,6 +257,19 @@ class LiveVPINStream:
         return self._last_update_ts
 
     async def run_forever(self) -> None:
+        """Run the configured feed (WS or REST poll) until ``stop()``.
+
+        E (parity 2026-05-07): branches on ``feed_kind``. Both feeds
+        update the same ``_LiveBucketAccumulator`` and respect the
+        same shutdown signal, so the engine sees identical
+        ``latest_vpin`` / ``is_stale`` / ``is_connected`` semantics.
+        """
+        if self._feed_kind == "rest":
+            await self._run_rest_loop()
+        else:
+            await self._run_ws_loop()
+
+    async def _run_ws_loop(self) -> None:
         """Connect to Binance aggTrade WS with auto-reconnect.
 
         Runs until ``stop()`` is called.  Reconnects with exponential
@@ -276,6 +312,93 @@ class LiveVPINStream:
                     return
                 logger.exception("LiveVPINStream: unexpected error")
                 await asyncio.sleep(5.0)
+
+    async def _run_rest_loop(self) -> None:
+        """Poll ``GET /fapi/v1/aggTrades`` every ``poll_seconds``.
+
+        E (parity 2026-05-07): geo-block fallback for the Futures WS.
+        Uses ``fromId`` pagination so every trade between polls is
+        consumed exactly once (no gaps, no double-count). At ~50
+        trades/s for BTCUSDT futures, the 1000-trade limit covers
+        ~20s of flow — a 3s poll has ample headroom.
+
+        Same accumulator + state as the WS path; only the I/O changes.
+        ``is_connected`` flips True after the first successful poll so
+        the operator-facing heartbeat reflects feed health correctly.
+        """
+        if self._rest_client is None:
+            self._rest_client = BinanceRESTClient(base_url=self._rest_base_url)
+            self._owns_rest_client = True
+        if self._owns_rest_client:
+            await self._rest_client.connect()
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    trades = await self._rest_client.fetch_agg_trades(
+                        self._symbol,
+                        from_id=(
+                            self._last_agg_trade_id + 1
+                            if self._last_agg_trade_id is not None else None
+                        ),
+                    )
+                except (BinanceRESTError, asyncio.CancelledError) as exc:
+                    self._connected = False
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    logger.warning(
+                        "LiveVPINStream REST: fetch failed (%s) — retry on next tick",
+                        exc,
+                    )
+                    trades = []
+                except Exception:
+                    self._connected = False
+                    logger.exception(
+                        "LiveVPINStream REST: unexpected error during poll",
+                    )
+                    trades = []
+
+                if trades:
+                    self._connected = True
+                    self._reconnect_attempts = 0
+                    self._process_rest_page(trades)
+
+                # Sleep with shutdown-awareness
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=self._poll_seconds,
+                    )
+                    return  # shutdown signaled
+                except asyncio.TimeoutError:
+                    pass  # poll interval elapsed
+        finally:
+            if self._owns_rest_client and self._rest_client is not None:
+                await self._rest_client.close()
+                self._rest_client = None
+
+    def _process_rest_page(self, trades: list[dict]) -> None:
+        """Feed a REST aggTrades page through the accumulator.
+
+        Each trade dict has keys ``a`` (aggTradeId), ``q`` (qty),
+        ``m`` (isBuyerMaker — same semantics as WS aggTrade ``m``).
+        Updates ``_last_agg_trade_id`` to the page's max ``a`` so the
+        next poll resumes at ``a + 1``.
+        """
+        max_id = self._last_agg_trade_id
+        for tr in trades:
+            try:
+                quantity = float(tr["q"])
+                is_seller_aggressor = bool(tr["m"])
+                agg_id = int(tr["a"])
+            except (KeyError, ValueError, TypeError):
+                continue  # silently skip malformed rows; defensive parsing
+            with self._lock:
+                self._acc.process_trade(quantity, is_seller_aggressor)
+            self._trades_processed += 1
+            self._last_update_ts = time.time()
+            if max_id is None or agg_id > max_id:
+                max_id = agg_id
+        if max_id is not None:
+            self._last_agg_trade_id = max_id
 
     async def stop(self) -> None:
         """Signal graceful shutdown."""

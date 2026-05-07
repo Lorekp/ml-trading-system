@@ -661,16 +661,27 @@ class TradingEngine:
             logger.warning("DRL manifest check failed (advisory only): %s", exc)
 
         # ── Phase 4b: Live VPIN stream ──
+        # E (parity 2026-05-07): branch on ``cfg.vpin_feed_kind`` so the
+        # operator can pick WS (default for un-blocked IPs) or REST
+        # polling (default — homeserver Sweden ProtonVPN is geo-blocked
+        # from the Futures WS). Both feed kinds use the same
+        # _LiveBucketAccumulator + warm-start state + staleness logic.
         from deribit_paper.features.vpin_live import LiveVPINStream
         if cfg.vpin_state_path:
             self.vpin_stream = LiveVPINStream(
                 state_path=Path(cfg.vpin_state_path),
                 fallback_vpin=cfg.vpin_fallback,
                 ws_url=cfg.binance_ws_url,
+                feed_kind=cfg.vpin_feed_kind,
+                symbol=f"{cfg.currency.upper()}USDT",
+                binance_rest_url=cfg.binance_rest_url,
+                poll_seconds=cfg.vpin_poll_seconds,
             )
             logger.info(
-                "LiveVPINStream ready (warm-start=%s, fallback=%.3f)",
-                cfg.vpin_state_path, cfg.vpin_fallback,
+                "LiveVPINStream ready (kind=%s, warm-start=%s, fallback=%.3f, "
+                "poll=%.1fs)",
+                cfg.vpin_feed_kind, cfg.vpin_state_path, cfg.vpin_fallback,
+                cfg.vpin_poll_seconds,
             )
         else:
             logger.info("LiveVPINStream disabled (vpin_state_path empty)")

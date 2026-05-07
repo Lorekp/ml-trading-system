@@ -188,6 +188,14 @@ class PaperConfig:
     vpin_state_path: str = "vol_arb/output/vpin_streamer_state.json"
     vpin_fallback: float = 0.189          # training-distribution mean
     binance_ws_url: str = ""              # sentinel -> resolved from currency in __post_init__
+    # E (parity 2026-05-07) — VPIN feed kind. Default ``"rest"`` because
+    # the homeserver's Sweden ProtonVPN IP is geo-blocked from
+    # ``wss://fstream.binance.com``; the Futures REST endpoint at
+    # ``https://fapi.binance.com`` IS reachable. Operators with an
+    # un-blocked IP can flip back to ``"ws"`` for lower latency.
+    vpin_feed_kind: str = "rest"          # "ws" | "rest"
+    binance_rest_url: str = "https://fapi.binance.com"
+    vpin_poll_seconds: float = 3.0        # REST poll cadence
 
     # ── Model inference ────────────────────────────────────────────
     # lgbm_models_dir holds the LightGBM ``.txt`` + ``_features.json``

@@ -40,6 +40,7 @@ from deribit_paper.client import DeribitAuth, DeribitRESTClient, DeribitWebSocke
 from deribit_paper.config import PaperConfig
 from deribit_paper.execution import OrderManager, StraddleFlow
 from deribit_paper.execution.idempotency import IdempotencyGuard
+from deribit_paper.execution.pnl_decomp import decompose_gross_pnl
 from deribit_paper.execution.profit_scale import (
     ProfitScaleEstimator,
     bsm_vega_per_vol_pt,
@@ -2065,30 +2066,26 @@ class TradingEngine:
             self.equity_tracker.on_trade_closed(realized_pnl_usd)
             self.kill_switch.on_trade_result(success=True)
 
-            # Profit-scale EMA update (V2 wiring, E.1.1; D5/D13 parity 2026-05-07).
-            # V2 backtester at vol_arb/backtester.py:2225-2233 feeds GROSS
-            # per-BTC PnL: ``vega_pnl_btc + theta_pnl_btc + delta_pnl_btc``
-            # — the BS-decomposition pre-fees breakdown of what the
-            # straddle + delta-hedge produced. The live equivalent is
-            # ``option_pnl_usd + hedge_pnl_usd`` (option premium PnL +
-            # delta-hedge realized PnL, both pre-fees) because:
+            # Profit-scale EMA update (V2 wiring, E.1.1; E4 parity-cycle round 2 2026-05-07).
+            # V2 backtester at ``vol_arb/backtester.py:2303-2305`` feeds the
+            # estimator the BS-decomposition GROSS per-BTC:
+            #     ``vega_pnl_btc + theta_pnl_btc + delta_pnl_btc``
+            # which is PRE-slippage and PRE-adverse-selection. ``ProfitScaleEstimator``
+            # SEPARATELY estimates those costs in ``est_costs`` (full_slip +
+            # hedge + option_fee), so feeding actual realized fills
+            # double-subtracts those costs and biases the EMA below the V2
+            # reference, pushing ``profit_scale`` toward its floor over time.
             #
-            #   * option_pnl_usd captures vega + theta + un-hedged delta
-            #     (it's the premium-difference PnL, mark-to-market);
-            #   * hedge_pnl_usd captures the realized delta-hedge
-            #     adjustment;
-            #   * their SUM equals V2's vega+theta+delta gross (the
-            #     un-hedged delta in option_pnl is offset by the hedge
-            #     side, leaving vega+theta+net-delta = gross).
+            # Pre-E4 the live engine passed ``option_pnl_usd + hedge_pnl_usd``
+            # — the actual fill-difference, which silently includes
+            # slippage + adverse-selection. ``decompose_gross_pnl`` now
+            # mirrors V2's BS Greeks shape: vega from BS vega × dIV (entry IV
+            # → exit IV from the live SVI calibrator), theta from BS theta ×
+            # dt_days, delta from realized perp MTM (the live analog of
+            # V2's ``simulate(...)`` delta_pnl).
             #
-            # Pre-D5 the live engine passed ``realized_pnl_usd`` (NET,
-            # post option+hedge fees) and the engine's own comment at
-            # this site flagged it as a deferred refactor. Live EMA was
-            # systematically below V2's because of the fee subtraction,
-            # biasing profit_scale toward the floor over time.
-            #
-            # Hedge cost (fees-on-perp-volume) is reported separately
-            # for the estimator's audit trail; slippage is tracked by
+            # Hedge cost (fees-on-perp-volume) is reported separately for
+            # the estimator's audit trail; slippage is tracked by
             # exec_cost_ema, not folded in here.
             if self._profit_scale_estimator is not None:
                 hedge_cost_usd = 0.0
@@ -2106,7 +2103,62 @@ class TradingEngine:
                     hedge_cost_usd = (
                         _cost_rate * total_usd_traded
                     )
-                gross_pnl_usd = option_pnl_usd + hedge_pnl_usd  # D5 (GROSS, pre-fees)
+                # E4 (2026-05-07): exit IV from the live SVI calibrator at
+                # trade-close time. ``NaN`` falls through to the helper
+                # which treats it as zero vega contribution (degraded mode).
+                exit_iv_decimal = self._fetch_exit_iv_decimal(outcome)
+                entry_iv_decimal = (
+                    float(outcome.signal.iv_used_pct) / 100.0
+                    if (outcome.signal.iv_used_pct is not None
+                        and math.isfinite(outcome.signal.iv_used_pct))
+                    else float("nan")
+                )
+                # Tau at entry: years between entry-time and expiry.
+                tau_entry_years: float = float("nan")
+                if (
+                    outcome.signal.straddle is not None
+                    and outcome.started_at is not None
+                ):
+                    tau_entry_years = max(
+                        (
+                            outcome.signal.straddle.expiry_dt
+                            - outcome.started_at
+                        ).total_seconds() / (365.25 * 24 * 3600),
+                        0.0,
+                    )
+                holding_dt_days = 0.0
+                if outcome.started_at is not None and outcome.ended_at is not None:
+                    holding_dt_days = max(
+                        (outcome.ended_at - outcome.started_at).total_seconds()
+                        / 86_400.0,
+                        0.0,
+                    )
+                if (
+                    math.isfinite(entry_iv_decimal)
+                    and math.isfinite(tau_entry_years)
+                    and tau_entry_years > 0.0
+                ):
+                    decomp = decompose_gross_pnl(
+                        signal_direction=int(outcome.signal.direction),
+                        entry_index_price=index,
+                        strike=float(outcome.signal.straddle.strike),
+                        entry_iv_decimal=entry_iv_decimal,
+                        exit_iv_decimal=exit_iv_decimal,
+                        entry_tau_years=tau_entry_years,
+                        holding_dt_days=holding_dt_days,
+                        n_btc=float(outcome.n_contracts_btc),
+                        realized_hedge_pnl_usd=hedge_pnl_usd,
+                    )
+                    gross_pnl_usd = decomp.total_usd
+                else:
+                    # Degraded path: missing IV / tau → fall back to actual
+                    # realized (matches pre-E4 behaviour but logs once).
+                    logger.warning(
+                        "E4: gross-PnL decomposition skipped (entry_iv=%s "
+                        "tau=%s); falling back to realized fill-difference",
+                        entry_iv_decimal, tau_entry_years,
+                    )
+                    gross_pnl_usd = option_pnl_usd + hedge_pnl_usd
                 self._profit_scale_estimator.update_realized(
                     gross_pnl_usd=gross_pnl_usd,
                     hedge_cost_usd=hedge_cost_usd,
@@ -2264,6 +2316,46 @@ class TradingEngine:
             index_name=f"{self.config.currency.lower()}_usd",
         )
         return float(info.get("index_price", 0.0) or 0.0)
+
+    def _fetch_exit_iv_decimal(self, outcome) -> float:
+        """E4 (2026-05-07): pull the SVI ATM IV at the trade's strike,
+        evaluated at trade-close time, and return as decimal (e.g. 0.75).
+
+        Returns ``NaN`` when:
+        - the calibrator is uncalibrated (warmup), or
+        - the trade has no straddle context, or
+        - the SVI surface lookup returns NaN / non-finite.
+
+        ``NaN`` is the safe degraded mode for ``decompose_gross_pnl`` —
+        the helper drops the vega leg when dIV is unavailable, leaving
+        theta + delta as the gross prior.
+        """
+        try:
+            if (
+                self.svi_calibrator is None
+                or not self.svi_calibrator.has_params
+                or outcome.signal is None
+                or outcome.signal.straddle is None
+                or outcome.ended_at is None
+            ):
+                return float("nan")
+            straddle = outcome.signal.straddle
+            query = pd.DataFrame({
+                "timestamp": [outcome.ended_at],
+                "strike": [float(straddle.strike)],
+                "expiry_dt": [pd.Timestamp(straddle.expiry_dt)],
+                "index_price": [float(straddle.index_price)],
+            })
+            result = self.svi_calibrator.evaluate(query)
+            if result is None or result.empty:
+                return float("nan")
+            iv_pct = float(result.iloc[0])
+            if not math.isfinite(iv_pct) or iv_pct <= 0.0:
+                return float("nan")
+            return iv_pct / 100.0
+        except Exception:
+            logger.debug("E4 exit-IV lookup failed", exc_info=True)
+            return float("nan")
 
     # ── Position lifecycle callbacks ─────────────────────────────────
 

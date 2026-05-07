@@ -1785,6 +1785,23 @@ class TradingEngine:
                     self.rnd_monitor._baseline_tail_prob() or 0.0,
                 )
                 n_contracts *= rnd_scale
+        # D7 (parity 2026-05-07): once n_contracts is finalised, refresh
+        # the IOC-cap pct using the V2 impact formula
+        # (``2 * sidecar * sqrt(N) * exp(k * jf)``, capped at
+        # ``ioc_cap_multiplier * sidecar``). The earlier call at L1708
+        # was a pre-sizing estimate (no N) that would request a static
+        # cap; this re-call sizes the cap to the actual trade.
+        if n_contracts > 0.0:
+            taker_slippage_pct = live_slippage_pct(
+                slip_usd_per_btc=slip_usd,
+                spot=index_price,
+                observed_spread_usd=None,
+                fallback_pct=self.config.max_slippage_pct,
+                n_btc=n_contracts,
+                jump_fraction=float(bar_tsrv.jump_fraction or 0.0),
+                spread_jump_k=self.config.spread_jump_k,
+                # ioc_cap_multiplier defaults to 2.0 (V2 default).
+            )
         risk_check = self.risk_limits.check_signal(
             signal=signal,
             proposed_n_contracts_btc=n_contracts,
@@ -1964,16 +1981,31 @@ class TradingEngine:
             self.equity_tracker.on_trade_closed(realized_pnl_usd)
             self.kill_switch.on_trade_result(success=True)
 
-            # Profit-scale EMA update (V2 wiring, E.1.1).
-            # Treat ``realized_pnl_usd`` as the gross-pre-fees proxy for now;
-            # E.1.10 will refactor this to subtract hedge PnL + fees so the
-            # estimator's "gross" matches the backtester's vega+theta+delta
-            # decomposition. Until then, the EMA tracks the closest live
-            # analog to gross PnL we have access to.
+            # Profit-scale EMA update (V2 wiring, E.1.1; D5/D13 parity 2026-05-07).
+            # V2 backtester at vol_arb/backtester.py:2225-2233 feeds GROSS
+            # per-BTC PnL: ``vega_pnl_btc + theta_pnl_btc + delta_pnl_btc``
+            # — the BS-decomposition pre-fees breakdown of what the
+            # straddle + delta-hedge produced. The live equivalent is
+            # ``option_pnl_usd + hedge_pnl_usd`` (option premium PnL +
+            # delta-hedge realized PnL, both pre-fees) because:
             #
-            # Hedge cost is the fee on total perp volume traded
-            # (HedgeRunSummary.total_usd_traded); slip is small relative
-            # to fees on a perp and tracked separately by exec_cost_ema.
+            #   * option_pnl_usd captures vega + theta + un-hedged delta
+            #     (it's the premium-difference PnL, mark-to-market);
+            #   * hedge_pnl_usd captures the realized delta-hedge
+            #     adjustment;
+            #   * their SUM equals V2's vega+theta+delta gross (the
+            #     un-hedged delta in option_pnl is offset by the hedge
+            #     side, leaving vega+theta+net-delta = gross).
+            #
+            # Pre-D5 the live engine passed ``realized_pnl_usd`` (NET,
+            # post option+hedge fees) and the engine's own comment at
+            # this site flagged it as a deferred refactor. Live EMA was
+            # systematically below V2's because of the fee subtraction,
+            # biasing profit_scale toward the floor over time.
+            #
+            # Hedge cost (fees-on-perp-volume) is reported separately
+            # for the estimator's audit trail; slippage is tracked by
+            # exec_cost_ema, not folded in here.
             if self._profit_scale_estimator is not None:
                 hedge_cost_usd = 0.0
                 if outcome.hedge_summary is not None:
@@ -1983,8 +2015,9 @@ class TradingEngine:
                     hedge_cost_usd = (
                         self.config.perp_taker_fee * total_usd_traded
                     )
+                gross_pnl_usd = option_pnl_usd + hedge_pnl_usd  # D5 (GROSS, pre-fees)
                 self._profit_scale_estimator.update_realized(
-                    gross_pnl_usd=realized_pnl_usd,
+                    gross_pnl_usd=gross_pnl_usd,
                     hedge_cost_usd=hedge_cost_usd,
                     n_btc=outcome.n_contracts_btc,
                 )

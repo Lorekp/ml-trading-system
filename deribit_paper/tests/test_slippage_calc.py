@@ -117,3 +117,81 @@ def test_nan_spot_returns_fallback():
         slip_usd_per_btc=10.0, spot=float("nan"), fallback_pct=0.42,
     )
     assert pct == 0.42
+
+
+# ── D7 (parity 2026-05-07): V2 size + jump-stress impact formula ──────────
+
+
+def test_v2_impact_formula_size_only():
+    """With ``n_btc=1.0`` and ``jump_fraction=0``, the V2 formula gives
+    ``min(2 * sidecar * sqrt(max(N, 0.1)) * exp(0), 2 * sidecar)``
+    = ``min(2*10*1.0, 2*10)`` = 20 USD/BTC → 20/60_000 = 0.0333%.
+    Without n_btc/jf the legacy path returns 10/60_000 = 0.0167%.
+    """
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=60_000.0,
+        n_btc=1.0, jump_fraction=0.0,
+        ioc_cap_multiplier=2.0,
+    )
+    # 2 * 10 * 1 * exp(0) = 20; cap = 2*10=20; min=20. pct = 100*20/60K = 0.0333.
+    assert pct == pytest.approx(0.0333, abs=1e-3)
+
+
+def test_v2_impact_formula_size_plus_jump_stress():
+    """With ``jump_fraction=0.1`` and k=3, the exp factor = exp(0.3) ≈ 1.35.
+    Effective slip = min(2*10*1*1.35, 2*10) = min(27, 20) = 20 (capped).
+    """
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=60_000.0,
+        n_btc=1.0, jump_fraction=0.1,
+        spread_jump_k=3.0, ioc_cap_multiplier=2.0,
+    )
+    # With cap=2x sidecar, hits the ceiling at 20 → 0.0333%.
+    assert pct == pytest.approx(0.0333, abs=1e-3)
+
+
+def test_v2_impact_formula_size_dominates_when_n_large():
+    """N=4, jf=0 → sqrt(4)=2 → 2*10*2*1 = 40, capped at 2*10=20 → 20."""
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=60_000.0,
+        n_btc=4.0, jump_fraction=0.0,
+        ioc_cap_multiplier=2.0,
+    )
+    assert pct == pytest.approx(0.0333, abs=1e-3)
+
+
+def test_v2_impact_formula_higher_cap_multiplier():
+    """``ioc_cap_multiplier=10`` lets the size impact bind below the cap.
+    N=4, jf=0 → 2*10*2 = 40, cap = 100, return 40 → 100*40/60_000 = 0.0667.
+    """
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=60_000.0,
+        n_btc=4.0, jump_fraction=0.0,
+        ioc_cap_multiplier=10.0,
+    )
+    assert pct == pytest.approx(0.0667, abs=1e-3)
+
+
+def test_v2_impact_formula_floor_on_tiny_n():
+    """N=0.01 floors at sqrt(0.1) (V2 lower bound on size mult)."""
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=60_000.0,
+        n_btc=0.01, jump_fraction=0.0,
+        ioc_cap_multiplier=10.0,
+    )
+    # max(0.01, 0.1) = 0.1; sqrt(0.1) ≈ 0.316; 2 * 10 * 0.316 = 6.32
+    # capped at 10*10=100, return 6.32 → 100*6.32/60K ≈ 0.0105
+    assert pct == pytest.approx(0.01054, abs=1e-3)
+
+
+def test_v2_impact_formula_only_when_both_args():
+    """If ``n_btc`` is given but ``jump_fraction`` is None, fall back to
+    the legacy bare-sidecar path. Locks the contract that BOTH must be
+    supplied for the V2 formula to engage."""
+    pct = live_slippage_pct(
+        slip_usd_per_btc=10.0, spot=60_000.0,
+        n_btc=4.0, jump_fraction=None,
+    )
+    # Legacy: 100 * 10 / 60K = 0.0167%
+    assert pct == pytest.approx(0.01667, abs=1e-3)
+

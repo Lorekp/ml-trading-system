@@ -506,10 +506,37 @@ class StraddleFlow:
             hedger.run(trade_id, entry_time=started_at),
         )
 
-        # ── 4. Wait holding period ─────────────────────────────────
+        # ── 4. Wait holding period (D12 parity 2026-05-07) ─────────
+        # V2 backtester exits at bar-boundary (loop counter ``i +
+        # holding_bars``); pre-D12 the live engine sleeped the
+        # wall-clock holding duration from the entry time. With
+        # ``holding_minutes == bar_minutes`` (V2 preset 15/15) the two
+        # are equivalent within ≤1s of execution latency, but for
+        # non-V2 horizons or under entry latency >1s they drift.
+        #
+        # Fix: compute target exit = ``started_at + holding_minutes``
+        # then round UP to the next bar-boundary that is ≥ target.
+        # ``bar_minutes == holding_minutes`` here (the StraddleFlow
+        # constructor passes ``bar_minutes=self._holding_minutes`` to
+        # the PerpHedger above, so for V2 this is bar-aligned).
         holding_seconds = self._holding_minutes * 60.0
+        target_exit = started_at + pd.Timedelta(seconds=holding_seconds)
+        # Round UP to the next bar boundary. ``bar_seconds == 0`` (test
+        # configurations with holding_minutes=0) skips the alignment.
+        bar_seconds = int(self._holding_minutes * 60)
+        if bar_seconds > 0:
+            epoch_seconds = int(target_exit.timestamp())
+            remainder = epoch_seconds % bar_seconds
+            if remainder != 0:
+                target_exit = target_exit + pd.Timedelta(
+                    seconds=(bar_seconds - remainder),
+                )
+        sleep_seconds = max(
+            0.0,
+            (target_exit - pd.Timestamp.now(tz="UTC")).total_seconds(),
+        )
         try:
-            await asyncio.sleep(holding_seconds)
+            await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
             # M2: On cancellation (shutdown/kill switch), close straddle legs
             # before re-raising to avoid leaving naked positions.

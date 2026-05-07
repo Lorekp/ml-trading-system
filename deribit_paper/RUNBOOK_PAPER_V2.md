@@ -211,6 +211,26 @@ if testnet fills sparse):
 If any of these fire, capture the last 200 lines of the JSON log and
 the SQLite `kill_switch_state` table before restarting.
 
+## Intended divergences from V2 backtester (D11, D12)
+
+The V2-parity cycle (2026-05-07) closed 12 of 13 audited divergences.
+Two are kept as **intended** divergences for documented reasons:
+
+* **D11 — Bar-volume guard (`min_perp_trades_per_bar=5`,
+  `max_consecutive_empty_bars=3`).** Live engine skips signal
+  generation on empty / low-volume bars (`engine.py:1440-1468`); the
+  V2 backtester reads pre-cleaned features and has no equivalent.
+  The live guard is a defence-in-depth layer against venue outages;
+  removing it would weaken live resilience without improving parity.
+  The Telegram heartbeat reports `n_muted_bars_24h` so the divergence
+  is observable.
+* **D12 — Bar-aligned exit.** The live engine waits until the
+  next-bar-boundary that is ≥ `entry_time + holding_minutes` before
+  closing. Under V2 preset (`holding_minutes==bar_minutes==15`) this
+  matches the V2 backtester's loop-counter exit within ≤1 bar; for
+  non-V2 presets the bar-aligned semantics are the live-only
+  improvement.
+
 ## Out of scope (for this run)
 
 * Mainnet bring-up (separate cycle).

@@ -83,6 +83,12 @@ class PaperConfig:
     # ``None`` disables the filter (legacy live default). The V2 preset
     # sets this to 0.0 to match the backtest contract.
     skip_long_if_term_slope_gt: float | None = None
+    # D2 (parity 2026-05-07): mute LONG (+1) signals at these UTC hours.
+    # Mirrors ``BacktestConfig.skip_long_hours_utc``. The V2 production
+    # backtest uses ``(14, 15, 16)`` to drop US-cash-open longs that fade
+    # 4/5 historical years. Empty tuple disables (default; preserves the
+    # legacy live behaviour for non-V2 presets).
+    skip_long_hours_utc: tuple[int, ...] = ()
     option_maker_fee: float = 0.0003    # Deribit: 0.03% of underlying (same maker & taker)
     perp_taker_fee: float = 0.0005     # Deribit: 0.05% taker (maker gets -0.01% rebate)
     perp_slippage_bps: float = 2.0
@@ -118,6 +124,13 @@ class PaperConfig:
     short_sizing_penalty: float = 0.50
     baseline_target_dvol: float = 50.0
     max_jump_fraction_for_shorts: float = 0.15
+    # D6 (parity 2026-05-07): RND tail-risk size scaling has no V2
+    # backtester counterpart. Default OFF so V2 preset matches the
+    # backtest contract; opt-in for live operators who want the
+    # additional defence-in-depth (memory: project_rnd_monitor_validated
+    # — historical halt rate ~0%, but the size-scaling path can shrink
+    # positions on real tail-risk events).
+    use_rnd_scaling: bool = False
 
     # ── Execution ──────────────────────────────────────────────────
     maker_wait_seconds: int = 60              # wait this long for maker fill before falling back to taker
@@ -375,13 +388,17 @@ class PaperConfig:
     def with_v2_preset(cls, base: "PaperConfig | None" = None) -> "PaperConfig":
         """Return a config aligned with ``BacktestConfig.with_btc_production_filters_v2()``.
 
-        Eight invariants flipped or set:
+        Invariants flipped or set:
 
-        * ``entry_threshold_long``: 30.0 → 12.0 (contango filter compensates).
+        * ``entry_threshold`` / ``entry_threshold_long``: V1/V2 thresholds.
         * ``skip_long_if_term_slope_gt``: None → 0.0 (drop longs in IV contango).
+        * ``skip_long_hours_utc``: () → (14, 15, 16) — D2 (2026-05-07).
+        * ``dte_min_days``: 1 → 5 — D1 (2026-05-07).
         * ``target_margin_utilization``: 0.05 → 0.15 (3x leverage closer to backtest).
         * ``use_profit_scaling``: False → True (conviction-weighted sizing).
         * ``profit_scaling_floor``: stays 0.3 (matches BacktestConfig V2).
+        * ``max_single_trade_btc``: 2.0 → 0.0 (= disabled per V2) — D10 (2026-05-07).
+        * ``use_rnd_scaling``: stays False (V2 has no RND monitor) — D6 (2026-05-07).
         * ``aligned_predictions_parquet`` → production aligner parquet.
         * ``aligner_betas_json`` → derived per-month β* JSON path.
         * ``kelly_mult_path`` → V2 Kelly K1 sidecar.
@@ -402,9 +419,27 @@ class PaperConfig:
         cfg.entry_threshold = 22.0  # V1 production stack short threshold
         cfg.entry_threshold_long = 12.0
         cfg.skip_long_if_term_slope_gt = 0.0
+        # D2 (parity 2026-05-07): mute longs at US cash-open hours. The V2
+        # backtest applies this in ``_apply_entry_filters``; the live
+        # predictor mirrors the same shape after the contango filter.
+        cfg.skip_long_hours_utc = (14, 15, 16)
+        # D1 (parity 2026-05-07): live default of 1 lets the engine trade
+        # the 1-4 DTE band the V2 backtester deliberately skips
+        # (theta-decay-dominated, fee-vs-vega ratio is poor).
+        cfg.dte_min_days = 5
         cfg.target_margin_utilization = 0.15
         cfg.use_profit_scaling = True
         cfg.profit_scaling_floor = 0.3
+        # D10 (parity 2026-05-07): V2 backtester has no per-trade BTC cap
+        # (``BacktestConfig.max_position_btc=0.0``). The live default 2.0
+        # was a defence-in-depth knob; under V2 we disable it (``0.0``)
+        # so dynamic_btc_cap is the only ceiling. The cap is still
+        # honoured under non-V2 presets where the field stays at 2.0.
+        cfg.max_single_trade_btc = 0.0
+        # D6 (parity 2026-05-07): no RND monitor in V2 backtester. Stays
+        # False under the V2 preset; opt-in for non-V2 live deployments
+        # via ``cfg.use_rnd_scaling = True``.
+        cfg.use_rnd_scaling = False
         cfg.aligned_predictions_parquet = (
             "vol_model/output/"
             "BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"

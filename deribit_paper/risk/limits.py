@@ -124,7 +124,15 @@ class RiskLimits:
                 False,
                 f"trade_size {proposed_n_contracts_btc:.3f} < min {self.min_single_trade_btc:.3f}",
             )
-        if proposed_n_contracts_btc > self.max_single_trade_btc:
+        # D10 (parity 2026-05-07): ``max_single_trade_btc <= 0`` disables
+        # the per-trade size cap (mirrors ``BacktestConfig.max_position_btc=0.0``
+        # convention). Default 2.0 still applies under non-V2 presets;
+        # the V2 preset sets this to 0.0 because dynamic_btc_cap is the
+        # V2 backtester's only ceiling.
+        if (
+            self.max_single_trade_btc > 0.0
+            and proposed_n_contracts_btc > self.max_single_trade_btc
+        ):
             return RiskCheck(
                 False,
                 f"trade_size {proposed_n_contracts_btc:.3f} > max {self.max_single_trade_btc:.3f}",

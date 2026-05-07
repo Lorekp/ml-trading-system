@@ -246,8 +246,14 @@ class StraddleFlow:
             n *= kelly_mult
             n = min(n, dynamic_btc_cap)
 
-        # Hard cap (static — final risk envelope)
-        n = min(n, self._max_trade_size)
+        # Hard cap (static — final risk envelope).
+        # D10 (parity 2026-05-07): ``_max_trade_size <= 0`` disables the
+        # cap. The V2 backtester has no per-trade hard cap (uses
+        # ``dynamic_btc_cap`` only); the V2 preset wires through 0.0
+        # so the only ceiling is the participation cap. Non-V2 presets
+        # keep the legacy 2 BTC default.
+        if self._max_trade_size > 0.0:
+            n = min(n, self._max_trade_size)
 
         # Quantise to option increment
         n_rounded = option_amount_btc(n)

@@ -69,6 +69,25 @@ def load_kelly_mult(
     with ``fallback``, and clips to ``[floor, cap]``. Mirrors the backtester
     contract at lines 1850-1878.
 
+    D8 (parity 2026-05-07): tested switching to ``method='ffill'`` for
+    parity with the live engine's ``lookup_kelly_mult_at`` walk-forward
+    contract (E.1.5). Result: V2 byte-identity NC PnL drifts +$64,803
+    (+6.75%) because ffill picks up Kelly>1 multipliers on bars where
+    target_index doesn't exact-match the sidecar. The V2 canon
+    ($959,571.07 / 7,417 trades) is fixed under exact-match semantics —
+    so we keep exact-match here and accept the divergence as designed:
+
+    - **Backtester**: exact-match because bar timestamps are canonical by
+      construction (generated from `pd.date_range`); the V2 sidecar was
+      fit on those same canonical timestamps.
+    - **Live engine**: walk-forward (``lookup_kelly_mult_at``) because
+      live bar timestamps may drift slightly from canonical sidecar keys
+      (clock drift, missed bar). Both are correct in their domain.
+
+    On canonical streams (V2 reference case) the two produce identical
+    multipliers; they only diverge when the live engine's bar clock
+    drifts, in which case walk-forward is the safer behaviour.
+
     Returns ``None`` (no-op) when ``path`` is ``None`` or the file does not
     exist — the live engine and backtester both interpret this as
     "Kelly disabled, multiplier ≡ 1.0 everywhere".

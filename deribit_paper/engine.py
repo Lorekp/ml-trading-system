@@ -573,6 +573,8 @@ class TradingEngine:
             spread_jump_k=cfg.spread_jump_k,
             max_jump_fraction_for_shorts=cfg.max_jump_fraction_for_shorts,
             skip_long_if_term_slope_gt=cfg.skip_long_if_term_slope_gt,
+            # D2 (parity 2026-05-07): mirror V2 backtester long-hour filter.
+            skip_long_hours_utc=cfg.skip_long_hours_utc,
             aligner_betas=aligner_betas,
             # E.1.14: V2 preset configures the aligner sidecar; an empty
             # dict here means the configuration failed silently. Fail
@@ -865,7 +867,22 @@ class TradingEngine:
         # threshold. The monitor is fed at each bar close from the
         # LiveSVICalibrator's cached params, and checked before every
         # signal decision alongside the kill switch.
-        self.rnd_monitor = RNDMonitor(config=RNDConfig(bar_minutes=cfg.bar_minutes))
+        #
+        # D6 (parity 2026-05-07): V2 backtester has no RND counterpart.
+        # Gated behind ``cfg.use_rnd_scaling`` (default False, V2 preset
+        # leaves False) so V2-preset live behaviour matches the backtest.
+        # Operators wanting tail-risk scaling can opt in via
+        # ``cfg.use_rnd_scaling = True``.
+        if cfg.use_rnd_scaling:
+            self.rnd_monitor = RNDMonitor(
+                config=RNDConfig(bar_minutes=cfg.bar_minutes),
+            )
+        else:
+            logger.info(
+                "RND tail-risk monitor disabled (cfg.use_rnd_scaling=False) "
+                "— matches V2 backtester contract",
+            )
+            self.rnd_monitor = None
 
         # ── Startup position reconciliation (C1) ──
         # Query exchange for any open positions left by a previous crash/restart.

@@ -96,6 +96,41 @@ def test_bar_exec_quality_path_set(v2_paper):
     )
 
 
+# ── Parity-cycle 2026-05-07: D1, D2, D6, D10 invariants ────────────────────
+
+def test_dte_min_days_is_5(v2_paper):
+    """D1 (parity 2026-05-07): V2 backtester ``min_dte_days=5.0``;
+    live default of 1 lets the engine trade the 1-4 DTE band the
+    backtester deliberately mutes (theta-decay-dominated).
+    """
+    assert v2_paper.dte_min_days == 5
+
+
+def test_skip_long_hours_utc_is_us_cash_open(v2_paper):
+    """D2 (parity 2026-05-07): V2 backtester mutes longs at US
+    cash-open hours (14, 15, 16) UTC — the largest single dollar-impact
+    parity divergence per the audit.
+    """
+    assert v2_paper.skip_long_hours_utc == (14, 15, 16)
+
+
+def test_use_rnd_scaling_false_under_v2(v2_paper):
+    """D6 (parity 2026-05-07): V2 backtester has no RND counterpart;
+    the live RNDMonitor is gated behind ``use_rnd_scaling``, default
+    ``False`` and stays False under V2 preset.
+    """
+    assert v2_paper.use_rnd_scaling is False
+
+
+def test_max_single_trade_btc_disabled_under_v2(v2_paper):
+    """D10 (parity 2026-05-07): V2 backtester ``max_position_btc=0.0``
+    (= no per-trade hard cap, dynamic_btc_cap is the only ceiling).
+    The V2 preset wires this through as 0.0 so RiskLimits and
+    StraddleFlow both skip the static cap.
+    """
+    assert v2_paper.max_single_trade_btc == 0.0
+
+
 def test_use_drl_hedging_implicit_via_engine(v2_paper):
     """SAC v4 hedging is always-on in the engine path; no flag needed.
 
@@ -120,6 +155,12 @@ def test_default_preset_keeps_legacy_thresholds(default_paper):
     assert default_paper.kelly_mult_path == ""
     assert default_paper.aligner_betas_json == ""
     assert default_paper.bar_exec_quality_path == ""
+    # D1, D2, D6, D10 (parity 2026-05-07): default preset preserves
+    # legacy live behaviour. Only the V2 preset flips these.
+    assert default_paper.dte_min_days == 1
+    assert default_paper.skip_long_hours_utc == ()
+    assert default_paper.use_rnd_scaling is False
+    assert default_paper.max_single_trade_btc == 2.0
 
 
 # ── Authoritative cross-check ──────────────────────────────────────────────
@@ -140,6 +181,13 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
         ("entry_threshold",              "entry_threshold"),
         ("holding_minutes",              "holding_minutes"),
         ("kelly_mult_path",              "kelly_mult_path"),
+        # Parity-cycle 2026-05-07 (D2, D10): align long-hour mute and
+        # per-trade size cap with V2 backtester. ``dte_min_days`` (D1)
+        # has type int on PaperConfig and float on BacktestConfig
+        # (``min_dte_days``); checked separately below to compare numeric
+        # values without tripping the ``==`` type check on tuple types.
+        ("skip_long_hours_utc",          "skip_long_hours_utc"),
+        ("max_single_trade_btc",         "max_position_btc"),
     ]
     for live_field, backtest_field in shared_invariants:
         live_val = getattr(v2_paper, live_field)
@@ -149,6 +197,13 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
             f"V2 invariant drift: PaperConfig.{live_field}={live_val!r} "
             f"!= BacktestConfig.{backtest_field}={bt_val!r}"
         )
+    # D1 (parity 2026-05-07): live ``dte_min_days`` int vs backtester
+    # ``min_dte_days`` float — compare numerically.
+    assert float(v2_paper.dte_min_days) == float(v2_backtest.min_dte_days), (
+        f"V2 invariant drift: PaperConfig.dte_min_days="
+        f"{v2_paper.dte_min_days!r} != BacktestConfig.min_dte_days="
+        f"{v2_backtest.min_dte_days!r}"
+    )
 
 
 def test_v2_preset_predictions_path_matches_backtest_default(v2_paper, v2_backtest):

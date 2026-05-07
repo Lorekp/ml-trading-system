@@ -87,6 +87,7 @@ class Predictor:
         spread_jump_k: float = 3.0,
         max_jump_fraction_for_shorts: float = 0.15,
         skip_long_if_term_slope_gt: float | None = None,
+        skip_long_hours_utc: tuple[int, ...] | frozenset[int] = (),
         aligner_betas: dict[str, float] | None = None,
         require_aligner: bool = False,
         log_every_bar: bool = False,
@@ -100,6 +101,13 @@ class Predictor:
         self._spread_jump_k = spread_jump_k
         self._max_jump_fraction_for_shorts = max_jump_fraction_for_shorts
         self._skip_long_if_term_slope_gt = skip_long_if_term_slope_gt
+        # D2 (parity 2026-05-07): UTC hours where LONG signals are muted.
+        # Mirrors V2 backtester ``_apply_entry_filters`` (long-only filter,
+        # shorts at the same hours actually outperform historically).
+        # Stored as ``frozenset[int]`` for O(1) membership tests.
+        self._skip_long_hours: frozenset[int] = frozenset(
+            int(h) for h in skip_long_hours_utc
+        )
         self._aligner_betas: dict[str, float] = dict(aligner_betas or {})
         self._log_every_bar = log_every_bar
         # E.1.14 (2026-05-01): under V2 preset, an empty aligner_betas
@@ -232,6 +240,23 @@ class Predictor:
                     reason = (
                         f"FLAT (V2 contango filter) — term_slope_1w_2w "
                         f"{term_slope:+.3f} > {self._skip_long_if_term_slope_gt:.2f}; "
+                        f"LONG candidate edge={edge:+.3f}vp suppressed"
+                    )
+            # D2 (parity 2026-05-07): drop LONG signals at US-cash-open
+            # hours. Mirrors ``BacktestConfig.skip_long_hours_utc`` muting
+            # in ``backtester._apply_entry_filters``. Long-only filter
+            # (shorts at the same hours outperform). Cheap O(1) check; if
+            # the contango filter already flipped to FLAT we just leave
+            # it FLAT — guarded by ``direction == 1``. ``bar.timestamp``
+            # is END-stamped UTC by the BarAggregator contract, so
+            # ``.hour`` is the UTC hour without any conversion.
+            if direction == 1 and self._skip_long_hours:
+                bar_hour = int(bar.timestamp.hour)
+                if bar_hour in self._skip_long_hours:
+                    direction = 0
+                    reason = (
+                        f"FLAT (V2 hour filter) — bar hour {bar_hour:02d}:00 UTC "
+                        f"in skip_long_hours_utc={sorted(self._skip_long_hours)}; "
                         f"LONG candidate edge={edge:+.3f}vp suppressed"
                     )
         elif edge < -effective_short:

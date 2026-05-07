@@ -194,7 +194,12 @@ class RNDMonitor:
     Thread safety: single-threaded asyncio. No locks.
     """
 
-    def __init__(self, config: RNDConfig | None = None):
+    def __init__(
+        self,
+        config: RNDConfig | None = None,
+        *,
+        started_at: pd.Timestamp | None = None,
+    ):
         self.config = config or RNDConfig()
         # Deque sized to the LONGER of the two baseline windows so that
         # ``_baseline_tail_prob`` can compute both medians from a single
@@ -206,6 +211,27 @@ class RNDMonitor:
         self._history: deque[RNDSnapshot] = deque(maxlen=history_len)
         self._latest: RNDSnapshot | None = None
         self._halt_reason: str | None = None
+        # Bug fix P1-3 (2026-05-07): track construction time so
+        # ``size_scale`` can degrade to ``size_min`` when ``_latest``
+        # stays None for too long. Pre-fix returned 1.0 (full size)
+        # forever when ``update()`` was never called successfully —
+        # e.g. SVI never calibrates (broken option_buffer), or every
+        # update raises and the surrounding try/except in
+        # engine.process_bar swallows it. The defensive direction is
+        # ``size_min``, not ``1.0``: when the tail-risk monitor is
+        # broken, we'd rather size down than full size blind. Same
+        # silent-failure family as the VPIN bug.
+        self._started_at: pd.Timestamp = (
+            started_at if started_at is not None
+            else pd.Timestamp.now(tz="UTC")
+        )
+        # Grace period before declaring "broken": same order as the
+        # baseline_warmup_bars expressed in time. Default 1 day to
+        # match the legitimate warmup window — a fresh engine has
+        # time to receive the first SVI calibration before this trips.
+        self._broken_grace_seconds: float = (
+            self.config.baseline_warmup_bars * self.config.bar_minutes * 60.0
+        )
 
     @property
     def latest(self) -> RNDSnapshot | None:
@@ -252,7 +278,21 @@ class RNDMonitor:
         """Return True if the RND tail probability exceeds the halt threshold."""
         return self._halt_reason is not None
 
-    def size_scale(self) -> float:
+    def is_warmup_failed(self, now: pd.Timestamp | None = None) -> bool:
+        """Return True iff the monitor has been alive past its grace
+        period AND has never received a successful ``update()``.
+
+        Indicates a broken upstream (SVI never calibrated, option_buffer
+        empty, engine not calling update()). Used by ``size_scale`` to
+        degrade to ``size_min`` instead of returning 1.0 (full size).
+        """
+        if self._latest is not None:
+            return False
+        now = now or pd.Timestamp.now(tz="UTC")
+        elapsed_seconds = (now - self._started_at).total_seconds()
+        return elapsed_seconds > self._broken_grace_seconds
+
+    def size_scale(self, now: pd.Timestamp | None = None) -> float:
         """Return a position-size multiplier in [size_min, 1.0].
 
         - 1.0 when current tail prob is at or below the rolling baseline
@@ -261,8 +301,22 @@ class RNDMonitor:
         - ``size_min`` when at or above the halt threshold
 
         Returns 1.0 when we don't yet have enough history to form a
-        baseline (warmup phase).
+        baseline (legitimate warmup phase, ``_latest`` is set but
+        ``baseline`` is None because ``baseline_warmup_bars`` haven't
+        elapsed).
+
+        P1-3 fix (2026-05-07): when the monitor has been alive past
+        its warmup grace AND has never received an update (``_latest
+        is None`` and elapsed > ``_broken_grace_seconds``), return
+        ``size_min`` instead of 1.0. The defensive direction matters:
+        a broken tail-risk monitor sizing trades at 100% is the worst
+        of both worlds.
         """
+        # P1-3: detect the broken-warmup case BEFORE the legitimate
+        # warmup short-circuit. ``_latest is None`` after the grace
+        # period == the upstream never delivered a single update.
+        if self.is_warmup_failed(now=now):
+            return self.config.size_min
         baseline = self._baseline_tail_prob()
         if baseline is None or self._latest is None:
             return 1.0

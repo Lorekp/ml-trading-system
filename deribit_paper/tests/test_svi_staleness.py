@@ -15,11 +15,19 @@ def _make_calibrator(**kwargs) -> LiveSVICalibrator:
     )
 
 
-def test_is_stale_no_meta_returns_false():
-    """Before any calibration, is_stale returns False (warmup, not stale)."""
-    cal = _make_calibrator()
-    now = pd.Timestamp("2026-04-13 12:00", tz="UTC")
-    assert cal.is_stale(now) is False
+def test_is_stale_no_meta_returns_false_within_grace():
+    """Before any calibration, within the warmup grace period
+    (``max_stale_hours`` since construction), is_stale returns False.
+
+    Past the grace period, see ``test_silent_failure_fixes.py`` —
+    the post-fix behaviour is that is_stale returns True after grace
+    even with no meta (closes the silent-failure pattern that hid
+    permanently-broken SVI as "warmup").
+    """
+    started = pd.Timestamp("2026-04-13 11:30", tz="UTC")
+    cal = _make_calibrator(started_at=started)
+    now = pd.Timestamp("2026-04-13 12:00", tz="UTC")  # 30 min after start
+    assert cal.is_stale(now, max_stale_hours=4.0) is False
 
 
 def test_is_stale_recent_calibration():
@@ -76,6 +84,15 @@ def test_stale_age_hours():
 
 
 def test_stale_age_hours_no_meta():
-    cal = _make_calibrator()
+    """When the calibrator has never produced ``_meta``, stale_age_hours
+    returns time-since-construction (NOT 0.0 as the pre-fix code emitted).
+
+    Pre-fix this returned 0.0, masking the "calibrator alive for hours
+    but never calibrated" failure mode in the operator-facing
+    heartbeat. Now it reports the honest elapsed.
+    """
+    started = pd.Timestamp("2026-04-13 11:00", tz="UTC")
+    cal = _make_calibrator(started_at=started)
     now = pd.Timestamp("2026-04-13 12:00", tz="UTC")
-    assert cal.stale_age_hours(now) == 0.0
+    # 1 hour since startup, no calibration yet
+    assert cal.stale_age_hours(now) == pytest.approx(1.0)

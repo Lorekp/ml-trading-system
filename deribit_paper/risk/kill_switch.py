@@ -70,6 +70,7 @@ class KillSwitch:
         network_outage_seconds: float = 120.0,
         alert_callback: Callable[[str], None] | None = None,
         persist_callback: Callable[[bool, str | None], None] | None = None,
+        started_at: pd.Timestamp | None = None,
     ):
         self._equity = equity_tracker
         self.max_daily_dd_pct = max_daily_drawdown_pct
@@ -88,6 +89,18 @@ class KillSwitch:
         self._last_ws_message_at: pd.Timestamp | None = None
         # C2: Flag for engine to trigger emergency close on next process_bar
         self.needs_emergency_close: bool = False
+        # Bug fix P0-2 (2026-05-07): track construction time so the
+        # network-outage check can trip when ``_last_ws_message_at`` is
+        # None AND too much time has passed since startup (e.g., Deribit
+        # subscribe ACKed but no events ever arrive — a silent
+        # geo-block, or all channels rejected silently). Pre-fix the
+        # check was skipped entirely when ``_last_ws_message_at is
+        # None``, leaving the outage trip dead during cold-start
+        # silence.
+        self._started_at: pd.Timestamp = (
+            started_at if started_at is not None
+            else pd.Timestamp.now(tz="UTC")
+        )
 
     @property
     def state(self) -> KillSwitchState:
@@ -126,14 +139,25 @@ class KillSwitch:
             )
 
         # 2. Network outage
-        if self._last_ws_message_at is not None:
-            silence = (now - self._last_ws_message_at).total_seconds()
-            if silence > self.network_outage_seconds:
-                return self.trip(
-                    f"network outage: {silence:.1f}s since last WS message "
-                    f"(threshold {self.network_outage_seconds:.0f}s)",
-                    now=now,
-                )
+        # P0-2 fix (2026-05-07): when no WS message has EVER arrived,
+        # measure silence from engine startup time instead of skipping
+        # the check. Pre-fix path was silent on cold-start scenarios
+        # like the Binance Futures geo-block — the engine would run for
+        # hours with `_last_ws_message_at is None` and the kill-switch
+        # never tripped because the `if not None` gate was False.
+        if self._last_ws_message_at is None:
+            ref_ts = self._started_at
+            silence_kind = "WS messages never arrived since startup"
+        else:
+            ref_ts = self._last_ws_message_at
+            silence_kind = "since last WS message"
+        silence = (now - ref_ts).total_seconds()
+        if silence > self.network_outage_seconds:
+            return self.trip(
+                f"network outage: {silence:.1f}s {silence_kind} "
+                f"(threshold {self.network_outage_seconds:.0f}s)",
+                now=now,
+            )
 
         # 3. Consecutive errors (handled in on_trade_result)
         return False

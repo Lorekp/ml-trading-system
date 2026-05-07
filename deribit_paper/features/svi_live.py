@@ -79,6 +79,7 @@ class LiveSVICalibrator:
         cache_path: str | Path = "deribit_paper/state/svi_cache.parquet",
         recalibrate_hours: float = 1.0,
         svi_config: SVIConfig | None = None,
+        started_at: pd.Timestamp | None = None,
     ):
         self.cache_path = Path(cache_path)
         self.recalibrate_hours = recalibrate_hours
@@ -91,6 +92,17 @@ class LiveSVICalibrator:
         self._features_df: pd.DataFrame | None = None
         self._meta: SVICacheMeta | None = None
         self._is_recalibrating = False
+        # Bug fix (2026-05-07): track construction time so ``is_stale``
+        # can transition from "warmup" to "stale" after a reasonable
+        # grace period when ``_meta`` stays None forever (e.g.,
+        # option_buffer never fills, all recalibrate attempts raise).
+        # Without this, the calibrator reports "fresh" indefinitely and
+        # the engine's stale-IV check (engine.py around line 1549)
+        # never fires — same family as the just-fixed VPIN bug.
+        self._started_at: pd.Timestamp = (
+            started_at if started_at is not None
+            else pd.Timestamp.now(tz="UTC")
+        )
 
     @property
     def has_params(self) -> bool:
@@ -114,20 +126,41 @@ class LiveSVICalibrator:
     def is_stale(self, now: pd.Timestamp, max_stale_hours: float = 4.0) -> bool:
         """Return True if cached SVI params are too old to trust.
 
+        Two failure modes produce stale params:
+
+        1. The calibrator HAS calibrated at least once but the most
+           recent calibration is older than ``max_stale_hours``.
+        2. The calibrator has NEVER calibrated AND has been alive
+           longer than ``max_stale_hours``. Pre-fix this case
+           returned False forever (treating "never calibrated" as
+           "warmup"). Same silent-failure family as the VPIN bug
+           — a recalibrate task that always fails (option buffer
+           empty due to broken WS, SVI fitter raising on every
+           bucket) leaves ``_meta`` as None indefinitely while
+           ``is_stale`` reports "fresh".
+
         Used by the engine to refuse to trade on stale IV.  The threshold
         is separate from ``recalibrate_hours`` (which is 1h): a failed
         recalibration is tolerable for a few hours, but after
         ``max_stale_hours`` the IV surface is unreliable.
         """
         if self._meta is None:
-            return False  # No params yet = warmup, not stale
+            elapsed = now - self._started_at
+            return elapsed >= pd.Timedelta(hours=max_stale_hours)
         elapsed = now - self._meta.last_recalibrated_at
         return elapsed >= pd.Timedelta(hours=max_stale_hours)
 
     def stale_age_hours(self, now: pd.Timestamp) -> float:
-        """Hours since last successful recalibration (0.0 if no meta)."""
+        """Hours since last successful recalibration.
+
+        When the calibrator has never produced ``_meta`` (no successful
+        recalibration yet), returns hours since construction so the
+        operator-facing heartbeat reports an honest "we've been waiting
+        N hours" rather than the misleading 0.0 the pre-fix code emitted.
+        """
         if self._meta is None:
-            return 0.0
+            elapsed = now - self._started_at
+            return elapsed.total_seconds() / 3600.0
         elapsed = now - self._meta.last_recalibrated_at
         return elapsed.total_seconds() / 3600.0
 

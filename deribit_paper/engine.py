@@ -2018,12 +2018,22 @@ class TradingEngine:
         return float(recent["amount"].abs().sum())
 
     async def _current_spot(self) -> float:
-        """Fetch the latest index price for the perp hedger's step callback."""
+        """Fetch the latest index price for the perp hedger's step callback.
+
+        P1-4 fix (2026-05-07): require the buffered price to be fresh
+        within 60s. Pre-fix this returned the most recent buffered
+        sample regardless of age — a silent index channel could feed
+        an hours-old price into the perp hedger and produce wrong
+        deltas. Now: if the buffer is empty OR the last sample is
+        stale, fall back to a REST ``get_index_price`` call (already
+        wired below as the fallback).
+        """
         if self.index_buffer is not None:
-            price = self.index_buffer.latest()
+            price = self.index_buffer.latest_fresh(max_age_seconds=60.0)
             if price is not None:
                 return price
-        # Fallback: REST call
+        # Fallback: REST call (also exercised when the buffer's latest
+        # sample is older than 60s — the index channel is silent).
         info = await self.rest.get_index_price(
             index_name=f"{self.config.currency.lower()}_usd",
         )

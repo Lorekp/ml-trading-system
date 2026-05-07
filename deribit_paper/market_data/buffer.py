@@ -219,10 +219,54 @@ class IndexPriceBuffer:
         return evicted
 
     def latest(self) -> float | None:
-        """Return the most recent index price, or ``None`` if empty."""
+        """Return the most recent index price, or ``None`` if empty.
+
+        Note: this method does NOT check freshness — the returned value
+        could be hours old if the index feed is silent. Use
+        :meth:`latest_with_age` or :meth:`latest_fresh` when freshness
+        matters (e.g., live hedging path). Kept for back-compat with
+        callers that don't care about staleness (e.g., off-line
+        aggregation).
+        """
         if not self._samples:
             return None
         return self._samples[-1][1]
+
+    def latest_with_age(
+        self, now: pd.Timestamp | None = None,
+    ) -> tuple[float | None, float | None]:
+        """Return ``(price, age_seconds)`` for the most recent sample.
+
+        ``age_seconds`` is None iff there are no samples. Lets the
+        caller make the staleness decision per use-site.
+        """
+        if not self._samples:
+            return (None, None)
+        ts, price = self._samples[-1]
+        ref = now or pd.Timestamp.now(tz="UTC")
+        age = (ref - ts).total_seconds()
+        return (price, age)
+
+    def latest_fresh(
+        self,
+        max_age_seconds: float = 60.0,
+        now: pd.Timestamp | None = None,
+    ) -> float | None:
+        """Return the most recent index price IFF younger than
+        ``max_age_seconds``, else None.
+
+        P1-4 (2026-05-07): the original ``latest()`` had no staleness
+        check — a hedger calling it after the index feed went silent
+        would receive a price from minutes/hours ago and trade against
+        a stale delta. This wrapper makes the staleness contract
+        explicit at the call site.
+        """
+        price, age = self.latest_with_age(now=now)
+        if price is None or age is None:
+            return None
+        if age > max_age_seconds:
+            return None
+        return price
 
     def at_or_before(self, ts: pd.Timestamp) -> float | None:
         """Return the latest index price with ``timestamp <= ts``.

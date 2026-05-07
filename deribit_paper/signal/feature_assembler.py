@@ -50,6 +50,8 @@ from deribit_paper.features.har_pd_live import (
     K_BARS_DEFAULT as HAR_PD_K_BARS_DEFAULT,
     HARPDState,
 )
+from deribit_paper.features.tsrv_features import TSRVFeatures
+from deribit_paper.features.tsrv_history import TSRVHistoryBuffer
 from deribit_paper.features.tsrv_live import BarTSRV
 from deribit_paper.market_data.aggregator import Bar
 
@@ -88,6 +90,13 @@ class AssemblerContext:
     # baseline (same fail-soft pattern as HAR-PD warmup / SVI cold start).
     dollar_bar_buffer: Any | None = None        # DollarBarBuffer, late-bound
     dollar_bar_features: Any | None = None      # DollarBarFeatures, late-bound
+    # F3 Tier 5 (parity-cycle round 3 — 2026-05-07): TSRV history
+    # buffer + cached-features view for the 6 TSRV-derived handlers
+    # (tsrv_mean_*, tsrv_ffd, up_jump_frac_ema50, bpv_tsrv_ratio_ema50).
+    # ``None`` until Tier 6 wires the engine; while None those handlers
+    # fall back to the historical baseline.
+    tsrv_history_buffer: Any | None = None      # TSRVHistoryBuffer, late-bound
+    tsrv_features: Any | None = None            # TSRVFeatures, late-bound
 
 
 def _h_tsrv(ctx: AssemblerContext) -> float:
@@ -223,9 +232,21 @@ def _baseline_or_nan(ctx: AssemblerContext, name: str) -> float:
 
 
 def _h_tsrv_mean_1d(ctx: AssemblerContext) -> float:
-    # F9 (2026-05-07): NaN propagates to the line-519 NaN guard rather
-    # than collapsing to 0.0. A bad baseline parquet → engine refuses
-    # to trade rather than feeding LightGBM a zero-mean TSRV.
+    """F3 Tier 5 (parity-cycle round 3 — 2026-05-07): live rolling mean
+    of ``log(vol_ann)`` over the last 96 15-min bars.
+
+    Pre-Tier-5 this was a baseline-fallback handler (always returned
+    the static parquet value at engine startup). With the
+    ``TSRVHistoryBuffer`` wired by Tier 6, returns a fresh rolling-mean
+    value per bar. Falls back to ``_baseline_or_nan`` when the buffer
+    is None or has fewer than the rolling-window's ``min_periods=24``
+    entries.
+    """
+    feats = ctx.tsrv_features
+    if feats is not None:
+        v = feats.tsrv_mean_1d()
+        if v is not None and np.isfinite(v):
+            return float(v)
     return _baseline_or_nan(ctx, "tsrv_mean_1d")
 
 
@@ -301,6 +322,33 @@ def _make_dollar_bar_handler(
     return _handler
 
 
+# ── F3 Tier 5 (parity-cycle round 3 — 2026-05-07): 6 TSRV-grid handlers ──
+# Each reads from ``ctx.tsrv_features`` (cached wrapper around the live
+# ``TSRVHistoryBuffer``). Falls back to ``_baseline_or_nan`` when the
+# buffer is None or underfull.
+
+
+def _make_tsrv_handler(
+    name: str,
+    method: str,
+    *args: Any,
+) -> Callable[[AssemblerContext], float]:
+    """Build a handler that calls ``ctx.tsrv_features.<method>(*args)``."""
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.tsrv_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = getattr(feats, method)(*args)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
 # Registry: feature name → handler.  Adding a new live-computable
 # feature is one line here, not a tuple edit + imperative loop edit.
 _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
@@ -347,6 +395,15 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "n_trades_ema50":      _make_dollar_bar_handler("n_trades_ema50", "ema", "n_trades", 50),
     "parkinson_1d":        _make_dollar_bar_handler("parkinson_1d", "parkinson_1d", 250),
     "parkinson_1d_ema50":  _make_dollar_bar_handler("parkinson_1d_ema50", "parkinson_1d_ema", 50),
+    # F3 Tier 5 — TSRV-grid handlers. Live values when the
+    # TSRVHistoryBuffer is wired (Tier 6); baseline-fallback otherwise.
+    # tsrv_mean_1d already overridden above (was baseline-fallback only).
+    "tsrv_mean_1d_lag3":    _make_tsrv_handler("tsrv_mean_1d_lag3", "tsrv_mean_1d_lag3"),
+    "tsrv_mean_1d_ema50":   _make_tsrv_handler("tsrv_mean_1d_ema50", "tsrv_mean_1d_ema50", 50),
+    "tsrv_mean_1w":         _make_tsrv_handler("tsrv_mean_1w", "tsrv_mean_1w"),
+    "tsrv_ffd":             _make_tsrv_handler("tsrv_ffd", "tsrv_ffd"),
+    "up_jump_frac_ema50":   _make_tsrv_handler("up_jump_frac_ema50", "up_jump_frac_ema50", 50),
+    "bpv_tsrv_ratio_ema50": _make_tsrv_handler("bpv_tsrv_ratio_ema50", "bpv_tsrv_ratio_ema50", 50),
 }
 
 
@@ -407,6 +464,7 @@ class FeatureAssembler:
         bundle,  # ModelBundle — late binding to avoid circular import
         svi_calibrator: Any | None = None,
         dollar_bar_buffer: DollarBarBuffer | None = None,
+        tsrv_history_buffer: TSRVHistoryBuffer | None = None,
         rolling_history_bars: int = 672,  # 7 days at 15min
         har_pd_k_bars: int = HAR_PD_K_BARS_DEFAULT,
     ):
@@ -421,6 +479,11 @@ class FeatureAssembler:
         # Tier 6 wires the engine; while None the 16 dollar-bar-derived
         # handlers fall back to the historical baseline.
         self._dollar_bar_buffer = dollar_bar_buffer
+        # F3 Tier 5 (parity-cycle round 3 — 2026-05-07): live TSRV
+        # history buffer (15-min cadence). ``None`` until Tier 6 wires
+        # the engine to call ``buffer.append_bar`` per process_bar.
+        # While None, the 6 TSRV-derived handlers fall back to baseline.
+        self._tsrv_history_buffer = tsrv_history_buffer
         self._rolling_history_bars = rolling_history_bars
         # C (parity 2026-05-07): live HAR-PD state. Each call to
         # ``build_row`` reads strict-past values from this buffer
@@ -651,6 +714,12 @@ class FeatureAssembler:
             if self._dollar_bar_buffer is not None else None
         )
 
+        # F3 Tier 5: same pattern for the TSRV history buffer.
+        tsrv_features = (
+            TSRVFeatures(self._tsrv_history_buffer)
+            if self._tsrv_history_buffer is not None else None
+        )
+
         ctx = AssemblerContext(
             bar=bar,
             bar_tsrv=bar_tsrv,
@@ -659,6 +728,8 @@ class FeatureAssembler:
             har_pd_features=har_pd_features,
             dollar_bar_buffer=self._dollar_bar_buffer,
             dollar_bar_features=dollar_bar_features,
+            tsrv_history_buffer=self._tsrv_history_buffer,
+            tsrv_features=tsrv_features,
         )
 
         for i, name in enumerate(feature_names):

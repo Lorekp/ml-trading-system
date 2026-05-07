@@ -226,10 +226,31 @@ class TestStraddleFlowIntegration:
 
 class TestVPINStaleness:
 
-    def test_not_stale_before_first_update(self):
-        """Before any data arrives, is_stale returns False (warmup)."""
+    def test_not_stale_within_warmup_grace_period(self):
+        """Immediately after construction, before grace period elapses,
+        is_stale returns False. The grace period equals ``stale_seconds``
+        — same threshold the live-data-flowing case uses, so a
+        permanently-silent feed transitions to stale at the same
+        deadline a previously-flowing feed would."""
         stream = LiveVPINStream(fallback_vpin=0.5, stale_seconds=60.0)
         assert stream.is_stale is False
+
+    def test_stale_after_warmup_with_zero_messages(self):
+        """Bug fix (2026-05-07): a feed that has been running longer than
+        ``stale_seconds`` but never delivered a single message must
+        transition to ``is_stale=True``. Pre-fix returned False forever
+        (treating "never received" as "warmup"), masking a real
+        permanent-disconnect / geo-block scenario."""
+        import time
+        stream = LiveVPINStream(
+            bucket_volume_btc=10.0, fallback_vpin=0.5, stale_seconds=0.01,
+        )
+        # No _process_message call — last_update_ts stays None
+        time.sleep(0.02)  # wait for grace period to elapse
+        assert stream.is_stale is True, (
+            "is_stale must transition to True after stale_seconds "
+            "even if the feed never delivered a message"
+        )
 
     def test_not_stale_after_recent_update(self):
         """Shortly after a trade, is_stale returns False."""

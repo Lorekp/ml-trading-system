@@ -155,6 +155,13 @@ class LiveVPINStream:
         self._last_update_ts: float | None = None
         self._trades_processed = 0
         self._stale_seconds = float(stale_seconds)
+        # Bug fix (2026-05-07): track stream construction time so
+        # ``is_stale`` can transition from "warmup" to "stale" after a
+        # reasonable grace period when ``_last_update_ts`` stays None.
+        # Without this, a permanently-silent feed (e.g. geo-blocked
+        # Binance Futures returning zero messages) reads as "warming up"
+        # forever and never trips the operator alert.
+        self._stream_start_ts: float = time.time()
 
         # Warm-start from serialized state
         if state_path is not None:
@@ -196,12 +203,27 @@ class LiveVPINStream:
     def is_stale(self) -> bool:
         """True if no trade updates received for > stale_seconds.
 
-        Indicates the Binance WS may be permanently disconnected and
-        ``latest_vpin`` is returning the fallback value.
+        Two failure modes produce stale data:
+
+        1. Stream WAS receiving and went silent (last_update_ts > 0,
+           but ``time.time() - last_update_ts`` exceeds ``stale_seconds``).
+        2. Stream NEVER received any messages — e.g. the Binance
+           Futures aggTrade endpoint is geo-blocked from this host's
+           IP. The WS handshake succeeds but no aggTrade frames flow.
+           Pre-fix, this case returned False forever ("warmup, not
+           stale"); the operator alert never fired and the live
+           engine ran on the warm-start VPIN value indefinitely.
+           Now: if the stream has been running longer than
+           ``stale_seconds`` AND has never received a message, that
+           is stale, not warmup.
         """
+        now = time.time()
         if self._last_update_ts is None:
-            return False  # Never received data = warmup, not stale
-        return (time.time() - self._last_update_ts) > self._stale_seconds
+            # Pre-fix: returned False unconditionally. Now: stale if we
+            # have been running long enough that "warmup" no longer
+            # explains the silence.
+            return (now - self._stream_start_ts) > self._stale_seconds
+        return (now - self._last_update_ts) > self._stale_seconds
 
     @property
     def buckets_since_start(self) -> int:

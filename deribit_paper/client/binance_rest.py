@@ -24,10 +24,17 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Binance Futures REST defaults
+# Binance REST defaults — Futures is the legacy default (built for VPIN).
+# F3 (2026-05-07): added Spot constants for dollar-bar reconstruction
+# from Binance Vision aggTrades. The offline pipeline trains on Binance
+# spot dollar bars (vol_model/features/engineer.py:_build_bars_sequential
+# loads from data/binance-aggTrades-parquet, which is Spot). Live must
+# pull from the SAME source for byte-identity.
 _DEFAULT_BASE_URL = "https://fapi.binance.com"
 _DEFAULT_TIMEOUT = 10.0
-_AGG_TRADES_PATH = "/fapi/v1/aggTrades"
+_AGG_TRADES_PATH = "/fapi/v1/aggTrades"          # Futures
+_SPOT_BASE_URL = "https://api.binance.com"
+_SPOT_AGG_TRADES_PATH = "/api/v3/aggTrades"      # Spot
 # Per Binance docs, max page size = 1000 trades.
 _MAX_LIMIT = 1000
 # Max attempts on transient 429/5xx before giving up the cycle.
@@ -58,11 +65,38 @@ class BinanceRESTClient:
         base_url: str = _DEFAULT_BASE_URL,
         timeout_s: float = _DEFAULT_TIMEOUT,
         max_retries: int = _MAX_RETRIES,
+        agg_trades_path: str = _AGG_TRADES_PATH,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
         self._max_retries = max_retries
+        # F3 (2026-05-07): path is configurable so the same client class
+        # serves both Binance Futures (``/fapi/v1/aggTrades``) and Spot
+        # (``/api/v3/aggTrades``). The two endpoints share request schema
+        # (symbol + fromId + limit) and response schema (a, p, q, T, m).
+        self._agg_trades_path = agg_trades_path
         self._client: httpx.AsyncClient | None = None
+
+    @classmethod
+    def for_spot(
+        cls,
+        *,
+        timeout_s: float = _DEFAULT_TIMEOUT,
+        max_retries: int = _MAX_RETRIES,
+    ) -> "BinanceRESTClient":
+        """Construct a client pointed at Binance Spot (api.binance.com).
+
+        Used by the dollar-bar reconstruction (F3 — parity-cycle round 3)
+        which mirrors the offline pipeline's spot-aggTrades source so the
+        24 dollar-bar-derived features can byte-identity-match the model's
+        training distribution.
+        """
+        return cls(
+            base_url=_SPOT_BASE_URL,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            agg_trades_path=_SPOT_AGG_TRADES_PATH,
+        )
 
     async def __aenter__(self) -> "BinanceRESTClient":
         await self.connect()
@@ -121,7 +155,7 @@ class BinanceRESTClient:
         last_exc: Exception | None = None
         for attempt in range(self._max_retries):
             try:
-                resp = await self._client.get(_AGG_TRADES_PATH, params=params)
+                resp = await self._client.get(self._agg_trades_path, params=params)
             except httpx.HTTPError as exc:
                 last_exc = exc
                 logger.warning(

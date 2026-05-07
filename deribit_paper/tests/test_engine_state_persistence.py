@@ -140,3 +140,88 @@ async def test_engine_state_idempotent_replace(tmp_path):
     assert loaded["current_equity_usd"] == pytest.approx(105_000.0)
     assert loaded["n_trades_closed"] == 5
     await db.close()
+
+
+# ── S5+S8 (parity-cycle round 2 — 2026-05-07): kill_switch consecutive
+# errors + svi_recal counters persist across restarts.
+
+
+@pytest.mark.asyncio
+async def test_engine_state_kill_switch_errors_persist(tmp_path):
+    """S5: kill_switch_consecutive_errors round-trips via engine_state."""
+    db = SQLiteStore(tmp_path / "ks_errors.db")
+    await db.open()
+    await db.save_engine_state({
+        "current_equity_usd": 100_000.0,
+        "peak_equity_usd": 100_000.0,
+        "realized_pnl_usd": 0.0,
+        "n_trades_closed": 0,
+        "edge_ema": None,
+        "edge_warmup": [],
+        "exec_cost_ema_usd_per_btc": 12.0,
+        "kill_switch_consecutive_errors": 2,  # 1 error away from tripping at threshold=3
+    })
+    loaded = await db.load_engine_state()
+    assert loaded is not None
+    assert loaded["kill_switch_consecutive_errors"] == 2
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_state_svi_recal_counters_persist(tmp_path):
+    """S8: svi_recal_count + svi_recal_failures round-trip via engine_state."""
+    db = SQLiteStore(tmp_path / "svi_recal.db")
+    await db.open()
+    await db.save_engine_state({
+        "current_equity_usd": 100_000.0,
+        "peak_equity_usd": 100_000.0,
+        "realized_pnl_usd": 0.0,
+        "n_trades_closed": 0,
+        "edge_ema": None,
+        "edge_warmup": [],
+        "exec_cost_ema_usd_per_btc": 12.0,
+        "svi_recal_count": 47,
+        "svi_recal_failures": 3,
+    })
+    loaded = await db.load_engine_state()
+    assert loaded is not None
+    assert loaded["svi_recal_count"] == 47
+    assert loaded["svi_recal_failures"] == 3
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_state_s5_s8_default_to_zero_when_unset(tmp_path):
+    """Older callers that don't pass S5/S8 keys still write — fields default to 0."""
+    db = SQLiteStore(tmp_path / "defaults.db")
+    await db.open()
+    await db.save_engine_state({
+        "current_equity_usd": 100_000.0,
+        "peak_equity_usd": 100_000.0,
+        "realized_pnl_usd": 0.0,
+        "n_trades_closed": 0,
+        "edge_ema": None,
+        "edge_warmup": [],
+        "exec_cost_ema_usd_per_btc": 12.0,
+        # S5/S8 fields omitted intentionally
+    })
+    loaded = await db.load_engine_state()
+    assert loaded is not None
+    assert loaded["kill_switch_consecutive_errors"] == 0
+    assert loaded["svi_recal_count"] == 0
+    assert loaded["svi_recal_failures"] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_state_migration_adds_s5_s8_columns(tmp_path):
+    """S5+S8 migration: opening a fresh DB applies ADD COLUMN idempotently.
+
+    Sanity that two opens of the same DB don't raise on duplicate-column.
+    """
+    db = SQLiteStore(tmp_path / "migrate.db")
+    await db.open()
+    await db.close()
+    db2 = SQLiteStore(tmp_path / "migrate.db")
+    await db2.open()  # second open must not raise on the ADD COLUMN
+    await db2.close()

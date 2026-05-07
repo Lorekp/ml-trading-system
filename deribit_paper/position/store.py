@@ -144,9 +144,29 @@ CREATE TABLE IF NOT EXISTS engine_state (
     edge_warmup_json TEXT NOT NULL,          -- list of |edge| during warmup
     -- Execution-cost EMA
     exec_cost_ema_usd_per_btc REAL NOT NULL,
+    -- S5 (parity-cycle round 2 — 2026-05-07): KillSwitch consecutive-error
+    -- counter. Pre-S5 reset to 0 on every restart, so an engine that was
+    -- 1 error from tripping got 2 free retries on restart.
+    kill_switch_consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    -- S8 (parity-cycle round 2 — 2026-05-07): SVI recalibration counters
+    -- so the heartbeat doesn't show "0 recals" right after restart.
+    svi_recal_count INTEGER NOT NULL DEFAULT 0,
+    svi_recal_failures INTEGER NOT NULL DEFAULT 0,
     last_updated TEXT NOT NULL
 );
 """
+
+# S5+S8: ALTER TABLE migrations for engine_state when an older row exists
+# without these columns. Idempotent: ADD COLUMN raises ``duplicate column``
+# on already-migrated DBs, which we swallow.
+_ENGINE_STATE_S5_S8_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE engine_state ADD COLUMN "
+    "kill_switch_consecutive_errors INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE engine_state ADD COLUMN "
+    "svi_recal_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE engine_state ADD COLUMN "
+    "svi_recal_failures INTEGER NOT NULL DEFAULT 0",
+)
 
 
 class SQLiteStore:
@@ -181,6 +201,15 @@ class SQLiteStore:
             except Exception:  # noqa: BLE001
                 logger.exception("SQLite pragma failed: %s", pragma)
         await self._conn.executescript(_CREATE_TABLES_SQL)
+        # S5+S8 migrations on engine_state. Each ADD COLUMN is idempotent
+        # via the duplicate-column check; SQLite raises OperationalError
+        # for an already-existing column which we swallow.
+        for _alter in _ENGINE_STATE_S5_S8_MIGRATIONS:
+            try:
+                await self._conn.execute(_alter)
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
         # Seed kill switch state if empty
         async with self._conn.execute(
             "SELECT COUNT(*) FROM kill_switch_state",
@@ -547,18 +576,24 @@ class SQLiteStore:
     # ── engine_state (S1+S3 parity-cycle round 2) ──────────────────
 
     async def load_engine_state(self) -> dict | None:
-        """Return persisted engine state (equity + edge_ema + exec_cost_ema), or None.
+        """Return persisted engine state, or None.
+
+        Covers (S1) EquityTracker fields, (S3) edge_ema / exec_cost_ema,
+        (S5) kill_switch consecutive_errors, (S8) svi_recal counters.
 
         Engine reads at startup; if non-None, applies to ``EquityTracker``,
-        ``self._edge_ema`` / ``_edge_warmup``, and ``self._exec_cost_ema``.
-        Cold start (no row) → keep constructor defaults.
+        ``self._edge_ema`` / ``_edge_warmup``, ``self._exec_cost_ema``,
+        ``self.kill_switch._consecutive_errors``, and the SVI recal
+        counters. Cold start (no row) → keep constructor defaults.
         """
         if self._conn is None:
             raise RuntimeError("SQLiteStore not opened")
         cursor = await self._conn.execute(
             "SELECT current_equity_usd, peak_equity_usd, realized_pnl_usd, "
             "n_trades_closed, edge_ema, edge_warmup_json, "
-            "exec_cost_ema_usd_per_btc, last_updated FROM engine_state "
+            "exec_cost_ema_usd_per_btc, "
+            "kill_switch_consecutive_errors, svi_recal_count, "
+            "svi_recal_failures, last_updated FROM engine_state "
             "WHERE id = 1",
         )
         row = await cursor.fetchone()
@@ -574,11 +609,18 @@ class SQLiteStore:
             "edge_ema": float(row[4]) if row[4] is not None else None,
             "edge_warmup": _json.loads(row[5]) if row[5] else [],
             "exec_cost_ema_usd_per_btc": float(row[6]),
-            "last_updated": row[7],
+            "kill_switch_consecutive_errors": int(row[7]),
+            "svi_recal_count": int(row[8]),
+            "svi_recal_failures": int(row[9]),
+            "last_updated": row[10],
         }
 
     async def save_engine_state(self, state: dict) -> None:
-        """Persist engine state. Idempotent (INSERT OR REPLACE at id=1)."""
+        """Persist engine state. Idempotent (INSERT OR REPLACE at id=1).
+
+        Optional keys default to 0 (S5/S8 counters) so older callers that
+        don't yet pass them keep working post-migration.
+        """
         if self._conn is None:
             raise RuntimeError("SQLiteStore not opened")
         import json as _json
@@ -586,8 +628,10 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO engine_state "
             "(id, current_equity_usd, peak_equity_usd, realized_pnl_usd, "
             "n_trades_closed, edge_ema, edge_warmup_json, "
-            "exec_cost_ema_usd_per_btc, last_updated) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "exec_cost_ema_usd_per_btc, "
+            "kill_switch_consecutive_errors, svi_recal_count, "
+            "svi_recal_failures, last_updated) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 float(state["current_equity_usd"]),
                 float(state["peak_equity_usd"]),
@@ -596,6 +640,9 @@ class SQLiteStore:
                 float(state["edge_ema"]) if state.get("edge_ema") is not None else None,
                 _json.dumps(state.get("edge_warmup", [])),
                 float(state["exec_cost_ema_usd_per_btc"]),
+                int(state.get("kill_switch_consecutive_errors", 0)),
+                int(state.get("svi_recal_count", 0)),
+                int(state.get("svi_recal_failures", 0)),
                 pd.Timestamp.now(tz="UTC").isoformat(),
             ),
         )

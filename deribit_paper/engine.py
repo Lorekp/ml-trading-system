@@ -770,6 +770,11 @@ class TradingEngine:
         except Exception:  # noqa: BLE001 — defensive, never block startup
             logger.exception("S1: failed to load engine_state; cold-start defaults")
             persisted = None
+        # S5+S8 (parity-cycle round 2 — 2026-05-07): the kill_switch
+        # consecutive_errors counter and SVI recal counters are part of
+        # engine_state but the kill_switch isn't constructed until below.
+        # Stash on self for the post-kill_switch-creation handoff.
+        self._persisted_engine_state: dict | None = persisted
         if persisted is not None:
             try:
                 self.equity_tracker.load_state({
@@ -787,15 +792,25 @@ class TradingEngine:
                 else:
                     self._edge_ema = None
                     self._edge_warmup = list(persisted.get("edge_warmup", []))
+                # S8: SVI recal counters (early enough — they're plain
+                # ints on self).
+                self._svi_recal_count = int(
+                    persisted.get("svi_recal_count", 0)
+                )
+                self._svi_recal_failures = int(
+                    persisted.get("svi_recal_failures", 0)
+                )
                 logger.info(
-                    "S1+S3: engine_state restored — equity=$%.2f peak=$%.2f "
+                    "S1+S3+S8: engine_state restored — equity=$%.2f peak=$%.2f "
                     "n_trades=%d edge_ema=%s exec_cost_ema=%.2f "
-                    "(last_updated=%s)",
+                    "svi_recal=(n=%d, fail=%d) (last_updated=%s)",
                     persisted["current_equity_usd"],
                     persisted["peak_equity_usd"],
                     persisted["n_trades_closed"],
                     persisted["edge_ema"],
                     persisted["exec_cost_ema_usd_per_btc"],
+                    self._svi_recal_count,
+                    self._svi_recal_failures,
                     persisted["last_updated"],
                 )
             except (KeyError, ValueError, TypeError) as exc:
@@ -885,6 +900,23 @@ class TradingEngine:
             persist_callback=_persist_ks,
         )
 
+        # S5 (parity-cycle round 2 — 2026-05-07): restore the kill-switch
+        # consecutive-error counter from engine_state. Pre-S5 the counter
+        # reset to 0 on every restart, so an engine that was 1 error
+        # away from tripping got 2 free retries.
+        if self._persisted_engine_state is not None:
+            ks_errors = int(
+                self._persisted_engine_state.get(
+                    "kill_switch_consecutive_errors", 0,
+                )
+            )
+            if ks_errors > 0:
+                self.kill_switch._consecutive_errors = ks_errors
+                logger.info(
+                    "S5: kill_switch consecutive_errors restored to %d",
+                    ks_errors,
+                )
+
         # H1: restore prior halt state (or clear if --clear-kill-state).
         prior_halted, prior_reason, prior_at = await self.store.get_kill_switch_state()
         if prior_halted and getattr(cfg, "clear_kill_state", False):
@@ -912,7 +944,14 @@ class TradingEngine:
                 "operator clears state via --clear-kill-state",
                 restored_msg,
             )
-            self.kill_switch.trip(restored_msg)
+            # S6 (parity-cycle round 2 — 2026-05-07): pass ``restored=True``
+            # so the kill_switch sets ``halted=True`` from the persisted
+            # row but does NOT re-fire ``needs_emergency_close``. The
+            # prior session already flattened on the original trip; a
+            # second close-all on every restart sends spurious Telegram
+            # alerts and risks placing reduce-only orders against zero
+            # positions if the ledger reconciliation lags.
+            self.kill_switch.trip(restored_msg, restored=True)
         else:
             logger.info("Kill-switch state at startup: clean")
 
@@ -1574,6 +1613,27 @@ class TradingEngine:
         # Bar is fully tradeable — reset the counter.
         self._consecutive_empty_bars = 0
 
+        # S2 (parity-cycle round 2 — 2026-05-07): drain any in-flight
+        # trade-close coroutines briefly so sizing for THIS bar reads
+        # the post-close equity instead of pre-close. Pre-S2 the
+        # bar-aligned exit (D12) made trade-T's exit fire on bar T+1's
+        # open; the equity_tracker.on_trade_closed update was a coroutine
+        # racing with bar T+1's process_bar — coroutine ordering decided
+        # whether sizing saw stale or fresh equity. The 200ms cap keeps
+        # the bar loop responsive on a stuck trade-close path; on
+        # timeout we proceed with the stale value (degraded but live)
+        # and emit a warning metric so the operator notices.
+        if self._trade_tasks:
+            pending = [t for t in self._trade_tasks if not t.done()]
+            if pending:
+                _, still_pending = await asyncio.wait(pending, timeout=0.2)
+                if still_pending:
+                    logger.warning(
+                        "S2: %d trade-close coroutine(s) did not drain within "
+                        "200ms; bar %s sizing reads pre-close equity",
+                        len(still_pending), bar.timestamp,
+                    )
+
         # 2. Kill switch gating
         if self.kill_switch.check_before_signal(now=bar.timestamp):
             logger.warning(
@@ -2196,25 +2256,20 @@ class TradingEngine:
                     fill_cost - self._exec_cost_ema
                 )
 
-            # S1+S3 (parity-cycle round 2 — 2026-05-07): persist engine
-            # state so a restart resumes equity / edge_ema / exec_cost_ema
-            # at their current values rather than re-baselining at
-            # constructor defaults. Best-effort — DB write failure must
-            # not block the trade close path. Mirrors H4 pattern.
+            # S1+S3+S5+S8 (parity-cycle round 2 — 2026-05-07): persist engine
+            # state so a restart resumes equity / edge_ema / exec_cost_ema /
+            # kill_switch consecutive_errors / svi_recal counters at their
+            # current values rather than re-baselining at constructor
+            # defaults. Best-effort — DB write failure must not block the
+            # trade close path. Mirrors H4 pattern.
             if self.store is not None:
                 try:
-                    await self.store.save_engine_state({
-                        "current_equity_usd": self.equity_tracker.current_equity,
-                        "peak_equity_usd": self.equity_tracker.peak_equity,
-                        "realized_pnl_usd": self.equity_tracker.realized_pnl,
-                        "n_trades_closed": self.equity_tracker.n_trades_closed,
-                        "edge_ema": self._edge_ema,
-                        "edge_warmup": list(self._edge_warmup),
-                        "exec_cost_ema_usd_per_btc": self._exec_cost_ema,
-                    })
+                    await self.store.save_engine_state(
+                        self._build_engine_state_dict()
+                    )
                 except Exception:  # noqa: BLE001
                     logger.exception(
-                        "S1+S3: engine_state persist failed for trade %s",
+                        "S1+S3+S5+S8: engine_state persist failed for trade %s",
                         getattr(outcome, "trade_id", "?"),
                     )
 
@@ -2281,6 +2336,21 @@ class TradingEngine:
                 self.telegram.error(
                     f"SVI recalibrate failed ({self._svi_recal_failures}×): {exc}"
                 )
+        # S8 (parity-cycle round 2 — 2026-05-07): persist svi_recal
+        # counters here as well as on every trade-close. Recals fire on
+        # an hourly cadence even on bars that don't trade, so the
+        # per-trade hook isn't sufficient to make these counters
+        # restart-resilient between trade gaps.
+        if self.store is not None:
+            try:
+                await self.store.save_engine_state(
+                    self._build_engine_state_dict()
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "S8: engine_state persist after recal failed",
+                    exc_info=True,
+                )
 
     def _trailing_1h_volume_btc(self) -> float | None:
         """Aggregate the last 1 hour of perp trades for participation-rate cap."""
@@ -2316,6 +2386,28 @@ class TradingEngine:
             index_name=f"{self.config.currency.lower()}_usd",
         )
         return float(info.get("index_price", 0.0) or 0.0)
+
+    def _build_engine_state_dict(self) -> dict:
+        """Snapshot the in-memory state covered by ``engine_state``.
+
+        Centralised so per-trade and per-recal save paths stay in lockstep.
+        Includes S1+S3 (equity/EMAs), S5 (kill_switch errors), S8 (svi
+        recal counters).
+        """
+        return {
+            "current_equity_usd": self.equity_tracker.current_equity,
+            "peak_equity_usd": self.equity_tracker.peak_equity,
+            "realized_pnl_usd": self.equity_tracker.realized_pnl,
+            "n_trades_closed": self.equity_tracker.n_trades_closed,
+            "edge_ema": self._edge_ema,
+            "edge_warmup": list(self._edge_warmup),
+            "exec_cost_ema_usd_per_btc": self._exec_cost_ema,
+            "kill_switch_consecutive_errors": int(
+                getattr(self.kill_switch, "_consecutive_errors", 0)
+            ),
+            "svi_recal_count": int(self._svi_recal_count),
+            "svi_recal_failures": int(self._svi_recal_failures),
+        }
 
     def _fetch_exit_iv_decimal(self, outcome) -> float:
         """E4 (2026-05-07): pull the SVI ATM IV at the trade's strike,

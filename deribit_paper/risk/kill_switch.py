@@ -211,8 +211,23 @@ class KillSwitch:
         reason: str,
         *,
         now: pd.Timestamp | None = None,
+        restored: bool = False,
     ) -> bool:
-        """Manually trip the kill switch.  Returns True (for chaining)."""
+        """Manually trip the kill switch.  Returns True (for chaining).
+
+        ``restored=True`` is the post-restart path: the kill-switch was
+        already tripped before the previous shutdown, and we're loading
+        that state from disk. Pre-S6 (parity-cycle round 2 — 2026-05-07)
+        a restart would call ``trip(restored_msg)`` and re-fire
+        ``needs_emergency_close=True``, causing the engine's first bar
+        to issue a fresh emergency close-all even though every position
+        had already been flattened on the prior trip. That double-flatten
+        sent a redundant Telegram alert, persisted a duplicate halt
+        timestamp, and (under bad luck on a partially-reconciled position
+        ledger) could place orders against zero positions. ``restored=True``
+        suppresses ``needs_emergency_close`` and the alert + persist
+        callbacks so the load-from-disk path is a pure state restore.
+        """
         if self._state.halted:
             return True
         self._state = KillSwitchState(
@@ -220,6 +235,12 @@ class KillSwitch:
             reason=reason,
             halted_at=now or pd.Timestamp.now(tz="UTC"),
         )
+        if restored:
+            logger.warning(
+                "KillSwitch RESTORED from prior session: %s "
+                "(needs_emergency_close NOT re-fired)", reason,
+            )
+            return True
         self.needs_emergency_close = True
         logger.error("KillSwitch TRIPPED: %s", reason)
         if self._alert_callback is not None:

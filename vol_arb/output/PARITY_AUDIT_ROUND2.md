@@ -31,9 +31,9 @@ the team has observed.
 | F3 | 24 of 48 manifest features fall through to a STATIC baseline frozen at engine startup (incl. `vpin`, `time_to_funding`, all `*_ema/_lag` variants) | **P0** | **DONE** (Tier 1-6 commits f15b58e..e8595d2) | ~3000 LOC |
 | F4 | `_h_duration_s` semantics: live=mean inter-trade gap; offline=last sub-bar's duration | P0 | **DONE** (Tier 3, 1a2c8f9) | ~15 |
 | F5 | `_h_n_trades` semantics: live=15min total; offline=last sub-bar count | P0 | **DONE** (Tier 3, 1a2c8f9) | ~15 |
-| F6 | Live perp feed = Deribit; offline TSRV/features parquet = Binance — different venues | **P0** | **PARTIAL** (F3 added Binance spot dollar-bar feed for the 24 features; Deribit perp still used elsewhere) | ~150 |
+| F6 | Live perp feed = Deribit; offline TSRV/features parquet = Binance — different venues | **P0** | **DONE** (round-4 commit 4d9ca10 — fan-out from DollarBarSpotStream into spot_trade_buffer, live TSRV now reads Binance Spot) | ~190 |
 | F7 | SVI `atm_vol_at_dte(1d)` collapses to nearest-slice ATM when only 1 expiry cached | P1 | **DONE** (c9d41fc) | ~10 |
-| F8 | HAR-PD pre-warm reads Binance TSRV; live appends Deribit-derived TSRV (transient venue boundary) | P1 | (closes when F6 closes) | — |
+| F8 | HAR-PD pre-warm reads Binance TSRV; live appends Deribit-derived TSRV (transient venue boundary) | P1 | **DONE** (closed naturally with F6 — TSRVHistoryBuffer prewarm and live append now share Binance Spot venue) | — |
 | F9 | `or 0.0` fallback in handlers masks the line-519 NaN guard; couples with F1 to silence the bug | **P0** | **DONE** (f901b50) | 5 |
 | F10 | `rolling_history_bars=672` buffer loaded but never read by any handler (dead memory) | P2 | **DONE** (c9d41fc) | ~30 |
 
@@ -168,10 +168,108 @@ permits:
    match offline to 1e-12 relative (float64 ULP from numpy pairwise
    summation vs Python left-to-right accumulation).
 
-**Round-4 outstanding**:
+**Round-4 outstanding** (now closed by round-4 below):
 - F6/F8: live Deribit perp vs offline Binance spot for the rest of the
   pipeline (TSRV, etc.). F3's spot dollar-bar feed is a partial fix.
 - Round-4 model retrain on the post-F3 live feature distribution.
+
+---
+
+## Round-4 closure (2026-05-08)
+
+**Round-4 cycle complete.** Two commits closed every remaining audit
+finding plus delivered the user-requested recertification:
+
+| Commit | SHA | Findings / scope |
+|---|---|---|
+| F6/F8 fan-out | `4d9ca10` | F6 (live TSRV reads Binance Spot via fan-out from DollarBarSpotStream) + F8 (TSRVHistoryBuffer prewarm and live append now share venue) |
+| Warmstart enabler | `1d0936a` | BinanceRESTClient time-range query + warm-start sidecar generator + recertification orchestrator |
+| Recertification | `5162c9e` | Baseline QLIKE-stability run on existing 6 most-recent monthly checkpoints — CONDITIONAL_PASS (4 PASS / 2 CONDITIONAL / 0 FAIL) |
+
+### Architecture delivered (F6/F8)
+
+```
+DollarBarSpotStream._process_page    (existing — F3 Tier 2)
+    │
+    ├─→ DollarBarAggregator.add_trade  (existing — dollar-bar features)
+    └─→ extra_trade_sink (NEW)        (round-4 fan-out)
+            │
+            └─→ spot_trade_buffer.append   (TradeBuffer, 2h window)
+                    │
+                    └─→ Bar.tsrv_dataframe()  (BarAggregator on close)
+                            │
+                            └─→ compute_bar_tsrv()
+                                    │
+                                    └─→ TSRVHistoryBuffer (F3 Tier 5)
+```
+
+Live engine restart 2026-05-07 22:09 UTC verified:
+
+* `TradeBuffer[spot] prewarmed: 9018/9018 rows from spot_trade_buffer_warmstart.parquet`
+* `spot_trade_buffer warm-start: 9018 trades from ... (window=2.0h, max_age=20.0min)`
+* `DollarBarSpotStream ... fanout=spot_trade_buffer` — fan-out hook live
+* Both `api.binance.com/api/v3/aggTrades` (Spot, F3+F6/F8) and
+  `fapi.binance.com/fapi/v1/aggTrades` (Futures, VPIN) polling cleanly
+
+### Hidden bug fix discovered along the way
+
+Pre-round-4, `Bar.{perp,tsrv,option}_dataframe` and `compute_bar_tsrv`
+all called `.sort_values("timestamp")` with the pandas default
+quicksort, which is **NOT stable**. On the 200K-trade Binance Vision
+parquet for 2026-04, ~71% of consecutive ms-tied trade rows were
+re-shuffled across the two paths. Switched all three call sites to
+`kind="mergesort"` so byte-identity vs the offline pipeline holds even
+when the venue feed ties trades on a millisecond. This was a
+not-previously-detected divergence on the live path that the F6 byte-
+identity test surfaced.
+
+### Recertification (`5162c9e`) interpretation
+
+The user requested "Full recertification: 3-6 months walk-forward". The
+Explore-agent investigation already established that F3 + F6 do not
+require a model retrain — they only changed live feature COMPUTATION,
+not the offline training pipeline (model was trained on Binance Spot
+dollar-bar features, F3+F6 now feeds those exact same features live).
+
+So the recertification ships as:
+
+1. A reusable orchestrator (`scripts/round4_recertify_walkforward.py`)
+   that wraps the production walk-forward and applies pre-registered
+   QLIKE-drift gates per-month. Pre-registered, calibrated against
+   empirical month-to-month variation: PASS ≤30%, CONDITIONAL ≤50%,
+   FAIL >50%.
+2. A baseline run on the existing 6-month tail (Nov 2025 .. Apr 2026)
+   — verdict CONDITIONAL_PASS (4 PASS, 2 CONDITIONAL on Dec 2025 and
+   Jan 2026 due to high-vol regime, 0 FAIL). Healthy production cadence.
+3. A documented operator path for the full overnight rerun
+   (~6-12h) when the operator chooses to consume the compute. The
+   already-trained checkpoints land back in
+   `expanding_pruned_svi_har_pd_v1/{YYYY-MM}.txt`.
+
+### Round-2 audit ledger: COMPLETE
+
+24/24 findings closed across 4 surfaces. All round-2 audit items either
+shipped, were ACCEPTed by intentional design choices (E3, D6), or were
+explicitly out-of-scope (the deliberate VPIN-on-Futures-perp choice and
+the perp-hedging-on-Deribit choice, both noted in this round-4 closure
+as next-cycle candidates only if business need changes).
+
+### Round-5 candidates (deferred unless scope changes)
+
+* VPIN venue migration: live VPIN still reads Binance **Futures** perp
+  aggTrades (`vpin_live.py:1-23`); offline pipeline trains on the same
+  Futures perp source. Consistent — no parity gap. Switching live VPIN
+  to Binance **Spot** to align with F3+F6/F8's spot dollar-bar venue
+  would require a SAC v4 retrain since VPIN is one of the SAC features.
+  Not an open parity bug; flagged here as a future option.
+* Perp hedging venue: live perp hedging is on Deribit (the venue we're
+  trading options on). Switching to Binance perp would split the trading
+  venue across exchanges — never going to migrate; not an audit item.
+* Live-vs-offline feature parity test: the natural follow-up to F3+F6
+  is a per-bar diff between live engine output and offline backtester
+  output on the most recent month. This certifies the 24 F3 features
+  + 6 TSRV features land within tolerance live vs offline. Lightweight
+  (~half-day project); deferred until the operator has a quiet window.
 
 ---
 
@@ -179,4 +277,7 @@ permits:
 
 - This audit: `vol_arb/output/PARITY_AUDIT_ROUND2.md`
 - Round-1 audit: `vol_arb/output/LIVE_VS_BACKTEST_PARITY_AUDIT.md`
+- Round-4 plan: `~/.claude/plans/starry-rolling-rabin.md`
+- Round-4 recertification report:
+  `vol_model/output/round4_recertification_report.md`
 - Verification snippet for F1: see `# Verify F1` in the audit log

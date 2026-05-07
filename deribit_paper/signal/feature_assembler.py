@@ -130,9 +130,16 @@ def _h_up_jump_frac(ctx: AssemblerContext) -> float:
 
 
 def _h_vol_ann(ctx: AssemblerContext) -> float:
-    # The backtester uses the CONTINUOUS-variance annualised vol, not
-    # the TSRV itself.  See bar_tsrv.vol_ann_continuous for the formula.
-    return float(ctx.bar_tsrv.vol_ann_continuous)
+    # F2 (2026-05-07): the offline TSRV parquet stores
+    # ``vol_ann = sqrt(tsrv * periods_per_year)`` (TSRV-based, see
+    # ``TSRV/tsrv_series.py:288-289``). Pre-fix the live handler
+    # returned ``vol_ann_continuous`` (continuous-variance based),
+    # producing a ~12% gap on jump bars (sqrt(tsrv) vs
+    # sqrt(continuous_var) — they differ by the jump component).
+    # The pre-fix comment was incorrect — the BACKTESTER ingests
+    # the offline parquet's ``vol_ann`` field, which IS the
+    # tsrv-based one. Use ``bar_tsrv.vol_ann`` to match.
+    return float(ctx.bar_tsrv.vol_ann)
 
 
 def _h_n_trades(ctx: AssemblerContext) -> float:
@@ -152,10 +159,33 @@ def _h_n_bars_in_window(ctx: AssemblerContext) -> float:
     return float(ctx.baseline_row.get("n_bars_in_window", 1) or 1)
 
 
+def _baseline_or_nan(ctx: AssemblerContext, name: str) -> float:
+    """Read ``name`` from the baseline row; return NaN if missing or NaN.
+
+    F9 (parity-cycle round 2 — 2026-05-07): pre-fix the baseline-fallback
+    handlers used ``ctx.baseline_row.get(name, 0.0) or 0.0``, which
+    collapses NaN (and any falsy value) to 0.0 — defeating the
+    line-519 ``~np.isfinite(values)`` fail-fast guard. Couples with F1
+    (SVI parquet integer-position join → 100% NaN baseline) to silently
+    feed ``svi_atm_1d=0%`` to LightGBM.
+
+    Post-fix: NaN propagates so the guard catches a broken baseline
+    and refuses to trade. Callers that NEED a sensible default (e.g.
+    ``n_bars_in_window=1``) keep their inline ``or X`` after this
+    helper if the value is non-NaN.
+    """
+    val = ctx.baseline_row.get(name, np.nan)
+    if val is None:
+        return float("nan")
+    val = float(val)
+    return val if np.isfinite(val) else float("nan")
+
+
 def _h_tsrv_mean_1d(ctx: AssemblerContext) -> float:
-    # Populated from rolling TSRV history when available; otherwise
-    # the baseline fallback is a reasonable stand-in (typical regime).
-    return float(ctx.baseline_row.get("tsrv_mean_1d", 0.0) or 0.0)
+    # F9 (2026-05-07): NaN propagates to the line-519 NaN guard rather
+    # than collapsing to 0.0. A bad baseline parquet → engine refuses
+    # to trade rather than feeding LightGBM a zero-mean TSRV.
+    return _baseline_or_nan(ctx, "tsrv_mean_1d")
 
 
 def _make_har_pd_handler(name: str) -> Callable[[AssemblerContext], float]:
@@ -166,12 +196,13 @@ def _make_har_pd_handler(name: str) -> Callable[[AssemblerContext], float]:
     or when no `bar_tsrv` was passed in), ``har_pd_features`` is empty
     and the handler falls back to the historical baseline value —
     matching the same fail-soft behaviour as ``svi_atm_1d`` when the
-    SVI calibrator hasn't yet produced live params.
+    SVI calibrator hasn't yet produced live params. F9 (2026-05-07):
+    NaN baseline propagates to line-519 guard.
     """
     def _handler(ctx: AssemblerContext) -> float:
         live = ctx.har_pd_features.get(name)
         if live is None or not np.isfinite(live):
-            return float(ctx.baseline_row.get(name, 0.0) or 0.0)
+            return _baseline_or_nan(ctx, name)
         return float(live)
 
     _handler.__name__ = f"_h_{name}"
@@ -186,13 +217,14 @@ def _h_svi_atm_1d(ctx: AssemblerContext) -> float:
     variance to T = 1 day.  Matches the offline scale used to train
     the T2.1 models (``vol_arb/output/svi_features_15m.parquet``).
     Falls back to the historical baseline value if the calibrator has
-    no cached params yet.
+    no cached params yet. F9 (2026-05-07): NaN baseline propagates to
+    line-519 guard rather than silently emitting 0% IV.
     """
     if ctx.svi_calibrator is None:
-        return float(ctx.baseline_row.get("svi_atm_1d", 0.0) or 0.0)
+        return _baseline_or_nan(ctx, "svi_atm_1d")
     live = ctx.svi_calibrator.atm_vol_at_dte(1.0)
     if live is None or not np.isfinite(live):
-        return float(ctx.baseline_row.get("svi_atm_1d", 0.0) or 0.0)
+        return _baseline_or_nan(ctx, "svi_atm_1d")
     return float(live)
 
 
@@ -327,11 +359,50 @@ class FeatureAssembler:
                 self._svi_features_parquet_path,
                 len(svi_df.columns), len(svi_df),
             )
+            # F1 (parity-cycle round 2 — 2026-05-07): the SVI-features
+            # parquet ships with a ``RangeIndex`` and ``timestamp`` as a
+            # column, while the base parquet uses a ``DatetimeIndex``.
+            # The pre-fix ``base.join(svi, how="left")`` aligned by
+            # INTEGER POSITION across mismatched indices, silently
+            # producing NaN in 100% of merged rows (verified
+            # empirically: 185,945/185,945 NaN). The ``_h_svi_atm_1d``
+            # baseline-fallback then emitted ``svi_atm_1d=0.0`` to
+            # LightGBM since the V2 stack was adopted, with the
+            # ``or 0.0`` collapse (F9) defeating the line-519 NaN
+            # guard. Set the SVI parquet's index to its ``timestamp``
+            # column BEFORE the join so alignment is timestamp-based.
+            if (
+                "timestamp" in svi_df.columns
+                and not isinstance(svi_df.index, pd.DatetimeIndex)
+            ):
+                svi_df = svi_df.set_index(
+                    pd.DatetimeIndex(pd.to_datetime(svi_df["timestamp"], utc=True))
+                ).drop(columns=["timestamp"])
+                svi_df.index.name = base_df.index.name  # match base for clean join
             overlap = set(base_df.columns) & set(svi_df.columns)
             if overlap:
                 # Drop from base so SVI wins on overlap
                 base_df = base_df.drop(columns=list(overlap))
             full_df = base_df.join(svi_df, how="left")
+            # Sanity check: at least one SVI column should land on a
+            # non-NaN value in the recent baseline tail. Fail-fast if
+            # the join still drops everything (e.g. timestamp parsing
+            # mismatch on a future parquet variant).
+            for svi_col in ("svi_atm_1d", "svi_atm_1w"):
+                if svi_col in full_df.columns:
+                    nan_rate_tail = (
+                        full_df[svi_col].tail(672).isna().mean()
+                    )
+                    if nan_rate_tail > 0.5:
+                        raise RuntimeError(
+                            f"SVI features parquet join produced "
+                            f"{nan_rate_tail:.1%} NaN in {svi_col} over "
+                            f"the last 7 days — index alignment likely "
+                            f"broken. Check that "
+                            f"{self._svi_features_parquet_path} has a "
+                            f"DatetimeIndex or a 'timestamp' column."
+                        )
+                    break
         else:
             full_df = base_df
 
@@ -485,10 +556,17 @@ class FeatureAssembler:
                         "Live handler failed for %s (%s); using baseline fallback",
                         name, exc,
                     )
-                    values[i] = float(self._baseline_row.get(name, 0.0) or 0.0)
+                    # F9 (2026-05-07): no ``or 0.0`` collapse — let NaN
+                    # propagate to the line-519 guard so a malformed
+                    # baseline (e.g. F1 SVI-join NaN) refuses to trade
+                    # rather than emitting a silent zero.
+                    raw = self._baseline_row.get(name, np.nan)
+                    values[i] = float(raw) if pd.notna(raw) else float("nan")
             else:
-                # Baseline fallback (validated in __init__, so this is safe)
-                values[i] = float(self._baseline_row.get(name, 0.0) or 0.0)
+                # Baseline fallback (validated in __init__, so this is safe).
+                # F9 (2026-05-07): NaN propagates instead of collapsing to 0.
+                raw = self._baseline_row.get(name, np.nan)
+                values[i] = float(raw) if pd.notna(raw) else float("nan")
             as_dict[name] = values[i]
 
         # C (parity 2026-05-07): append the current bar's TSRV to the

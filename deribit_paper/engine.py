@@ -722,6 +722,7 @@ class TradingEngine:
             short_sizing_penalty=cfg.short_sizing_penalty,
             max_trade_size_btc=cfg.max_single_trade_btc,
             n_hedge_ticks=cfg.intra_bar_hedge_ticks,
+            delta_hedge_band=cfg.delta_hedge_band,  # E2 (parity-cycle round 2)
             spot_fetcher=self._current_spot,
             vpin_provider=(
                 (lambda: self.vpin_stream.latest_vpin)
@@ -1996,7 +1997,22 @@ class TradingEngine:
                 total_usd_traded = float(getattr(
                     outcome.hedge_summary, "total_usd_traded", 0.0,
                 ) or 0.0)
-                hedge_fees_usd = self.config.perp_taker_fee * total_usd_traded
+                # E1 (parity-cycle round 2 — 2026-05-07): the V2
+                # backtester charges ``cost_rate = perp_fee +
+                # perp_slippage_bps/1e4`` (= 7 bps total at the V2
+                # default) on every hedge tick (backtester.py:803).
+                # Pre-fix the live engine charged only ``perp_taker_fee``
+                # (5 bps), silently dropping the 2-bps slippage
+                # component. Across ~7,400 lifetime trades and
+                # ~5-10 BTC perp turnover per trade, that's ~$200-370K
+                # of un-modelled hedge cost, biasing live realized PnL
+                # higher than V2 would predict and feeding the
+                # profit_scale empirical-Bayes prior an upward bias.
+                cost_rate = (
+                    self.config.perp_taker_fee
+                    + self.config.perp_slippage_bps / 10_000.0
+                )
+                hedge_fees_usd = cost_rate * total_usd_traded
 
             realized_pnl_usd = (
                 option_pnl_usd + hedge_pnl_usd
@@ -2037,8 +2053,15 @@ class TradingEngine:
                     total_usd_traded = float(getattr(
                         outcome.hedge_summary, "total_usd_traded", 0.0,
                     ) or 0.0)
+                    # E1 (2026-05-07): include perp_slippage_bps in
+                    # the cost rate so profit_scale's hedge-cost
+                    # input matches V2's ``perp_fee + slip`` formula.
+                    _cost_rate = (
+                        self.config.perp_taker_fee
+                        + self.config.perp_slippage_bps / 10_000.0
+                    )
                     hedge_cost_usd = (
-                        self.config.perp_taker_fee * total_usd_traded
+                        _cost_rate * total_usd_traded
                     )
                 gross_pnl_usd = option_pnl_usd + hedge_pnl_usd  # D5 (GROSS, pre-fees)
                 self._profit_scale_estimator.update_realized(

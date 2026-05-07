@@ -125,8 +125,12 @@ async def test_short_straddle_pnl_recipe_includes_hedge_and_fees(engine):
     back at 0.08 BTC × 1.0 × $60K = $4800. Option PnL = +$1200.
     Hedge PnL = +$50 (gain from delta hedging).
     Option fees = 4 × 0.0003 × 60000 × 1.0 = $72.
-    Hedge fees = 0.0005 × $20,000 traded = $10.
-    Net = 1200 + 50 - 72 - 10 = $1168.
+
+    E1 (parity-cycle round 2 — 2026-05-07): hedge cost rate is now
+    ``perp_taker_fee + perp_slippage_bps/1e4`` = 0.0005 + 0.0002 = 0.0007
+    (V2 backtester recipe, backtester.py:803). Hedge cost on $20K
+    traded = $14 (was $10 pre-E1).
+    Net = 1200 + 50 - 72 - 14 = $1164.
     """
     outcome = _make_outcome(
         direction=-1, n_contracts_btc=1.0,
@@ -143,7 +147,7 @@ async def test_short_straddle_pnl_recipe_includes_hedge_and_fees(engine):
 
     # Equity tracker should have received the net PnL.
     args, _ = engine.equity_tracker.on_trade_closed.call_args
-    assert args[0] == pytest.approx(1168.0, abs=1.0)
+    assert args[0] == pytest.approx(1164.0, abs=1.0)
 
 
 @pytest.mark.asyncio
@@ -191,8 +195,10 @@ async def test_realized_pnl_zero_when_legs_missing(engine):
     )
 
     args, _ = engine.equity_tracker.on_trade_closed.call_args
-    # Hedge PnL 20 - hedge fees 5 = 15; option_pnl skipped because legs missing.
-    assert args[0] == pytest.approx(15.0, abs=1.0)
+    # E1 (parity-cycle round 2): cost_rate = perp_taker_fee +
+    # perp_slippage_bps/1e4 = 0.0005 + 0.0002 = 0.0007.
+    # Hedge fee on $10K = $7. Hedge PnL 20 - 7 = $13.
+    assert args[0] == pytest.approx(13.0, abs=1.0)
 
 
 # ── E.1.15: index_price fallback removal ─────────────────────────────────
@@ -255,3 +261,67 @@ async def test_skip_equity_update_when_index_price_nan(engine):
     )
 
     engine.equity_tracker.on_trade_closed.assert_not_called()
+
+
+# ── 12.5%-of-premium fee cap (Plan: Part 1b, 2026-05-07) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_fee_cap_binds_for_low_premium_legs(engine):
+    """Per-leg cap = MIN(0.0003 BTC, 0.125 · leg_premium_btc).
+    Pre-fix the engine charged 4 × 0.0003 × index unconditionally; post-fix
+    it must apply 0.125·premium when that's tighter (deep-OTM / near-expiry).
+
+    Entry leg cap = 0.125·0.001 = 0.000125 BTC ⇒ $7.5/leg.
+    Exit  leg cap = 0.125·0.0008 = 0.0001 BTC ⇒ $6.0/leg.
+    Total fee = 2·$7.5 + 2·$6.0 = $27 (vs $72 pre-fix flat).
+
+    Option PnL: SHORT, entry premium 0.001+0.001=0.002 BTC × 1 × $60K = $120,
+    exit 0.0008+0.0008=0.0016 × 1 × $60K = $96 ⇒ option_pnl = +$24.
+    Net = 24 - 27 - 0 (no hedge) = -$3.
+    """
+    outcome = _make_outcome(
+        direction=-1, n_contracts_btc=1.0,
+        entry_call=0.001, entry_put=0.001,
+        exit_call=0.0008, exit_put=0.0008,
+        hedge_pnl_usd=0.0, total_usd_traded=0.0,
+    )
+    engine.straddle_flow.execute.return_value = outcome
+
+    fake_signal = SimpleNamespace(direction=-1, edge_vol_pts=10.0)
+    await engine._execute_and_persist(
+        fake_signal, n_contracts_btc=1.0,
+    )
+
+    args, _ = engine.equity_tracker.on_trade_closed.call_args
+    # 24 - 27 = -3. Pre-fix would have given 24 - 72 = -48.
+    assert args[0] == pytest.approx(-3.0, abs=0.5), (
+        "Per-fill 12.5% cap not applied — engine.py:1960 may have "
+        "regressed to the uncapped flat-fee formula."
+    )
+
+
+@pytest.mark.asyncio
+async def test_fee_cap_unbounded_at_typical_premiums(engine):
+    """Sanity counterpart to the cap-binds test: at typical V2 premiums
+    (≥ 0.005 BTC) the cap does NOT bind, so the post-fix fee equals the
+    pre-fix flat-fee value — proves the fix is non-destructive in the
+    regime where the strategy actually trades.
+    """
+    outcome = _make_outcome(
+        direction=-1, n_contracts_btc=1.0,
+        entry_call=0.05, entry_put=0.05,
+        exit_call=0.04, exit_put=0.04,
+        hedge_pnl_usd=0.0, total_usd_traded=0.0,
+    )
+    engine.straddle_flow.execute.return_value = outcome
+
+    fake_signal = SimpleNamespace(direction=-1, edge_vol_pts=10.0)
+    await engine._execute_and_persist(
+        fake_signal, n_contracts_btc=1.0,
+    )
+
+    args, _ = engine.equity_tracker.on_trade_closed.call_args
+    # SHORT: option_pnl = (0.10-0.08)·1·60000 = +$1200. Fee = 4·0.0003·60000 = $72.
+    # No hedge ⇒ net = 1200 - 72 = $1128.
+    assert args[0] == pytest.approx(1128.0, abs=1.0)

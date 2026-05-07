@@ -17,6 +17,34 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+# ── Fee math ───────────────────────────────────────────────────
+
+
+def deribit_option_fees_btc(
+    sigma_entry: np.ndarray,
+    T_entry: np.ndarray,
+    sigma_exit: np.ndarray,
+    T_exit: np.ndarray,
+    S_exec: np.ndarray,
+    fee_flat: float = 0.0003,
+) -> np.ndarray:
+    """Per-bar Deribit option fees in USD per BTC of straddle notional.
+
+    Deribit charges MIN(0.0003 BTC, 12.5% of premium) per fill, applied
+    against THAT FILL's premium — so entry and exit legs cap separately.
+    Premium is approximated via Brenner-Subrahmanyam: 0.4·σ·√T (BTC-units).
+    A round-trip straddle is 4 fills (entry call+put, exit call+put).
+    Returns USD per BTC (multiplied by S_exec).
+    """
+    T_e = np.maximum(T_entry, 1e-6)
+    T_x = np.maximum(T_exit, 1e-6)
+    prem_entry = 0.4 * sigma_entry * np.sqrt(T_e)
+    prem_exit = 0.4 * sigma_exit * np.sqrt(T_x)
+    fee_entry = np.minimum(fee_flat, 0.125 * prem_entry)
+    fee_exit = np.minimum(fee_flat, 0.125 * prem_exit)
+    return (2.0 * fee_entry + 2.0 * fee_exit) * S_exec
+
+
 # ── Configuration ──────────────────────────────────────────────
 
 class BacktestConfig(BaseModel):
@@ -1636,13 +1664,20 @@ class VolArbBacktester:
                 **delta_kw,
             )
 
-        # Option maker fees (entry + exit, 4 legs) with Deribit 12.5% cap
-        # Fee per leg = MIN(0.0003 BTC, 0.125 * option_price_btc)
-        # ATM call price in BTC ≈ 0.4 * sigma * sqrt(T) (Brenner-Subrahmanyam)
-        _opt_price_btc = 0.4 * sigma_dec * np.sqrt(np.maximum(T_years, 1e-6))
-        _fee_flat = cfg.option_maker_fee  # 0.0003 BTC per contract
-        _fee_capped = np.minimum(_fee_flat, 0.125 * _opt_price_btc)
-        option_fee_btc = 4 * _fee_capped * S_exec  # USD per BTC (4 legs)
+        # Option maker fees (4 fills: entry call+put, exit call+put) with
+        # Deribit 12.5%-of-premium PER-FILL cap. See deribit_option_fees_btc
+        # at the top of this module. Variable kept named option_fee_btc for
+        # back-compat — units are USD per BTC of notional.
+        _holding_years = cfg.holding_minutes / (365.25 * 24 * 60)
+        _T_years_exit = np.maximum(T_years - _holding_years, 1e-6)
+        option_fee_btc = deribit_option_fees_btc(
+            sigma_entry=sigma_dec,
+            T_entry=T_years,
+            sigma_exit=iv_exit / 100.0,
+            T_exit=_T_years_exit,
+            S_exec=S_exec,
+            fee_flat=cfg.option_maker_fee,
+        )
 
         # ── Vega stop: minute-level (honest) or terminal (lookahead) ──
         n_bars = len(S)

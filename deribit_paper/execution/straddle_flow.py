@@ -99,6 +99,7 @@ class StraddleFlow:
         max_trade_size_btc: float = 2.0,
         min_trade_size_btc: float = 0.1,
         n_hedge_ticks: int = 10,
+        delta_hedge_band: float = 0.01,         # E2 (parity-cycle round 2): wired through to PerpHedger
         spot_fetcher: Callable[[], Awaitable[float]] | None = None,
         vpin_provider: Callable[[], float] | None = None,
         maker_wait_seconds: float = 60.0,
@@ -124,6 +125,7 @@ class StraddleFlow:
         self._on_position_opened = on_position_opened
         self._on_position_closed = on_position_closed
         self._n_hedge_ticks = n_hedge_ticks
+        self._delta_hedge_band = float(delta_hedge_band)
         self._spot_fetcher = spot_fetcher
         self._vpin_provider = vpin_provider
         self._maker_wait_seconds = maker_wait_seconds
@@ -494,12 +496,18 @@ class StraddleFlow:
                 logger.exception("on_position_opened callback failed")
 
         # ── 3. Spawn hedge loop ────────────────────────────────────
+        # E2 (parity-cycle round 2 — 2026-05-07): wire ``cfg.delta_hedge_band``
+        # through to PerpHedger's dust threshold. Pre-fix the engine
+        # accepted ``delta_hedge_band=0.05`` from config but never
+        # passed it through, so PerpHedger used a hardcoded 0.01 BTC
+        # dust threshold — 5x tighter than configured.
         hedger = PerpHedger(
             order_manager=self._order_manager,
             live_drl_hedger=self._drl,
             perp_instrument=self._perp_instrument,
             bar_minutes=self._holding_minutes,
             n_ticks_per_bar=self._n_hedge_ticks,
+            dust_threshold_btc=self._delta_hedge_band,
             spot_fetcher=self._spot_fetcher,
         )
         hedge_task = asyncio.create_task(

@@ -108,6 +108,7 @@ class StraddleFlow:
         sizing_dd_floor: float = 0.25,         # min scale at deep drawdown (composite_v2)
         min_trade_floor: bool = False,         # return exchange min instead of 0.0
         use_tiered_taker: bool = False,        # E.1.6: 3-tier IOC ladder
+        cancel_exit_max_slippage_pct: float = 1.0,  # E-8 (2026-05-08): cap for recovery exits
         on_position_opened: Callable[..., Awaitable[None]] | None = None,
         on_position_closed: Callable[..., Awaitable[None]] | None = None,
     ):
@@ -133,6 +134,7 @@ class StraddleFlow:
         self._sizing_edge_cap = sizing_edge_cap
         self._sizing_dd_floor = sizing_dd_floor
         self._use_tiered_taker = use_tiered_taker
+        self._cancel_exit_max_slippage_pct = float(cancel_exit_max_slippage_pct)
 
     # ── Sizing ──────────────────────────────────────────────────────
 
@@ -296,6 +298,7 @@ class StraddleFlow:
         profit_scale: float = 1.0,
         kelly_mult: float = 1.0,
         taker_slippage_pct: float = 0.5,
+        vol_ann_entry_lagged: float | None = None,
     ) -> TradeOutcome:
         """Run the full signal → entry → hedge → exit lifecycle.
 
@@ -418,22 +421,38 @@ class StraddleFlow:
         # adversary observing log timestamps. The timestamp prefix is
         # kept for human-readable forensics.
         entry_nonce = secrets.token_hex(8)
+        # E-5 (parity-r3 cycle 2 — 2026-05-08): use maker-then-taker on
+        # entry to mirror the V2 backtester's SOR (`backtester.py:2215-2234`),
+        # which simulates a maker fill (zero option slippage) when a taker
+        # prints through the would-be-maker within 5s. ~30-60% of bars
+        # see maker fills offline; pre-fix live always paid full taker
+        # slip on every leg, accumulating ~$5-15/trade × 7,400 trades ≈
+        # $40-100K of phantom backtest PnL not reproducible live.
+        # `place_maker_then_taker` already implements the cancel-and-fall-back
+        # logic at `order_manager.py:819-972`, and `cfg.maker_wait_seconds`
+        # (default 60s) is already plumbed via `engine.py:861`. Exits stay
+        # on `place_ioc_taker` (immediately below) — bar-aligned exit
+        # timing makes a 60s maker wait miss the next bar's signal.
         entry_call, entry_put = await asyncio.gather(
-            self._order_manager.place_ioc_taker(
+            self._order_manager.place_maker_then_taker(
                 instrument_name=straddle.call_instrument,
                 side=entry_side,
                 amount=n_contracts,
-                max_slippage_pct=taker_slippage_pct,
+                maker_wait_seconds=self._maker_wait_seconds,
                 label=f"straddle_entry_C_{started_at.value}_{entry_nonce}",
-                tiered=self._use_tiered_taker,
+                reduce_only=False,
+                taker_max_slippage_pct=taker_slippage_pct,
+                taker_tiered=self._use_tiered_taker,
             ),
-            self._order_manager.place_ioc_taker(
+            self._order_manager.place_maker_then_taker(
                 instrument_name=straddle.put_instrument,
                 side=entry_side,
                 amount=n_contracts,
-                max_slippage_pct=taker_slippage_pct,
+                maker_wait_seconds=self._maker_wait_seconds,
                 label=f"straddle_entry_P_{started_at.value}_{entry_nonce}",
-                tiered=self._use_tiered_taker,
+                reduce_only=False,
+                taker_max_slippage_pct=taker_slippage_pct,
+                taker_tiered=self._use_tiered_taker,
             ),
         )
 
@@ -471,11 +490,27 @@ class StraddleFlow:
         # for all 10 ticks. ``None`` is the safe degraded mode — the
         # hedger falls back to ``iv_entry`` (matches pre-fix behaviour
         # under uncalibrated SVI / missing-expiry).
+        # D-8 (parity-r3 cycle 2 — 2026-05-08): prefer the lagged
+        # ``vol_ann`` (raw, prior bar) over the current bar's
+        # ``vol_ann_continuous``. The training env at
+        # ``env.py:172`` reads ``df["vol_ann"].shift(1)`` — i.e. the
+        # PRIOR bar's raw vol_ann — and the offline backtester's
+        # ``DRLHedger.simulate`` consumes the same column. Live's
+        # pre-fix value used (a) the current bar (one ahead) and (b)
+        # the jump-corrected ``continuous`` column (different formula).
+        # Fall back to the current bar only at cold start (no prior
+        # bar in the buffer yet).
+        if vol_ann_entry_lagged is not None and vol_ann_entry_lagged > 0:
+            vol_ann_entry_value = float(vol_ann_entry_lagged)
+        elif signal.bar_tsrv is not None:
+            vol_ann_entry_value = float(signal.bar_tsrv.vol_ann_continuous)
+        else:
+            vol_ann_entry_value = 0.8
         trade_id = self._drl.begin_trade(
             signal=signal.direction,
             S_entry=spot,
             K=straddle.strike,
-            vol_ann_entry=float(signal.bar_tsrv.vol_ann_continuous) if signal.bar_tsrv else 0.8,
+            vol_ann_entry=vol_ann_entry_value,
             iv_entry=float(signal.iv_used_pct) / 100.0 if signal.iv_used_pct else 0.75,
             tau_entry=tau_entry_years,
             V_bg=float(trailing_1h_volume_btc) if trailing_1h_volume_btc else 100.0,
@@ -563,20 +598,26 @@ class StraddleFlow:
             exit_side = "buy" if signal.direction == -1 else "sell"
             cancel_nonce = secrets.token_hex(8)
             try:
+                # E-8 (parity-r3 cycle 2 — 2026-05-08): cancel-exit uses
+                # tiered IOC instead of naked market — the slippage cap
+                # is enforced even on shutdown so the engine respects
+                # the "never naked market" contract from E.1.7.
                 await asyncio.gather(
-                    self._order_manager.place_and_wait(
+                    self._order_manager.place_ioc_taker(
                         instrument_name=straddle.call_instrument,
                         side=exit_side, amount=n_contracts,
-                        order_type="market",
+                        max_slippage_pct=self._cancel_exit_max_slippage_pct,
+                        tiered=True,
                         label=f"cancel_exit_C_{started_at.value}_{cancel_nonce}",
-                        timeout_seconds=15.0, reduce_only=True,
+                        reduce_only=True,
                     ),
-                    self._order_manager.place_and_wait(
+                    self._order_manager.place_ioc_taker(
                         instrument_name=straddle.put_instrument,
                         side=exit_side, amount=n_contracts,
-                        order_type="market",
+                        max_slippage_pct=self._cancel_exit_max_slippage_pct,
+                        tiered=True,
                         label=f"cancel_exit_P_{started_at.value}_{cancel_nonce}",
-                        timeout_seconds=15.0, reduce_only=True,
+                        reduce_only=True,
                     ),
                 )
                 logger.info("Cancellation exit orders sent for %s", trade_id)
@@ -671,6 +712,13 @@ class StraddleFlow:
         C5: Retries up to ``max_retries`` times with 2s backoff. If all
         retries fail, logs at CRITICAL and sends alert so the operator
         knows a naked single-leg position exists on the exchange.
+
+        E-8 (parity-r3 cycle 2 — 2026-05-08): close uses tiered IOC
+        taker, not naked market. The tier-3 ladder still escalates to
+        a wider IOC at ``1.5×max_slippage_pct``; on full miss it logs
+        CRITICAL and the per-attempt retry loop here gives the next
+        retry a chance at a stabilising book. Tier-3 protects against
+        manipulated thin books (E.1.7).
         """
         if not order.is_filled or order.filled_amount <= 0.0:
             return
@@ -681,16 +729,16 @@ class StraddleFlow:
         )
         for attempt in range(1, max_retries + 1):
             try:
-                result = await self._order_manager.place_and_wait(
+                result = await self._order_manager.place_ioc_taker(
                     instrument_name=instrument,
                     side=close_side,
                     amount=order.filled_amount,
-                    order_type="market",
+                    max_slippage_pct=self._cancel_exit_max_slippage_pct,
+                    tiered=True,
                     label=(
                         f"unilateral_close_{instrument}_{attempt}_"
                         f"{secrets.token_hex(8)}"
                     ),
-                    timeout_seconds=15.0,
                     reduce_only=True,
                 )
                 if result.is_filled:

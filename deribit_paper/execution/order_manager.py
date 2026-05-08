@@ -54,6 +54,31 @@ _TERMINAL_STATES: frozenset[str] = frozenset({
 })
 
 
+# O-4 (parity-r3 cycle 2 — 2026-05-08): Deribit's option tick size
+# depends on mark price. Per Deribit's instrument-rules table:
+#   mark <  0.05 BTC → 0.0001 BTC tick  (cheap options, far OTM / weeklies)
+#   mark >= 0.05 BTC → 0.0005 BTC tick  (ATM, near-term, expensive)
+# The cutover is exact at 0.05; we use ``<`` so 0.05 itself rounds to
+# 0.0005 (matching Deribit's API behaviour observed on testnet 2026-05-08).
+_OPTION_TICK_BREAKPOINT_BTC: float = 0.05
+_OPTION_TICK_FINE_BTC: float = 0.0001
+_OPTION_TICK_COARSE_BTC: float = 0.0005
+
+
+def _option_tick_for_mark(mark_price_btc: float) -> float:
+    """Return the Deribit option tick size for a given mark price.
+
+    A non-finite or non-positive mark falls back to the coarse tick
+    (defensive — pre-O-4 behaviour). Once a quote is available the
+    fine grid kicks in for cheap options.
+    """
+    if not (mark_price_btc > 0.0):
+        return _OPTION_TICK_COARSE_BTC
+    if mark_price_btc < _OPTION_TICK_BREAKPOINT_BTC:
+        return _OPTION_TICK_FINE_BTC
+    return _OPTION_TICK_COARSE_BTC
+
+
 def _merge_tier_results(a: "OrderResult", b: "OrderResult") -> "OrderResult":
     """Aggregate two tiered IOC results (filled_amount weighted average).
 
@@ -398,8 +423,15 @@ class OrderManager:
                 timeout_seconds=30.0,
             )
 
-        # Deribit option tick size is 0.0005 BTC
-        tick = 0.0005
+        # O-4 (parity-r3 cycle 2 — 2026-05-08): Deribit option tick is
+        # 0.0001 BTC for marks below 0.05 BTC, 0.0005 BTC otherwise.
+        # Pre-fix the engine hardcoded 0.0005, over-rounding tier-1/-2
+        # caps on cheap options (e.g. far OTM weeklies, mark ~0.001 BTC)
+        # by ~5x — typically pulling the cap THROUGH the touch and
+        # turning a ~0.5% slippage cap into a 5% one. The mark price
+        # is already in the ticker payload from the get_ticker() above.
+        mark_price = float(ticker.get("mark_price", 0.0) or 0.0)
+        tick = _option_tick_for_mark(mark_price)
 
         if side == "buy":
             best = float(ticker.get("best_ask_price", 0.0) or 0.0)
@@ -491,7 +523,10 @@ class OrderManager:
                 timeout_seconds=30.0,
             ))
 
-        tick = 0.0005   # Deribit option tick size in BTC.
+        # O-4 (parity-r3 cycle 2 — 2026-05-08): mark-price-aware tick
+        # (0.0001 BTC for mark < 0.05 BTC, else 0.0005).
+        mark_price = float(ticker.get("mark_price", 0.0) or 0.0)
+        tick = _option_tick_for_mark(mark_price)
         if side == "buy":
             best = float(ticker.get("best_ask_price", 0.0) or 0.0)
             tier1_cap = round((best + tick) / tick) * tick
@@ -591,6 +626,7 @@ class OrderManager:
             )
             return _stamp_total(_merge_tier_results(r1, r2))
 
+        # ``tick`` was set above using the mark-aware helper (O-4).
         if side == "buy":
             tier3_cap = round((best * (1.0 + 1.5 * max_slippage_pct / 100.0)) / tick) * tick
         else:
@@ -825,6 +861,8 @@ class OrderManager:
         maker_wait_seconds: float = 60.0,
         label: str | None = None,
         reduce_only: bool | None = None,
+        taker_max_slippage_pct: float = 1.0,
+        taker_tiered: bool = False,
     ) -> OrderResult:
         """MkrTkr60: post a limit order, wait for maker fill, fallback to taker.
 
@@ -832,7 +870,14 @@ class OrderManager:
         2. Post a limit order joining the passive side (post_only=True)
         3. Poll for up to ``maker_wait_seconds``
         4. If filled: return (maker fill, zero exchange fee on options)
-        5. If not filled / partially filled: cancel, send market for remainder
+        5. If not filled / partially filled: cancel, IOC taker for remainder
+
+        E-8 (parity-r3 cycle 2 — 2026-05-08): the taker fallback now uses
+        :meth:`place_ioc_taker` (with optional tiered ladder) so the
+        slippage cap is enforced even on cancel/timeout — pre-fix this
+        sent a naked market order, defeating the price protection the
+        rest of the engine enforces. Mirrors E.1.7's "never naked market"
+        contract from the tier-3 ladder.
 
         Perp hedges should NOT use this — they stay market for latency.
         """
@@ -844,17 +889,17 @@ class OrderManager:
             ticker = await self._rest.get_ticker(instrument_name)
         except Exception as exc:
             logger.warning(
-                "MkrTkr60: get_ticker(%s) failed (%s) -- falling back to market",
+                "MkrTkr60: get_ticker(%s) failed (%s) -- falling back to taker",
                 instrument_name, exc,
             )
-            return await self.place_and_wait(
+            return await self.place_ioc_taker(
                 instrument_name=instrument_name,
                 side=side,
                 amount=amount,
-                order_type="market",
+                max_slippage_pct=taker_max_slippage_pct,
                 label=f"{label}_tkr",
                 reduce_only=reduce_only,
-                timeout_seconds=30.0,
+                tiered=taker_tiered,
             )
 
         # 2. Compute limit price: join the passive side
@@ -866,17 +911,17 @@ class OrderManager:
             limit_price = float(ticker.get("mark_price", 0.0) or 0.0)
         if limit_price <= 0:
             logger.warning(
-                "MkrTkr60: no valid price for %s -- falling back to market",
+                "MkrTkr60: no valid price for %s -- falling back to taker",
                 instrument_name,
             )
-            return await self.place_and_wait(
+            return await self.place_ioc_taker(
                 instrument_name=instrument_name,
                 side=side,
                 amount=amount,
-                order_type="market",
+                max_slippage_pct=taker_max_slippage_pct,
                 label=f"{label}_tkr",
                 reduce_only=reduce_only,
-                timeout_seconds=30.0,
+                tiered=taker_tiered,
             )
 
         logger.info(
@@ -927,15 +972,17 @@ class OrderManager:
             maker_result.raw["execution_type"] = "maker"
             return maker_result
 
-        # 5. Taker fallback
-        taker_result = await self.place_and_wait(
+        # 5. Taker fallback (E-8 2026-05-08: was naked market; now IOC
+        # tiered to enforce the slippage cap on cancel/timeout. Maintains
+        # the engine's "never naked market" contract from E.1.7.)
+        taker_result = await self.place_ioc_taker(
             instrument_name=instrument_name,
             side=side,
             amount=remaining,
-            order_type="market",
+            max_slippage_pct=taker_max_slippage_pct,
             label=f"{label}_tkr",
             reduce_only=reduce_only,
-            timeout_seconds=30.0,
+            tiered=taker_tiered,
         )
 
         # 6. Combine maker + taker into a single result

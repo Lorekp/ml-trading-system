@@ -39,15 +39,26 @@ def _make_filled_result() -> OrderResult:
 
 
 def _make_flow(*, use_tiered: bool) -> tuple[StraddleFlow, list[dict]]:
-    """Return a flow instance plus a list of recorded place_ioc_taker calls."""
+    """Return a flow instance plus a list of recorded entry+exit calls.
+
+    E-5 (parity-r3 cycle 2 — 2026-05-08): entry path uses
+    ``place_maker_then_taker``; exit path uses ``place_ioc_taker``.
+    Both record into the same ``calls`` list with a ``_method`` key
+    so assertions can distinguish entry-vs-exit.
+    """
     calls: list[dict] = []
 
-    async def _record(**kwargs) -> OrderResult:
-        calls.append(kwargs)
+    async def _record_maker_then_taker(**kwargs) -> OrderResult:
+        calls.append({**kwargs, "_method": "maker_then_taker"})
+        return _make_filled_result()
+
+    async def _record_ioc_taker(**kwargs) -> OrderResult:
+        calls.append({**kwargs, "_method": "ioc_taker"})
         return _make_filled_result()
 
     om = MagicMock()
-    om.place_ioc_taker = _record
+    om.place_maker_then_taker = _record_maker_then_taker
+    om.place_ioc_taker = _record_ioc_taker
     om._rest = None             # disables the spread-fetch branch in execute
     om.place_and_wait = AsyncMock(return_value=_make_filled_result())
 
@@ -122,9 +133,18 @@ def test_all_four_ioc_sites_propagate_tiered_flag(
         kelly_mult=1.0,
     ))
 
-    # Expect exactly 4 IOC calls: entry C, entry P, exit C, exit P.
+    # Expect 4 calls total: 2 entry maker_then_taker + 2 exit ioc_taker.
+    # E-5 (parity-r3 cycle 2 — 2026-05-08): the tiered flag arrives at
+    # entry as ``taker_tiered`` (controlling the maker→taker fallback),
+    # at exit as ``tiered`` (controlling the steady-state IOC ladder).
     assert len(calls) == 4, calls
-    for c in calls:
+    entry_calls = [c for c in calls if c["_method"] == "maker_then_taker"]
+    exit_calls = [c for c in calls if c["_method"] == "ioc_taker"]
+    assert len(entry_calls) == 2
+    assert len(exit_calls) == 2
+    for c in entry_calls:
+        assert c.get("taker_tiered") == expected_tiered, c
+    for c in exit_calls:
         assert c.get("tiered") == expected_tiered, c
 
 
@@ -155,6 +175,9 @@ def test_order_labels_unique_across_concurrent_trades():
 
     def _build_flow():
         om = MagicMock()
+        # E-5 (parity-r3 cycle 2 — 2026-05-08): entry uses
+        # place_maker_then_taker, exit uses place_ioc_taker.
+        om.place_maker_then_taker = _record
         om.place_ioc_taker = _record
         om._rest = None
         om.place_and_wait = AsyncMock(return_value=_make_filled_result())
@@ -206,11 +229,20 @@ def test_observed_spread_widens_taker_slippage_pct_in_execute():
     ``live_slippage_pct``, raising ``taker_slippage_pct`` for the IOC
     call sites. Caller passed ``taker_slippage_pct=0.05`` (sidecar-tight),
     but a $300 observed spread at $60K spot = 0.5% > 1.5×0.05% = 0.075%
-    → override fires → ~0.5% used at the IOC."""
+    → override fires → ~0.5% used at the IOC.
+
+    E-5 (parity-r3 cycle 2 — 2026-05-08): entry path uses
+    ``place_maker_then_taker``; the override flows to entry via
+    ``taker_max_slippage_pct`` and to exit via ``max_slippage_pct``.
+    """
     calls: list[dict] = []
 
-    async def _record(**kwargs) -> OrderResult:
-        calls.append(kwargs)
+    async def _record_maker_then_taker(**kwargs) -> OrderResult:
+        calls.append({**kwargs, "_method": "maker_then_taker"})
+        return _make_filled_result()
+
+    async def _record_ioc_taker(**kwargs) -> OrderResult:
+        calls.append({**kwargs, "_method": "ioc_taker"})
         return _make_filled_result()
 
     rest = MagicMock()
@@ -220,7 +252,8 @@ def test_observed_spread_widens_taker_slippage_pct_in_execute():
     })
 
     om = MagicMock()
-    om.place_ioc_taker = _record
+    om.place_maker_then_taker = _record_maker_then_taker
+    om.place_ioc_taker = _record_ioc_taker
     om._rest = rest
     om.place_and_wait = AsyncMock(return_value=_make_filled_result())
 
@@ -259,10 +292,15 @@ def test_observed_spread_widens_taker_slippage_pct_in_execute():
         taker_slippage_pct=0.05,            # tight sidecar value
     ))
 
-    # All 4 IOC sites got the OVERRIDE pct, not the original 0.05.
+    # All 4 sites got the OVERRIDE pct, not the original 0.05.
     # Override pct ≈ 0.5% (300/60000 × 100).
     assert len(calls) == 4
     for c in calls:
-        # Override fired → close to 0.5%, not 0.05%.
-        assert c["max_slippage_pct"] > 0.4
-        assert c["max_slippage_pct"] < 1.0      # also clipped by cap_pct=1.0
+        if c["_method"] == "maker_then_taker":
+            # Entry: pct flows through ``taker_max_slippage_pct``
+            assert c["taker_max_slippage_pct"] > 0.4
+            assert c["taker_max_slippage_pct"] < 1.0
+        else:
+            # Exit: pct flows through ``max_slippage_pct``
+            assert c["max_slippage_pct"] > 0.4
+            assert c["max_slippage_pct"] < 1.0

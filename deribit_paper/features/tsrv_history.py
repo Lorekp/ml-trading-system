@@ -94,6 +94,25 @@ class TSRVHistoryBuffer:
             return None
         return self._rows[-1]
 
+    def latest_vol_ann_lagged(self) -> float | None:
+        """D-8 (parity-r3 cycle 2 — 2026-05-08): the most recent
+        ``vol_ann`` in the buffer.
+
+        Call this BEFORE :meth:`append_bar` for the current bar; the
+        return is then ``vol_ann[T-1]`` — the lagged value the training
+        env (``vol_arb/drl_hedging/env.py:172``:
+        ``df["vol_ann_lagged"] = df["vol_ann"].shift(1)``) and the
+        offline backtester (``DRLHedger.simulate``) both consume as
+        ``sigma`` in the GBM simulator.
+
+        Returns ``None`` when the buffer is empty (cold start with no
+        prewarm + no live bars yet); the caller falls back to the
+        current bar's ``vol_ann`` to keep the trade alive.
+        """
+        if not self._rows:
+            return None
+        return float(self._rows[-1].vol_ann)
+
     def as_series(self, field: str) -> pd.Series:
         """Return one column as a timestamp-indexed pandas Series."""
         if not self._rows:

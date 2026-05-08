@@ -401,10 +401,34 @@ class TradingEngine:
         )
 
         def _on_ws_reconnect() -> None:
+            # O-9 (parity-r3 cycle 2 \u2014 2026-05-08): on WS reconnect, fire
+            # a fire-and-forget reconciliation against
+            # ``rest.get_open_orders_by_currency`` so the engine knows
+            # whether anything orphaned during the WS gap. Pre-fix the
+            # engine just sent a Telegram message; orders submitted via
+            # the maker-then-taker path that timed out during the gap
+            # could remain open at the venue with no listener \u2014 and a
+            # second WS hiccup + 3 REST timeouts would trip the kill
+            # switch on what is really a transient network blip.
             if self.telegram is not None:
                 self.telegram.send(
                     "error",
                     "Deribit WS reconnected \u2014 channels resubscribed",
+                )
+            # Schedule the reconciliation; never block the WS reconnect
+            # callback itself (it must return synchronously to the WS
+            # client's reconnect path).
+            try:
+                asyncio.create_task(
+                    self._reconcile_open_orders_on_reconnect(),
+                    name="reconcile_open_orders_on_ws_reconnect",
+                )
+            except RuntimeError:
+                # No running event loop (e.g., test harness invoking
+                # the callback directly). Safe to skip; the next reconnect
+                # under a real loop will catch up.
+                logger.debug(
+                    "O-9: no running loop on _on_ws_reconnect; skipping reconcile",
                 )
 
         self.ws = DeribitWebSocketClient(
@@ -864,6 +888,7 @@ class TradingEngine:
             sizing_dd_floor=cfg.sizing_dd_floor,
             min_trade_floor=cfg.min_trade_floor,
             use_tiered_taker=cfg.use_tiered_taker,
+            cancel_exit_max_slippage_pct=cfg.cancel_exit_max_slippage_pct,
             on_position_opened=self._on_position_opened,
             on_position_closed=self._on_position_closed,
         )
@@ -888,6 +913,29 @@ class TradingEngine:
         self.position_tracker = PositionTracker()
         self.store = SQLiteStore(cfg.sqlite_db)
         await self.store.open()
+
+        # D-11 (parity-r3 cycle 2 — 2026-05-08): wire the DRL hedger's
+        # state-persistence callbacks to the SQLite store. Sync→async
+        # bridge via ``asyncio.create_task`` so the synchronous
+        # ``LiveDRLHedger.step()`` hot path returns immediately while
+        # the SQLite write proceeds in the background. ``store`` is
+        # opened above; ``live_drl_hedger`` was constructed earlier
+        # without persister callbacks (cold-start safe — persistence
+        # is disabled until this wiring runs).
+        def _drl_state_persister(state_dict: dict[str, Any]) -> None:
+            asyncio.create_task(
+                self.store.persist_drl_trade_state(state_dict),
+                name=f"persist_drl_{state_dict['trade_id']}",
+            )
+
+        def _drl_state_remover(trade_id: str) -> None:
+            asyncio.create_task(
+                self.store.remove_drl_trade_state(trade_id),
+                name=f"remove_drl_{trade_id}",
+            )
+
+        self.live_drl_hedger._state_persister = _drl_state_persister
+        self.live_drl_hedger._state_remover = _drl_state_remover
 
         # S1+S3 (parity-cycle round 2 — 2026-05-07): restore engine
         # state across restarts. Pre-fix the equity tracker, edge_ema,
@@ -1914,6 +1962,22 @@ class TradingEngine:
             bar=bar, bar_tsrv=bar_tsrv, straddle=straddle,
             transvol_embedding=None,  # fresh TransVol is Phase 4B follow-up
         )
+        # D-8 (parity-r3 cycle 2 — 2026-05-08): capture vol_ann_lagged
+        # BEFORE the F-1 append below so it reflects bar T-1's vol_ann
+        # (the value training env + offline backtester consume as the
+        # GBM simulator's σ at decision time T). Pre-fix the engine
+        # passed ``signal.bar_tsrv.vol_ann_continuous`` (current bar,
+        # plus a wrong column — env uses raw ``vol_ann``, not
+        # ``vol_ann_continuous``). After the F-1 append the buffer
+        # would be at bar T; we'd then need ``iloc[-2]`` for lagged.
+        # Capturing here avoids that fragile post-append index dance.
+        # ``getattr`` with default keeps test stubs that don't construct
+        # the buffer happy (some unit tests build engines via
+        # ``TradingEngine.__new__`` to bypass the full async setup).
+        vol_ann_lagged: float | None = None
+        _hist = getattr(self, "tsrv_history_buffer", None)
+        if _hist is not None:
+            vol_ann_lagged = _hist.latest_vol_ann_lagged()
         # F-1 fix (round-3 audit, parity-r5 — 2026-05-08):
         # Append this bar's TSRV to the history buffer ONLY AFTER the
         # predictor has read it. Pre-fix this lived right after
@@ -2149,6 +2213,7 @@ class TradingEngine:
                 profit_scale=profit_scale,
                 kelly_mult=kelly_mult,
                 taker_slippage_pct=taker_slippage_pct,
+                vol_ann_lagged=vol_ann_lagged,
             ),
             name=f"trade_{bar.timestamp.value}",
         )
@@ -2170,8 +2235,19 @@ class TradingEngine:
         profit_scale: float = 1.0,
         kelly_mult: float = 1.0,
         taker_slippage_pct: float = 0.5,
+        vol_ann_lagged: float | None = None,
     ) -> None:
-        """Run a straddle trade + update all state after completion."""
+        """Run a straddle trade + update all state after completion.
+
+        D-8 (parity-r3 cycle 2 — 2026-05-08): ``vol_ann_lagged`` is the
+        prior bar's ``vol_ann`` (raw, not continuous), captured by the
+        bar-loop BEFORE the F-1 ``tsrv_history_buffer`` append. The
+        offline backtester (``DRLHedger.simulate``) and training env
+        (``env.py:172``: ``df["vol_ann"].shift(1)``) both consume the
+        lagged value as ``sigma`` in the GBM simulator. Pre-fix the
+        engine passed ``signal.bar_tsrv.vol_ann_continuous`` (current
+        bar, jump-corrected) which differs in BOTH lag and column.
+        """
         try:
             outcome = await self.straddle_flow.execute(
                 signal=signal,
@@ -2185,6 +2261,7 @@ class TradingEngine:
                 profit_scale=profit_scale,
                 kelly_mult=kelly_mult,
                 taker_slippage_pct=taker_slippage_pct,
+                vol_ann_entry_lagged=vol_ann_lagged,
             )
         except Exception as exc:  # noqa: BLE001 - log + kill-switch
             logger.exception("StraddleFlow.execute failed: %s", exc)
@@ -2667,6 +2744,109 @@ class TradingEngine:
         if self.store is not None:
             await self.store.remove_open_position(trade_id)
 
+    # ── O-9: WS reconnect open-orders reconcile ──────────────────────
+
+    async def _reconcile_open_orders_on_reconnect(self) -> None:
+        """O-9 (parity-r3 cycle 2 — 2026-05-08): reconcile venue's open
+        orders with the engine after a WS reconnect.
+
+        Strategy: query ``get_open_orders_by_currency`` and surface the
+        result. We do NOT cancel orders aggressively — the inline
+        polling in ``OrderManager.place_and_wait`` is each call's own
+        custodian (it polls REST until terminal regardless of WS state).
+        Instead we log + alert so the operator has visibility, and we
+        cancel only orders OLDER than ``ws_reconcile_orphan_age_seconds``
+        (default 300s = 5 min — well past any reasonable in-flight call's
+        timeout) — those are the ones an interrupted prior session
+        almost certainly left behind.
+
+        Paper mode: skipped (no exchange-side state to reconcile).
+        """
+        if self.config.paper_mode:
+            return
+        if self.rest is None:
+            return
+        try:
+            orders = await self.rest.get_open_orders_by_currency(
+                currency=self.config.currency,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "O-9: get_open_orders_by_currency failed on reconnect: %s",
+                exc,
+            )
+            if self.telegram is not None:
+                self.telegram.send(
+                    "error",
+                    f"WS reconnect: failed to query open orders ({exc})",
+                )
+            return
+
+        n = len(orders or [])
+        logger.info(
+            "O-9: WS reconnect — venue has %d open order(s)",
+            n,
+        )
+        if n == 0:
+            return
+
+        # Age-gate cleanup: orders older than ``orphan_age_seconds`` are
+        # almost certainly stale (the engine's inline polls all return
+        # to terminal within seconds-to-30s).
+        now_ms = pd.Timestamp.now(tz="UTC").value // 10**6
+        orphan_age_ms = int(
+            float(self.config.ws_reconcile_orphan_age_seconds) * 1000,
+        )
+        orphans: list[dict[str, Any]] = []
+        in_flight: list[dict[str, Any]] = []
+        for o in orders:
+            creation_ms = int(
+                o.get("creation_timestamp", 0) or 0,
+            )
+            age_ms = max(0, now_ms - creation_ms)
+            if creation_ms > 0 and age_ms >= orphan_age_ms:
+                orphans.append(o)
+            else:
+                in_flight.append(o)
+
+        if in_flight:
+            logger.info(
+                "O-9: %d order(s) appear in-flight (age < %ds); leaving "
+                "them to the inline polls",
+                len(in_flight),
+                int(self.config.ws_reconcile_orphan_age_seconds),
+            )
+
+        if not orphans:
+            return
+
+        cancelled = 0
+        for o in orphans:
+            order_id = str(o.get("order_id", ""))
+            instrument = str(o.get("instrument_name", ""))
+            label = str(o.get("label", "(no-label)"))
+            try:
+                await self.order_manager.cancel(order_id)
+                cancelled += 1
+                logger.warning(
+                    "O-9: cancelled stale order %s on %s "
+                    "(label=%s, age >= %ds)",
+                    order_id, instrument, label,
+                    int(self.config.ws_reconcile_orphan_age_seconds),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "O-9: cancel of stale order %s failed: %s",
+                    order_id, exc,
+                )
+
+        if self.telegram is not None and cancelled > 0:
+            self.telegram.send(
+                "error",
+                f"WS reconnect cleanup: cancelled {cancelled} stale order(s) "
+                f"(>= {int(self.config.ws_reconcile_orphan_age_seconds)}s old)",
+            )
+
     # ── C1: Startup position reconciliation ────────────────────────
 
     async def _reconcile_positions_on_startup(self) -> None:
@@ -2801,16 +2981,22 @@ class TradingEngine:
                             instrument, close_side, close_amount,
                             attempt, self.config.max_orphan_close_retries,
                         )
-                        result = await self.order_manager.place_and_wait(
+                        # E-8 (parity-r3 cycle 2 — 2026-05-08): tiered IOC
+                        # instead of naked market on orphan close. Same
+                        # rationale as the cancel-exit path in
+                        # `straddle_flow.execute`: respect the slippage
+                        # cap even during recovery; tier-3 escalates to
+                        # ``1.5×`` of the cap before logging CRITICAL.
+                        result = await self.order_manager.place_ioc_taker(
                             instrument_name=instrument,
                             side=close_side,
                             amount=close_amount,
-                            order_type="market",
+                            max_slippage_pct=self.config.cancel_exit_max_slippage_pct,
+                            tiered=True,
                             label=(
                                 f"orphan_close_{instrument}_{attempt}_"
                                 f"{secrets.token_hex(8)}"
                             ),
-                            timeout_seconds=30.0,
                             reduce_only=True,
                         )
                         if result.is_filled:
@@ -2852,6 +3038,13 @@ class TradingEngine:
         Registers the position in the in-memory tracker.  If the holding
         period has time remaining, spawns an abbreviated close task.  If
         it already expired, closes the position immediately.
+
+        D-11 (parity-r3 cycle 2 — 2026-05-08): also rehydrates the DRL
+        hedger's per-trade state (``hedge_inventory_btc``, frozen SVI
+        slice, etc.) from the persisted ``drl_trade_state`` row. Pre-fix
+        the hedger had no entry on resume → next perp tick computed
+        ``delta_required = target - 0.0`` and over-traded by exactly
+        the prior tick's hedge inventory.
         """
         from deribit_paper.position.tracker import OpenPosition
         trade_id = db_row["trade_id"]
@@ -2875,6 +3068,39 @@ class TradingEngine:
             entry_equity_usd=self.equity_tracker.current_equity,
         )
         self.position_tracker._positions[trade_id] = pos
+
+        # D-11: rehydrate the DRL hedger if a persisted state row exists.
+        if self.store is not None and self.live_drl_hedger is not None:
+            try:
+                drl_states = await self.store.load_drl_trade_states()
+            except Exception:  # noqa: BLE001 — defensive, never block resume
+                logger.exception(
+                    "D-11: load_drl_trade_states failed; %s will be hedged "
+                    "from inventory=0 (one-tick over-trade possible)",
+                    trade_id,
+                )
+                drl_states = []
+            for state in drl_states:
+                if state["trade_id"] == trade_id:
+                    try:
+                        self.live_drl_hedger.resume_trade_from_dict(state)
+                        logger.info(
+                            "D-11: resumed DRL state for %s (hedge_inv=%.4f, tick=%d)",
+                            trade_id, state["hedge_inventory_btc"], state["tick"],
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "D-11: resume_trade_from_dict failed for %s",
+                            trade_id,
+                        )
+                    break
+            else:
+                logger.warning(
+                    "D-11: no persisted DRL state for %s — hedger will start "
+                    "from inventory=0 (next tick may over-trade by the prior "
+                    "session's last hedge_inventory_btc)",
+                    trade_id,
+                )
 
         if remaining <= 0:
             logger.info(
@@ -2910,7 +3136,11 @@ class TradingEngine:
         await self._close_resumed_position(db_row)
 
     async def _close_resumed_position(self, db_row: dict[str, Any]) -> None:
-        """Close both legs of a resumed straddle position via market orders."""
+        """Close both legs of a resumed straddle position.
+
+        E-8 (parity-r3 cycle 2 — 2026-05-08): uses tiered IOC instead
+        of naked market — see ``cancel_exit_max_slippage_pct`` in config.
+        """
         trade_id = db_row["trade_id"]
         direction = db_row["signal_direction"]
         n = db_row["n_contracts_btc"]
@@ -2919,19 +3149,21 @@ class TradingEngine:
         logger.info("Closing resumed position %s: %s %.2f BTC", trade_id, exit_side, n)
         try:
             await asyncio.gather(
-                self.order_manager.place_and_wait(
+                self.order_manager.place_ioc_taker(
                     instrument_name=db_row["call_instrument"],
                     side=exit_side, amount=n,
-                    order_type="market",
+                    max_slippage_pct=self.config.cancel_exit_max_slippage_pct,
+                    tiered=True,
                     label=f"resume_exit_C_{trade_id}_{secrets.token_hex(8)}",
-                    timeout_seconds=30.0, reduce_only=True,
+                    reduce_only=True,
                 ),
-                self.order_manager.place_and_wait(
+                self.order_manager.place_ioc_taker(
                     instrument_name=db_row["put_instrument"],
                     side=exit_side, amount=n,
-                    order_type="market",
+                    max_slippage_pct=self.config.cancel_exit_max_slippage_pct,
+                    tiered=True,
                     label=f"resume_exit_P_{trade_id}_{secrets.token_hex(8)}",
-                    timeout_seconds=30.0, reduce_only=True,
+                    reduce_only=True,
                 ),
             )
             logger.info("Resumed position %s closed successfully", trade_id)

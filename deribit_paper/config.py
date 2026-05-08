@@ -137,6 +137,14 @@ class PaperConfig:
     intra_bar_hedge_ticks: int = 10           # matches backtester's hedge_sim_steps
     order_retry_max: int = 3                  # retry transient errors this many times
     max_slippage_pct: float = 0.5             # IOC cap above best ask / below best bid
+    # E-8 (parity-r3 cycle 2 — 2026-05-08): slippage cap for cancel /
+    # recovery exits (unilateral close, kill-switch unwind, resumed-trade
+    # close on startup). Wider than the steady-state ``max_slippage_pct``
+    # because we MUST flatten the position; tier-3 still escalates to
+    # ``1.5×`` of this before logging CRITICAL. Pre-fix the recovery
+    # paths sent naked market orders, defeating the engine's "never
+    # naked market" contract (E.1.7).
+    cancel_exit_max_slippage_pct: float = 1.0
     # E.1.6: when True, all 4 production IOC sites in straddle_flow.py
     # escalate through the 3-tier ladder
     # (touch+1tick → cap → bounded-IOC). Off by default to preserve the
@@ -159,6 +167,14 @@ class PaperConfig:
     # mainnet operators should set ~3000ms.
     kill_switch_latency_ms: float = float("inf")
     network_outage_seconds: int = 120         # halt if no WS messages for this long
+    # O-9 (parity-r3 cycle 2 — 2026-05-08): on WS reconnect, the engine
+    # queries `get_open_orders_by_currency` to reconcile what the venue
+    # thinks is open vs the engine's in-flight polling state. Orders
+    # older than this many seconds are treated as stale orphans (from
+    # an interrupted prior session) and cancelled; younger orders are
+    # left to the inline polls. 5 min is safely past any reasonable
+    # in-flight call's timeout (30s order timeout × 3 retries × backoff).
+    ws_reconcile_orphan_age_seconds: float = 300.0
     # WS data-stale watchdog: forcibly close + reconnect the WS if no
     # subscription message arrives in this many seconds. Sits BELOW
     # ``network_outage_seconds`` so the watchdog triggers a recovery

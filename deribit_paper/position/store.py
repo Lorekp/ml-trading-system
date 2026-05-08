@@ -154,6 +154,53 @@ CREATE TABLE IF NOT EXISTS engine_state (
     svi_recal_failures INTEGER NOT NULL DEFAULT 0,
     last_updated TEXT NOT NULL
 );
+
+-- D-11 (parity-r3 cycle 2 — 2026-05-08): persist the DRL hedger's
+-- per-trade state across engine restarts. Pre-fix the
+-- ``LiveDRLHedger._trades`` dict was held in memory only; on restart,
+-- after ``_resume_trade`` rebuilds the OpenPosition tracker, the DRL
+-- hedger had no entry for the trade — causing either (a) a KeyError
+-- on the next perp-hedge tick, or (b) a fresh `_LiveTradeState` with
+-- ``hedge_inventory_btc=0.0`` overlaid on the actual perp position
+-- already on the exchange, leading to a 2× hedge on the next move.
+--
+-- One row per active trade. Linked to ``open_positions`` via FK so a
+-- DELETE on the parent cascades. Mutable fields are updated after
+-- every ``step()`` (cheap because SQLite WAL handles 10s of writes/sec
+-- and the engine's hedger fires ~10 ticks per 15-min bar).
+CREATE TABLE IF NOT EXISTS drl_trade_state (
+    trade_id TEXT PRIMARY KEY,
+    -- Entry-time invariants (recovered exactly to rebuild _LiveTradeState)
+    signal INTEGER NOT NULL,
+    K REAL NOT NULL,
+    s_entry REAL NOT NULL,
+    vol_ann_entry REAL NOT NULL,
+    iv_entry REAL NOT NULL,
+    v_bg REAL NOT NULL,
+    jump_fraction REAL NOT NULL,
+    vpin REAL NOT NULL,
+    tau_entry REAL NOT NULL,
+    delta_entry REAL NOT NULL,
+    delta_theo_entry_abs REAL NOT NULL,
+    -- SVI slice (nullable for trades begun without a calibrated slice)
+    svi_a REAL,
+    svi_b REAL,
+    svi_rho REAL,
+    svi_m REAL,
+    svi_sigma REAL,
+    svi_t REAL,
+    svi_f REAL,
+    -- Mutable fields (updated after every step())
+    hedge_inventory_btc REAL NOT NULL DEFAULT 0.0,
+    tick INTEGER NOT NULL DEFAULT 0,
+    total_trade_size_btc REAL NOT NULL DEFAULT 0.0,
+    total_impact_cost_usd REAL NOT NULL DEFAULT 0.0,
+    last_updated TEXT NOT NULL,
+    FOREIGN KEY(trade_id) REFERENCES open_positions(trade_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_drl_trade_state_last_updated
+    ON drl_trade_state(last_updated);
 """
 
 # S5+S8: ALTER TABLE migrations for engine_state when an older row exists
@@ -433,6 +480,122 @@ class SQLiteStore:
             }
             for r in rows
         ]
+
+    # ── DRL trade state (D-11 parity-r3 cycle 2 — 2026-05-08) ─────
+
+    async def persist_drl_trade_state(self, state: dict[str, Any]) -> None:
+        """Upsert one trade's DRL hedger state.
+
+        Idempotent via ``INSERT OR REPLACE`` on the ``trade_id`` PK.
+        Called on every ``LiveDRLHedger.step()`` to keep the persisted
+        ``hedge_inventory_btc`` in lockstep with the in-memory state —
+        so a restart between ticks correctly resumes the hedger at the
+        last known inventory rather than re-zeroing it (which would
+        2× the next perp tick).
+        """
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        last_updated = pd.Timestamp.now(tz="UTC").isoformat()
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO drl_trade_state (
+                trade_id, signal, K, s_entry, vol_ann_entry, iv_entry,
+                v_bg, jump_fraction, vpin, tau_entry, delta_entry,
+                delta_theo_entry_abs,
+                svi_a, svi_b, svi_rho, svi_m, svi_sigma, svi_t, svi_f,
+                hedge_inventory_btc, tick, total_trade_size_btc,
+                total_impact_cost_usd, last_updated
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                state["trade_id"],
+                int(state["signal"]),
+                float(state["K"]),
+                float(state["s_entry"]),
+                float(state["vol_ann_entry"]),
+                float(state["iv_entry"]),
+                float(state["v_bg"]),
+                float(state["jump_fraction"]),
+                float(state["vpin"]),
+                float(state["tau_entry"]),
+                float(state["delta_entry"]),
+                float(state["delta_theo_entry_abs"]),
+                state.get("svi_a"),
+                state.get("svi_b"),
+                state.get("svi_rho"),
+                state.get("svi_m"),
+                state.get("svi_sigma"),
+                state.get("svi_t"),
+                state.get("svi_f"),
+                float(state["hedge_inventory_btc"]),
+                int(state["tick"]),
+                float(state["total_trade_size_btc"]),
+                float(state["total_impact_cost_usd"]),
+                last_updated,
+            ),
+        )
+        await self._conn.commit()
+
+    async def remove_drl_trade_state(self, trade_id: str) -> None:
+        """Remove a closed trade's DRL state (idempotent)."""
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        await self._conn.execute(
+            "DELETE FROM drl_trade_state WHERE trade_id = ?",
+            (trade_id,),
+        )
+        await self._conn.commit()
+
+    async def load_drl_trade_states(self) -> list[dict[str, Any]]:
+        """Load all persisted DRL trade states for resume-on-startup."""
+        if self._conn is None:
+            raise RuntimeError("SQLiteStore not opened")
+        cursor = await self._conn.execute(
+            """
+            SELECT trade_id, signal, K, s_entry, vol_ann_entry, iv_entry,
+                   v_bg, jump_fraction, vpin, tau_entry, delta_entry,
+                   delta_theo_entry_abs,
+                   svi_a, svi_b, svi_rho, svi_m, svi_sigma, svi_t, svi_f,
+                   hedge_inventory_btc, tick, total_trade_size_btc,
+                   total_impact_cost_usd, last_updated
+            FROM drl_trade_state
+            """,
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "trade_id": r[0],
+                "signal": int(r[1]),
+                "K": float(r[2]),
+                "s_entry": float(r[3]),
+                "vol_ann_entry": float(r[4]),
+                "iv_entry": float(r[5]),
+                "v_bg": float(r[6]),
+                "jump_fraction": float(r[7]),
+                "vpin": float(r[8]),
+                "tau_entry": float(r[9]),
+                "delta_entry": float(r[10]),
+                "delta_theo_entry_abs": float(r[11]),
+                "svi_a": r[12],
+                "svi_b": r[13],
+                "svi_rho": r[14],
+                "svi_m": r[15],
+                "svi_sigma": r[16],
+                "svi_t": r[17],
+                "svi_f": r[18],
+                "hedge_inventory_btc": float(r[19]),
+                "tick": int(r[20]),
+                "total_trade_size_btc": float(r[21]),
+                "total_impact_cost_usd": float(r[22]),
+                "last_updated": r[23],
+            })
+        return out
 
     # ── kill switch ────────────────────────────────────────────────
 

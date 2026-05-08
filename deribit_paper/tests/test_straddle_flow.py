@@ -442,8 +442,10 @@ async def test_execute_rejects_zero_size():
 async def test_execute_aborts_when_entry_leg_rejected():
     signal = _make_signal(direction=-1)
     manager = AsyncMock()
-    # Call leg filled; put leg rejected
-    manager.place_ioc_taker = AsyncMock(side_effect=[
+    # E-5 (parity-r3 cycle 2 — 2026-05-08): entry now uses
+    # place_maker_then_taker, not place_ioc_taker. Call leg fills, put
+    # leg rejected.
+    manager.place_maker_then_taker = AsyncMock(side_effect=[
         _fill_result("BTC-12APR26-60000-C", "sell", 1.7),
         OrderResult(
             client_order_id="p_fail",
@@ -458,8 +460,9 @@ async def test_execute_aborts_when_entry_leg_rejected():
             error="test rejection",
         ),
     ])
-    # Unilateral close of the filled leg uses place_and_wait (market)
-    manager.place_and_wait = AsyncMock(side_effect=[
+    # E-8 (parity-r3 cycle 2 — 2026-05-08): unilateral close uses
+    # place_ioc_taker(tiered=True) instead of naked market.
+    manager.place_ioc_taker = AsyncMock(side_effect=[
         _fill_result("BTC-12APR26-60000-C", "buy", 1.7),
     ])
 
@@ -475,9 +478,12 @@ async def test_execute_aborts_when_entry_leg_rejected():
     outcome = await flow.execute(signal=signal, equity=1_000_000.0)
     assert outcome.status == "aborted_entry"
     assert "not filled" in (outcome.error or "").lower()
-    # 2 maker calls (entry_C + entry_P) + 1 market close
-    assert manager.place_ioc_taker.await_count == 2
-    assert manager.place_and_wait.await_count == 1
+    # 2 entry maker_then_taker calls + 1 unilateral tiered IOC close
+    assert manager.place_maker_then_taker.await_count == 2
+    assert manager.place_ioc_taker.await_count == 1
+    # The recovery close used tiered IOC, not naked market
+    close_call = manager.place_ioc_taker.await_args
+    assert close_call.kwargs["tiered"] is True
 
 
 # ─── Execute flow — full lifecycle (both legs fill, no hedges needed) ─

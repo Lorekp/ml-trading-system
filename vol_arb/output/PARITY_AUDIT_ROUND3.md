@@ -537,30 +537,39 @@ order; pick whichever fit the next cycle's scope.
 | **F-2** | P0 | **DONE** — round-3 cycle commit (`parkinson_1d_ema` now operates on rolling-mean series; 6 byte-identity tests in `test_parkinson_1d_ema_source_series.py`) |
 | **F-3** | P1 | **DONE** — round-3 cycle 2 commit (dynamic `bpd` via `DollarBarFeatures.bars_per_day`; closes F-2 sibling; 8 tests in `test_dollar_bar_features_dynamic_bpd.py`; existing handler tests updated) |
 | **F-4** | P0 | **DONE** — round-3 cycle commit (`atm_vol_at_dte` filters `params_df` by shifted `bucket_ts`; 7 tests in `test_svi_atm_dte_bucket_shift.py`; predictor + assembler call sites updated) |
-| F-5..F-9 | P2/P3 | OPEN |
+| F-5, F-6, F-8, F-9 | P2/P3 | OPEN |
+| **F-7** | P2 | **DONE** — round-3 cycle 3 (`_h_n_trades` and `_h_duration_s` warmup fallback now reads `baseline_row[name]` instead of synthesising wall-clock window stats; 7 tests in `test_feature_assembler_warmup_fallback.py`; existing `test_feature_assembler_dollar_bar_handlers.py` updated for new contract) |
 | **E-5** | P0 | **DONE** — round-3 cycle 2 commit `803be95` (`place_maker_then_taker` wired into `straddle_flow.execute` entry path; exit stays on `place_ioc_taker`; 5 tests in `test_straddle_flow_maker_then_taker.py`; existing tiered-ioc tests updated) |
-| E-6, E-7 | P1 | OPEN — backtester model-philosophy decisions; deferred |
+| **E-6** | P1 | **DONE** — round-3 cycle 3 (new `cfg.ioc_max_slippage_pct: float = 0.0` default; V2 preset enables `1.0` to match live API ceiling; cap applied in BOTH compound + NC slippage paths; tests in `test_backtester_tier_c.py`) |
+| **E-7** | P1 | **DONE** — round-3 cycle 3 (new `StraddleFlow.maker_adverse_selection_iv` ctor param; `_maker_adverse_selection_charge` helper proportional to per-leg maker fill fraction; `TradeOutcome.maker_adverse_selection_charge_usd`; engine deducts from `realized_pnl_usd`; 7 tests in `test_straddle_flow_maker_adverse_selection.py`) |
 | **E-8** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (4 cancel/recovery paths swap naked `order_type="market"` for `place_ioc_taker(tiered=True)`; new `cfg.cancel_exit_max_slippage_pct=1.0`; tests in `test_straddle_flow_maker_then_taker.py`) |
 | E-9..E-12 | P2/P3 | OPEN |
 | **D-7** | P0 | **DONE** — round-3 cycle 2 commit `1d4ca5a` (per-tick Greeks in `DRLHedger.simulate`; V2 NC PnL $1,024,449.18 → $1,024,054.51 (-$394.67, -0.039%) with Kelly K1 sidecar regen; n_trades unchanged at 7,543; 4 unit tests + V2 byte-identity relocked; rebaseline report at `vol_arb/output/parity_r3_cycle2_d7_rebaseline.md`) |
 | **D-8** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (engine captures `vol_ann_lagged` from `tsrv_history_buffer.latest_vol_ann_lagged()` BEFORE F-1 append, plumbs through to `LiveDRLHedger.begin_trade`; matches env.py:172's `df["vol_ann"].shift(1)`; tests in `test_drl_hedger_iv_and_vol_ann_sources.py`) |
 | **D-9** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (`begin_trade` evaluates `slice.iv(K)` to recover `iv_entry` whenever a slice is provided; matches env.py:412-415 reset semantic) |
 | **D-11** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (new `drl_trade_state` SQLite table FK-linked to `open_positions`; persister/remover callbacks emit on every begin_trade/step/close_trade; `_resume_trade` rehydrates via `resume_trade_from_dict`; 13 tests in `test_drl_trade_state_persistence.py`) |
-| D-10, D-12, D-13 | P2/P3 | OPEN |
+| **D-10** | P2 | **DONE** — round-3 cycle 3 (`StraddleFlow.execute` VPIN provider call now guards non-finite + provider exceptions; falls back to neutral 0.5 with warning log; 8 tests in `test_straddle_flow_vpin_nan_guard.py`) |
+| D-12, D-13 | P3 | OPEN |
 | S-1 | P0 | OPEN — multi-day feature build (no h15m TransVol checkpoint, no live inference path); split into S-1a (training) + S-1b (live wiring); deferred to dedicated TransVol-live cycle |
-| S-2 | P1 | OPEN |
+| **S-2** | P1 | **REJECT** — accepted by design. `vol_arb/sidecars.py:72-89` already documents this is correct-per-domain: backtester's `reindex()` exact-match is correct on canonical training bars (V2 K1 sidecar locked under exact-match); live's `searchsorted(side='right')-1` walk-forward asof is correct for drift-tolerant real-time. Switching backtester to `method='ffill'` previously drifted V2 byte-identity by **+$64.8K (+6.75%)** — confirmed not a parity bug. |
 | **S-3** | P1 | **DONE** — round-3 cycle 2 commit (predictor `_lookup_iv` falls through to TSRV proxy when SVI uncalibrated/empty; new `Signal.iv_source` field tags "svi" / "tsrv_proxy"; 7 tests in `test_predictor_iv_used_fallback.py`; warmup-emit behavior change documented) |
 | **S-4** | P0 | **REJECT** — agent mis-read backtester semantics. `df["vega"]` is the COMPOSITE (call+put = straddle) vega, set in `_composite_greeks` at `vol_arb/pipeline.py:241-242`. `bsm_vega_per_vol_pt` (live) returns single-leg vega; live correctly multiplies by 2 to convert to straddle. Both sides end at straddle vega; no divergence. |
-| S-6 | P1 | OPEN |
+| **S-6** | P1 | **REJECT** — agent mis-read. Both code paths call the SAME `lookup_beta_for_month()` from `vol_arb/sidecars.py:361-415` (exact-month + most-recent-prior + zero-fallback ladder). Live (`deribit_paper/signal/predictor.py:181-184`) and offline (`vol_arb/backtester.py:1958` via `load_aligner_betas`) both load the per-month dict once at startup and look up via the shared helper. No actual divergence. |
 | **S-8** | P1 | **DONE** — round-3 cycle 2 commit (`PaperConfig.with_v2_preset` flips `base_spread_iv 1.5 → 2.0` to match `BacktestConfig.with_realistic_costs`; 3 tests in `test_v2_preset_base_spread_iv.py` including cross-engine sanity check) |
 | S-5, S-7, S-9, S-10 | P2/P3 | OPEN |
 | **R-1** | P0 | **DONE** — round-3 cycle commit (kill-switch wired to `daily_return_pct` instead of `drawdown_pct`; existing `test_kill_switch.py` updated to assert corrected semantic; new `test_kill_switch_daily_dd_and_set_equity_peak.py` covers contract) |
 | **R-2** | P0 | **DONE** — round-3 cycle commit (`set_equity` peak advance only on `reason="deposit"`; default `reason="reconcile"` preserves peak; unknown reasons raise; 4 tests in `test_kill_switch_daily_dd_and_set_equity_peak.py`) |
-| R-3, R-4, R-5 | P1 | OPEN — risk-engine cycle (worth a dedicated audit) |
-| R-6..R-10 | P2/P3 | OPEN |
+| **R-3** | P1 | **REJECT** — both live (`deribit_paper/risk/limits.py:165-169`) and offline (`vol_arb/sizing.py:31-55`) consistently exclude perp delta-hedge leg from margin notional. No parity divergence — "fixing" live alone would CREATE divergence. Filed as forward-looking risk-management ticket in `vol_arb/output/FORWARD_LOOKING_TICKETS.md` for future design work; out of scope for parity audit. |
+| **R-4** | P1 | **DONE** — round-3 cycle 3 commit `160cd1c` (floor-lot exemption no longer gated on `n_open == 0`; absolute floor lot is exempt regardless of open-position count, unblocking DD-recovery; tests in `test_engine_state_persistence_R5_R6.py` + updated `test_limits.py`) |
+| **R-5** | P1 | **DONE** — round-3 cycle 3 commit `160cd1c` (`_consecutive_empty_bars` persists via `_build_engine_state_dict` + restore at startup; mirrors S5/S8 pattern) |
+| **R-6** | P2 | **DONE** — round-3 cycle 3 commit `160cd1c` (R-5 sibling: `_recent_trade_timestamps` deque persists as ISO strings + restore on startup; backward-compatible with old engine_state files) |
+| **R-9** | P2 | **DONE** — round-3 cycle 3 commit `160cd1c` (`RiskLimits.check_signal` accepts `bar_index_price` kwarg for margin envelope BTC→USD; mirrors offline `vol_arb/sizing.py` which uses bar spot; snapshot still drives index_price sanity check; tests in `test_limits_bar_index_price.py`) |
+| R-7, R-8, R-10 | P2/P3 | OPEN |
 | **O-5** | P0 | **DONE** — round-3 cycle 2 commit `803be95` (the existing `_reconcile_positions_on_startup` already handled full-straddle recovery; the genuine gap was DRL hedger state — closed via D-11; orphan-close path also upgraded from naked market to tiered IOC via E-8) |
 | **O-9** | P0 | **DONE** — round-3 cycle 2 commit `803be95` (`_on_ws_reconnect` now schedules `_reconcile_open_orders_on_reconnect`; age-gated cleanup of stale orphans; new `cfg.ws_reconcile_orphan_age_seconds=300`; 8 tests in `test_engine_ws_reconnect_reconcile.py`) |
-| O-1, O-2, O-6 | P1 | OPEN — backtester semantics changes; deferred to execution-modeling cycle |
+| **O-1** | P1 | **DONE** — round-3 cycle 3 (new `cfg.cancel_replace_bar_gap: bool = False`; when `use_sor=True AND maker_filled[i]==False`, taker leg uses bar-(i+1)'s slip + price (mirrors live's 60s cancel-and-replace timing); N/A under V2 (`use_sor=False`); applies in both compound + NC slippage paths; tests in `test_backtester_tier_c.py`) |
+| **O-2** | P1 | **DONE** — round-3 cycle 3 (new `cfg.taker_tier_blend: bool = False` + `taker_tier_split_fractions=(0.5,0.3,0.2)` + `taker_tier_slip_multipliers=(0.5,1.5,2.5)`; replaces flat `ioc_cap_multiplier × bar_slip` cap with tier-blended slip mirroring live's `_place_tiered_taker` ladder; effective cap ~2.4× bar_slip vs legacy 2.0×; V2 preset enables; tests in `test_backtester_tier_c.py`) |
+| **O-6** | P1 | **DONE** — round-3 cycle 3 (new `cfg.bar_aligned_exit_latency_pct: float = 0.0`; when > 0, adds `pct/100 × premium × 2 (legs)` slip surcharge on every fired non-stopped non-maker bar; models live's 2× ticker + 2× IOC round-trip latency; V2 preset sets `0.05` (5 bps); tests in `test_backtester_tier_c.py`) |
 | **O-4** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (Deribit option tick now mark-price-aware via `_option_tick_for_mark`; 0.0001 BTC for mark<0.05, else 0.0005; 8 tests in `test_order_manager_option_tick.py`) |
 | O-3, O-7, O-8 | P2/P3 | OPEN |
 
@@ -605,6 +614,48 @@ tests green.
   9 P1s deferred to dedicated cycles (modeling-philosophy debates +
   risk-engine + sidecar conventions).
 - All P2/P3 hygiene items remain OPEN.
+
+### Round-3 cycle 3 closure summary (2026-05-08)
+
+| Status | Count | Items |
+|---|---:|---|
+| DONE — closed this cycle | 7 P1s | R-4, R-5, E-7, E-6, O-1, O-2, O-6 |
+| DONE — closed this cycle | 4 P2s | R-6, R-9, D-10, F-7 |
+| REJECT — accepted by design | 3 P1s | R-3 (both systems consistent), S-2 (correct-per-domain), S-6 (no actual divergence — same helper) |
+| OPEN — deferred (multi-day project) | 1 P0 | S-1 (TransVol live; needs h15m checkpoint training + sequence buffer + encoder loader) |
+| OPEN — deferred (P2/P3 hygiene) | ~17 | F-5, F-6, F-8, F-9, E-9..E-12, D-12, D-13, S-5, S-7, S-9, S-10, R-7, R-8, R-10, O-3, O-7, O-8 |
+
+**Cycle 3 totals**: ~340 LOC source + ~1,800 LOC tests across 6 new
+test files + 3 modified. 4 sequenced commits:
+- `160cd1c` — risk-engine + persistence (R-4, R-5, R-6, R-9)
+- `3638890` — live exec + DRL hygiene (E-7, D-10, F-7)
+- *cycle 3C* — Tier C backtester semantics + V2 rebaseline (E-6, O-1, O-2, O-6)
+- *cycle 3D* — this audit ledger update + forward-looking ticket file
+
+V2 byte-identity rebaselined to `$1,010,891.4966 / 7,543 trades`
+(was cycle-2 `$1,024,054.5149 / 7,543 trades`); delta -$13,163.02
+(-1.285%), well within the 10% halt-gate. Tier C flips raise V2's
+modeled execution costs to match what live actually pays. Kelly K1
+sidecar regenerated (mean multiplier 1.0025, essentially unchanged).
+Convergence achieved at iteration 2 of the V2↔Kelly loop.
+
+**Cumulative round-3 progress (cycle 1 + cycle 2 + cycle 3)**:
+- 9 P0s closed, 1 rejected (S-4), 1 deferred (S-1 only)
+- 15 P1s closed, 3 rejected (R-3, S-2, S-6) — **all P1s now resolved**
+  except those covered by S-1's deferral path (S-1 alone is the
+  single open P0; no P1s remain blocking)
+- 4 P2s closed (R-6, R-9, D-10, F-7); ~20 P2/P3 hygiene items OPEN
+
+**Files**:
+- Cycle 3 plan: `~/.claude/plans/glimmering-snacking-turing.md`
+- Tier C rebaseline report: `vol_arb/output/parity_r3_cycle3_tierC_rebaseline.md`
+- Forward-looking risk ticket file: `vol_arb/output/FORWARD_LOOKING_TICKETS.md`
+- Test files (cycle 3): `test_engine_state_persistence_R5_R6.py`,
+  `test_limits_bar_index_price.py`,
+  `test_straddle_flow_maker_adverse_selection.py`,
+  `test_straddle_flow_vpin_nan_guard.py`,
+  `test_feature_assembler_warmup_fallback.py`,
+  `test_backtester_tier_c.py`
 
 **Files**:
 - Cycle 2 plan: `~/.claude/plans/starry-rolling-rabin.md`

@@ -97,6 +97,10 @@ class AssemblerContext:
     # fall back to the historical baseline.
     tsrv_history_buffer: Any | None = None      # TSRVHistoryBuffer, late-bound
     tsrv_features: Any | None = None            # TSRVFeatures, late-bound
+    # S-1c (parity-r3 cycle 6 — 2026-05-08): live funding-rate provider
+    # for the 5 ``funding_basis_*`` columns. ``None`` falls back to
+    # baseline-fallback (matches HAR-PD warmup pattern).
+    funding_provider: Any | None = None         # FundingRateProvider, late-bound
 
 
 def _h_tsrv(ctx: AssemblerContext) -> float:
@@ -753,6 +757,47 @@ def _h_down_jump_frac(ctx: AssemblerContext) -> float:
     return _baseline_or_nan(ctx, "down_jump_frac")
 
 
+# ── S-1c: funding_basis live provider handlers ──
+# These read from ``ctx.funding_provider`` (a ``FundingRateProvider``
+# advance()'d once per bar by the engine BEFORE the handler loop).
+# When the provider is None (legacy / test paths) the handlers fall
+# back to the historical baseline value.
+
+def _h_funding_basis(ctx: AssemblerContext) -> float:
+    prov = ctx.funding_provider
+    if prov is not None:
+        v = prov.latest()
+        if v is not None and np.isfinite(v):
+            return float(v)
+    return _baseline_or_nan(ctx, "funding_basis")
+
+
+def _make_funding_basis_lag_handler(n: int) -> Callable[[AssemblerContext], float]:
+    name = f"funding_basis_lag{n}"
+    def _handler(ctx: AssemblerContext) -> float:
+        prov = ctx.funding_provider
+        if prov is not None:
+            v = prov.latest_lag(n)
+            if v is not None and np.isfinite(v):
+                return float(v)
+        return _baseline_or_nan(ctx, name)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_funding_basis_ema_handler(span: int) -> Callable[[AssemblerContext], float]:
+    name = f"funding_basis_ema{span}"
+    def _handler(ctx: AssemblerContext) -> float:
+        prov = ctx.funding_provider
+        if prov is not None:
+            v = prov.latest_ema(span)
+            if v is not None and np.isfinite(v):
+                return float(v)
+        return _baseline_or_nan(ctx, name)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
 # Registry: feature name → handler.  Adding a new live-computable
 # feature is one line here, not a tuple edit + imperative loop edit.
 _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
@@ -902,6 +947,14 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "noise_level_lag3":      _make_tsrv_handler("noise_level_lag3", "noise_level_lag", 3),
     "noise_level_ema10":     _make_tsrv_handler("noise_level_ema10", "noise_level_ema", 10),
     "noise_level_ema50":     _make_tsrv_handler("noise_level_ema50", "noise_level_ema", 50),
+    # funding_basis: 5 columns. Live provider wires Binance perp REST
+    # (Path A) + offline parquet fallback (Path B); see
+    # ``deribit_paper/market_data/funding.py``.
+    "funding_basis":         _h_funding_basis,
+    "funding_basis_lag1":    _make_funding_basis_lag_handler(1),
+    "funding_basis_lag3":    _make_funding_basis_lag_handler(3),
+    "funding_basis_ema10":   _make_funding_basis_ema_handler(10),
+    "funding_basis_ema50":   _make_funding_basis_ema_handler(50),
 }
 
 

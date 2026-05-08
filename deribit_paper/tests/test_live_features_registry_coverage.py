@@ -92,18 +92,17 @@ def test_total_transvol_input_columns_is_101():
     assert len(TRANSVOL_INPUT_COLUMNS_FOR_GATE) == 101
 
 
-def test_post_cycle_6_phase_1_coverage_is_96_of_101():
-    """All 96 non-funding columns must have a live handler after Phase 1d."""
+def test_post_cycle_6_phase_2_coverage_is_101_of_101():
+    """All 101 TransVol input columns must have a live handler after
+    Phase 2 (funding_basis live provider) ships."""
     missing = [
         c for c in TRANSVOL_INPUT_COLUMNS_FOR_GATE
         if c not in _LIVE_HANDLERS
     ]
-    # Only the 5 funding_basis_* columns may be missing at this point;
-    # they ship in Phase 2.
-    assert sorted(missing) == [
-        "funding_basis", "funding_basis_ema10", "funding_basis_ema50",
-        "funding_basis_lag1", "funding_basis_lag3",
-    ]
+    assert missing == [], (
+        f"{len(missing)} TransVol input columns still resolve to "
+        f"baseline-fallback: {missing}"
+    )
 
 
 def test_no_duplicate_column_names_in_canonical_list():

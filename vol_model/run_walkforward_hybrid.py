@@ -312,8 +312,12 @@ def main():
     model_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(f"  WALK-FORWARD HYBRID (strict no-leakage) — {args.asset} @ h={args.horizon_minutes}m")
-    print(f"  Checkpoints → {model_dir}")
+    print(
+        f"  WALK-FORWARD HYBRID (strict no-leakage) -- {args.asset} "
+        f"@ h={args.horizon_minutes}m"
+    )
+    # Plain ASCII (Windows cp1252 console can't encode the unicode arrow).
+    print(f"  Checkpoints -> {model_dir}")
     print("=" * 70)
 
     # Load all data once

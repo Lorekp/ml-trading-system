@@ -550,7 +550,7 @@ order; pick whichever fit the next cycle's scope.
 | **D-11** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (new `drl_trade_state` SQLite table FK-linked to `open_positions`; persister/remover callbacks emit on every begin_trade/step/close_trade; `_resume_trade` rehydrates via `resume_trade_from_dict`; 13 tests in `test_drl_trade_state_persistence.py`) |
 | **D-10** | P2 | **DONE** — round-3 cycle 3 (`StraddleFlow.execute` VPIN provider call now guards non-finite + provider exceptions; falls back to neutral 0.5 with warning log; 8 tests in `test_straddle_flow_vpin_nan_guard.py`) |
 | D-12, D-13 | P3 | OPEN |
-| S-1 | P0 | **PARTIAL** — round-3 cycle 4 (infrastructure shipped; live feature builder + engine integration deferred). Cycle-4 closures: live `TransVolHistoryBuffer` (32-bar deque + parquet pre-warm + Z-norm); `TransVolInference` (encoder forward-pass wrapper, returns 16-dim `embedding_compact` or None during warmup; fail-soft on non-finite/wrong-shape). Real-checkpoint smoke test passes against `expanding_hybrid/2026-04_transvol.pt`. **Deferred to S-1b**: live 101-feature row builder (~70 new handler entries + 5+ base features: `ffd_rv`, `funding_basis`, `hurst_100`, `noise_level`, `rv_zscore_*`); engine `process_bar` integration; parity test vs offline `BTCUSDT_transvol_embeddings.parquet`. Audit's original "no h15m checkpoint" framing was incorrect — `expanding_hybrid/{YYYY-MM}_transvol.pt` covers 50 months through 2026-04 (default freq_s=900s = h15m); training is NOT required. 30 tests in `test_transvol_history.py` (18) + `test_transvol_inference.py` (12). |
+| S-1 | P0 | **PARTIAL** — round-3 cycle 4 + 5 (infrastructure + ~22 handlers shipped; engine integration + remaining variants deferred to S-1c). **Cycle 4** closures: live `TransVolHistoryBuffer` (32-bar deque + parquet pre-warm + Z-norm); `TransVolInference` (encoder forward-pass wrapper, returns 16-dim `embedding_compact` or None during warmup; fail-soft on non-finite/wrong-shape). Real-checkpoint smoke test passes against `expanding_hybrid/2026-04_transvol.pt`. **Cycle 5** closures: 3 base feature live equivalents byte-equal to offline (`hurst_100`, `ffd_rv`, `rv_zscore_1d/1w/1m`); 22 new live-computed handlers across 8 base groups; previously-stale baseline-fallback features now live. Verified: 2026-04 production checkpoint is healthy (QLIKE 0.5283, RankIC 0.6236, 44 LightGBM features, encoder smoke produces valid 16-dim embedding). Phase 0 data refresh attempted May 2026 ingest; Binance Vision had only May 1-7 published (May 8 = 404 = day-current); the month was not trainable since training requires a complete month of data. Audit's original "no h15m checkpoint" framing was incorrect — `expanding_hybrid/{YYYY-MM}_transvol.pt` covers 50 months through 2026-04 (default freq_s=900s = h15m); training is NOT required. **Deferred to S-1c**: ~40 remaining feature handlers (lag/EMA variants of `hurst_100`/`ffd_rv`/`rv_zscore_*` requiring per-bar series caching; `bpv_tsrv_ratio` raw + variants; `down_jump_frac` alias + variants; `noise_level` (TSRV buffer extension); `funding_basis` (live REST fetcher)); engine `process_bar` integration with config flag; offline-vs-live parity gate test. 46 tests across cycle 4 (`test_transvol_history.py` + `test_transvol_inference.py`) + cycle 5 (`test_live_features_s1b.py`). |
 | **S-2** | P1 | **REJECT** — accepted by design. `vol_arb/sidecars.py:72-89` already documents this is correct-per-domain: backtester's `reindex()` exact-match is correct on canonical training bars (V2 K1 sidecar locked under exact-match); live's `searchsorted(side='right')-1` walk-forward asof is correct for drift-tolerant real-time. Switching backtester to `method='ffill'` previously drifted V2 byte-identity by **+$64.8K (+6.75%)** — confirmed not a parity bug. |
 | **S-3** | P1 | **DONE** — round-3 cycle 2 commit (predictor `_lookup_iv` falls through to TSRV proxy when SVI uncalibrated/empty; new `Signal.iv_source` field tags "svi" / "tsrv_proxy"; 7 tests in `test_predictor_iv_used_fallback.py`; warmup-emit behavior change documented) |
 | **S-4** | P0 | **REJECT** — agent mis-read backtester semantics. `df["vega"]` is the COMPOSITE (call+put = straddle) vega, set in `_composite_greeks` at `vol_arb/pipeline.py:241-242`. `bsm_vega_per_vol_pt` (live) returns single-leg vega; live correctly multiplies by 2 to convert to straddle. Both sides end at straddle vega; no divergence. |
@@ -661,6 +661,27 @@ Critical correction to original audit framing: "no h15m TransVol checkpoint, no 
 **Cumulative round-3 progress (cycle 1 + cycle 2 + cycle 3 + cycle 4)**:
 - 9 P0s closed, 1 rejected (S-4), 1 PARTIAL (S-1 — infrastructure done, live feature builder + integration deferred to S-1b)
 - 15 P1s closed, 3 rejected (R-3, S-2, S-6); all P1s resolved
+- 4 P2s closed; ~20 P2/P3 hygiene items OPEN
+
+### Round-3 cycle 5 closure summary (2026-05-08)
+
+| Status | Count | Items |
+|---|---:|---|
+| PARTIAL — additional Phase 1 progress on S-1 | 1 P0 | S-1 cycle 5 Phase 1a + 1b |
+| Latest-month verification | (verify) | 2026-04 production checkpoint validated (QLIKE 0.5283, RankIC 0.6236) |
+| Phase 0 — data refresh | (data) | TSRV / features parquets refreshed through 2026-04-30; HAR-PD predictions extracted for 50/50 months through 2026-03 |
+| OPEN — deferred to S-1c | 1 P0 | full live 101-feature parity (~40 remaining handlers) + engine integration + parity gate test |
+
+**Cycle 5 totals**: ~590 LOC source (3 new feature methods + 22 handler registrations + verification script + Unicode-bug ride-along) + ~360 LOC tests across 1 new file (`test_live_features_s1b.py`). 4 commits:
+- `f69aa66` — S-1b Phase 1a: hurst_100 + ffd_rv + rv_zscore live equivalents (16 byte-equal tests)
+- `60e7d7f` — S-1b Phase 1b: register 22 live handlers across 8 base groups
+- *(this commit)* — verification script + Unicode-bug ride-along + audit ledger update
+
+**Latest-month freshness**: production engine loads `expanding_pruned_svi_v1/2026-04` LightGBM (44 features) paired with `expanding_hybrid/2026-04_transvol.pt` TransVol encoder (101 input features → 16-dim compact). Bundle smoke verified by `scripts/verify_latest_month_training.py` — exits 0 against current artifacts. May 2026 ingest attempted but Binance Vision only had May 1-7 published (May 8 = 404 = day-current); training a complete May month is blocked until next-day Vision publishes May 8.
+
+**Cumulative round-3 progress (cycle 1 + 2 + 3 + 4 + 5)**:
+- 9 P0s closed, 1 rejected (S-4), 1 PARTIAL (S-1 — infrastructure + ~22 handlers shipped; remaining ~40 handlers + engine integration deferred to S-1c)
+- 15 P1s closed, 3 rejected; all P1s resolved
 - 4 P2s closed; ~20 P2/P3 hygiene items OPEN
 
 **Files**:

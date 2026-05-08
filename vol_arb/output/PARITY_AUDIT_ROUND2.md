@@ -153,13 +153,21 @@ permits:
 
 **Documented deviations from offline byte-identity**:
 
-1. **Tier 5 TSRV-grid features** (`tsrv_mean_*`, `tsrv_ffd`,
-   `up_jump_frac_ema50`, `bpv_tsrv_ratio_ema50`) compute on the live
-   15-min TSRV grid directly, not on offline's dollar-bar grid (which
-   would require a 1750-bar dollar buffer + per-handler ffill of
-   TSRV onto dollar-bar timestamps). Mathematically equivalent under
-   constant-rate trading; deviates under bursty volume. Substantially
-   better than baseline-frozen.
+1. **Tier 5 TSRV-grid features** — **CLOSED via round-3 cycle 7
+   (S-1d, 2026-05-08)**. The deviation has been closed strictly: a
+   new `TSRVDollarBarFeatures` wrapper (`deribit_paper/features/
+   tsrv_dollar_bar_grid.py`) ffills TSRV scalars onto the dollar-bar
+   grid (60000-bar live buffer; 700000-bar parity-test buffer)
+   matching offline `_ffill_to_bars + _window_and_aggregate` byte-
+   for-byte. All 30 affected columns plus 4 `time_to_funding`
+   lag/EMA variants now match offline at `rtol=1e-5, atol=1e-7`,
+   locked by `test_transvol_live_offline_parity.py::test_tier_a_
+   strict_byte_equal` with extended mutation probes. Original text
+   for context:
+   *(`tsrv_mean_*`, `tsrv_ffd`, `up_jump_frac_ema50`,
+   `bpv_tsrv_ratio_ema50`) computed on the live 15-min TSRV grid
+   directly, not on offline's dollar-bar grid. Substantially better
+   than baseline-frozen until cycle 7 ship.)*
 
 2. **Tier 3 dollar-bar features**: byte-identity to offline pandas
    reference at 1e-12 relative on real 200K-trade slices.

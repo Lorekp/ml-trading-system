@@ -56,6 +56,20 @@ slightly different grid).
 **Closure path**: ~200 LOC + a 1750-bar `DollarBarBuffer` extension; only
 worth doing if the recertification reveals a real signal gap.
 
+**S-1d (parity-r3 cycle 7 — 2026-05-08): C1 STATUS → DONE.** Closed via
+`deribit_paper/features/tsrv_dollar_bar_grid.py` (`TSRVDollarBarFeatures`)
++ `DollarBarBuffer` defaults flipped to 60000 bars + the parity gate
+loading 700000 bars from `vol_model/output/BTCUSDT_bar_series.parquet`
+directly. All 30 columns under the C1 deviation bucket
+(`tsrv_mean_1d/1w` + 4 variants each, `tsrv_ffd` + 4 variants,
+`up_jump_frac` + 4 variants, `down_jump_frac` + 4 variants,
+`noise_level` + 4 variants, `bpv_tsrv_ratio` + 4 variants) plus the
+4 `time_to_funding` lag/EMA variants now byte-equal to offline within
+`rtol=1e-5, atol=1e-7`. Tier-A in `test_transvol_live_offline_parity.py`
+expanded 6 → 45 columns; Tier-B is empty. Mutation probe locks 3
+column-swap regressions. **40 new tests** (9 buffer + 27 wrapper +
+4 parity-gate); 1173 deribit_paper tests pass.
+
 #### C2 — Overnight walk-forward retrain not executed
 
 The user explicitly authorised "Full recertification: 3-6 months
@@ -721,6 +735,45 @@ Critical correction to original audit framing: "no h15m TransVol checkpoint, no 
 - `deribit_paper/signal/feature_assembler.py` — 56 new handler registrations + funding handlers + assemble_transvol_input_row + TRANSVOL_INPUT_COLUMNS
 - `deribit_paper/engine.py` — TransVol bar-loop integration + funding provider wiring
 - `deribit_paper/config.py` — `use_transvol_live: bool = True`, `funding_parquet_path` sentinel
+
+### Round-3 cycle 7 closure summary (2026-05-08) — C1 DONE
+
+| Status | Count | Items |
+|---|---:|---|
+| **DONE — C1 closes** | (round-2 carryover) | TSRV-derived columns now compute on the dollar-bar grid byte-equivalent to offline |
+| Tier-A strict-byte-equal | 45 cols (was 6) | All 30 cycle-6 Tier-B columns + 4 time_to_funding lag/EMA variants promoted |
+| Tier-B (informational) | 0 cols (was 30) | C1 deviation closed strictly |
+
+**Cycle 7 totals**: ~1,200 LOC source + ~1,400 LOC tests across 4 sequenced commits:
+
+- `a1ea430` — Phase 0: dollar-bar cache extended 300 → 60000 bars
+- `2cb2114` — Phase 1: DollarBarBuffer.timestamp_at + as_index + 60000-bar default
+- `7edd109` — Phase 2: TSRVDollarBarFeatures NEW module + 27 byte-equality tests
+- `b567377` — Phase 3: 30 Tier-B handlers rerouted to dollar-bar-grid path + time_to_funding lag/EMA on dollar-bar grid
+- `278a5ef` — Phase 4: parity gate promotes 30 columns to Tier-A strict-byte-equal + mutation probe extension
+
+**The architecture**: a new `TSRVDollarBarFeatures` wrapper takes both a `TSRVHistoryBuffer` and a `DollarBarBuffer`, ffills each TSRV scalar onto the dollar-bar grid via `shift(1).reindex(union, ffill).reindex(db_idx)` — byte-equivalent to offline `_ffill_to_bars`. Rolling / EMA / lag operations then run on the dollar-bar-grid series; the latest position equals offline's `groupby(window_labels).last().iloc[-1]` for the most recent 15-min window. `bpd` is sourced from the trailing-30-day window of the live buffer's index, matching offline `avg_bars_per_day(bars.index, trailing_days=30)`. The cycle-5/6 15-min-cadence path stays as a documented fallback for cold-start / test paths without a long DollarBarBuffer.
+
+**The 30 columns under C1 + 4 time_to_funding lag/EMA variants now match offline at `rtol=1e-5, atol=1e-7`**: `tsrv_mean_1d/1w + 4 variants each`, `tsrv_ffd + 4 variants`, `up_jump_frac + 4 variants`, `down_jump_frac + 4 variants`, `noise_level + 4 variants`, `bpv_tsrv_ratio + 4 variants`, `time_to_funding_lag1/lag3/ema10/ema50`. Tier-A in `test_transvol_live_offline_parity.py` expanded from 6 to 45 columns. Mutation probe locks 3 column-swap regressions.
+
+**Cycle 7 files added**:
+- `deribit_paper/features/tsrv_dollar_bar_grid.py` (NEW — TSRVDollarBarFeatures, ~440 LOC)
+- `deribit_paper/tests/test_dollar_bar_buffer_extensions.py`
+- `deribit_paper/tests/test_tsrv_dollar_bar_grid.py` (27 byte-equality tests)
+
+**Cycle 7 files modified**:
+- `deribit_paper/features/dollar_bar_buffer.py` — `timestamp_at(idx)` + `as_index()` + maxlen 300 → 60000 default
+- `deribit_paper/signal/feature_assembler.py` — `_make_tsrv_db_handler` factory + 30 handler rewires + time_to_funding sub-15-min path
+- `deribit_paper/config.py` — `dollar_bar_history_bars` 300 → 60000
+- `deribit_paper/tests/test_transvol_live_offline_parity.py` — Tier-A → 45 cols; Tier-B → 0; +2 mutation probes
+- `vol_arb/output/BTC_dollar_bar_cache.parquet` — regenerated at 60k bars
+
+**Cumulative round-3 progress (cycle 1 + 2 + 3 + 4 + 5 + 6 + 7)**:
+- 10 P0s closed, 1 rejected (S-4), 0 deferred — **all P0s resolved**
+- 15 P1s closed, 3 rejected — **all P1s resolved**
+- 4 P2s closed; ~20 P2/P3 hygiene items OPEN
+- **C1 (round-2 carryover) closed strictly** — all 30 affected columns byte-equal at `rtol=1e-5, atol=1e-7`
+- Round-3 audit ladder transitions from "P0+P1 closure-complete" to "**all DOCUMENTED-DEVIATIONS closure-complete on the signal-stream side**"
 
 **Cycle 5 totals**: ~590 LOC source (3 new feature methods + 22 handler registrations + verification script + Unicode-bug ride-along) + ~360 LOC tests across 1 new file (`test_live_features_s1b.py`). 4 commits:
 - `f69aa66` — S-1b Phase 1a: hurst_100 + ffd_rv + rv_zscore live equivalents (16 byte-equal tests)

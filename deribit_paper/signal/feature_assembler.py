@@ -257,6 +257,30 @@ def _h_duration_s(ctx: AssemblerContext) -> float:
 
 
 def _h_n_bars_in_window(ctx: AssemblerContext) -> float:
+    """F-5 (parity-r3 cycle 8 — 2026-05-08): live count of dollar bars
+    in the current 15-min wall-clock window. Mirrors offline
+    ``vol_model/features/engineer.py:440-441``::
+
+        n_bars = pd.Series(1, index=raw_feats.index).groupby(window_labels).sum()
+
+    Pre-cycle-8 this returned the baseline-frozen historical value
+    (the LAST 15-min window's count from the offline parquet at
+    engine startup) — same value forever, never advanced.
+
+    Falls back to the baseline-frozen value when no DollarBarBuffer
+    is wired (test fixtures, cold start before the first bar).
+    """
+    buf = getattr(ctx, "dollar_bar_buffer", None)
+    bar_ts = getattr(ctx.bar, "timestamp", None) if ctx.bar is not None else None
+    if buf is not None and len(buf) > 0 and bar_ts is not None:
+        # 15-min window ending at bar.timestamp (exclusive of next bar's start).
+        window_start = pd.Timestamp(bar_ts).floor("15min")
+        window_end = window_start + pd.Timedelta(minutes=15)
+        idx = buf.as_index()
+        in_window = (idx >= window_start) & (idx < window_end)
+        n = int(in_window.sum())
+        if n > 0:
+            return float(n)
     return float(ctx.baseline_row.get("n_bars_in_window", 1) or 1)
 
 
@@ -1231,6 +1255,11 @@ class FeatureAssembler:
         # buffer from the historical TSRV parquet at startup so the
         # first live bar produces non-NaN HAR-PD features.
         self._har_pd_state = HARPDState(k_bars=har_pd_k_bars)
+        # F-8 (parity-r3 cycle 8 — 2026-05-08): handler-exception
+        # tracking so silent baseline-fallback occurrences surface
+        # at ERROR level + are inspectable at run-end.
+        self._handler_exception_count: int = 0
+        self._handler_exception_names: set[str] = set()
 
         if not self._features_parquet_path.exists():
             raise FileNotFoundError(
@@ -1498,14 +1527,23 @@ class FeatureAssembler:
                 try:
                     values[i] = float(handler(ctx))
                 except Exception as exc:  # noqa: BLE001 - defensive
-                    logger.warning(
-                        "Live handler failed for %s (%s); using baseline fallback",
+                    # F-8 (parity-r3 cycle 8 — 2026-05-08): escalate
+                    # handler-exception fallbacks from WARNING to ERROR
+                    # and count them. F9 already propagates NaN baseline
+                    # values, but a baseline that happens to be FINITE
+                    # would silently feed a stale value to LightGBM
+                    # without operator visibility. Counting + escalating
+                    # surfaces the regression.
+                    self._handler_exception_count += 1
+                    self._handler_exception_names.add(name)
+                    logger.error(
+                        "Live handler failed for %s (%s); using baseline "
+                        "fallback. Total handler exceptions this run: %d "
+                        "across %d distinct handlers.",
                         name, exc,
+                        self._handler_exception_count,
+                        len(self._handler_exception_names),
                     )
-                    # F9 (2026-05-07): no ``or 0.0`` collapse — let NaN
-                    # propagate to the line-519 guard so a malformed
-                    # baseline (e.g. F1 SVI-join NaN) refuses to trade
-                    # rather than emitting a silent zero.
                     raw = self._baseline_row.get(name, np.nan)
                     values[i] = float(raw) if pd.notna(raw) else float("nan")
             else:

@@ -953,7 +953,10 @@ class TradingEngine:
 
         self.order_manager = OrderManager(
             rest=self.rest,
-            idempotency_guard=IdempotencyGuard(ttl_seconds=60.0),
+            # O-3 (parity-r3 cycle 8 — 2026-05-08): TTL strictly
+            # exceeds maker_wait_seconds + IOC ladder timeout so the
+            # guard window covers the full retry envelope.
+            idempotency_guard=IdempotencyGuard(ttl_seconds=180.0),
             fill_poll_seconds=1.5,
             latency_threshold_ms=cfg.kill_switch_latency_ms,
             on_latency_breach=_latency_breach,

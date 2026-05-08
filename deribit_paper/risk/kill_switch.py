@@ -86,6 +86,11 @@ class KillSwitch:
         self._persist_callback = persist_callback
         self._state = KillSwitchState(halted=False, reason=None, halted_at=None)
         self._consecutive_errors = 0
+        # R-8 (parity-r3 cycle 8 — 2026-05-08): latency breaches now
+        # tracked separately so successes on the trade-execution path
+        # don't reset the latency counter (and vice versa). Both still
+        # trip the same kill switch on ``max_consecutive_errors``.
+        self._consecutive_latency_breaches = 0
         self._last_ws_message_at: pd.Timestamp | None = None
         # C2: Flag for engine to trigger emergency close on next process_bar
         self.needs_emergency_close: bool = False
@@ -176,6 +181,15 @@ class KillSwitch:
         # 3. Consecutive errors (handled in on_trade_result)
         return False
 
+    def on_latency_clean(self) -> None:
+        """R-8 (parity-r3 cycle 8 — 2026-05-08): reset the latency-
+        breach counter when an order completes within its latency
+        budget. Symmetric to ``on_trade_result(success=True)`` for
+        execution errors. Engine calls this on every clean order
+        completion path.
+        """
+        self._consecutive_latency_breaches = 0
+
     def on_trade_result(self, *, success: bool) -> None:
         """Update the consecutive-error counter after a trade execution."""
         if success:
@@ -206,18 +220,23 @@ class KillSwitch:
         """
         if not (math.isfinite(total_ms) and total_ms > threshold_ms):
             return
-        # Treat as a soft error — feeds into the consecutive-error path.
-        self._consecutive_errors += 1
+        # R-8 (parity-r3 cycle 8 — 2026-05-08): use the dedicated
+        # ``_consecutive_latency_breaches`` counter so a streak of
+        # latency hiccups doesn't get reset by an unrelated successful
+        # trade (and successes on a different code path don't reset
+        # this one). Both counters trip the same kill switch on the
+        # shared ``max_consecutive_errors`` threshold.
+        self._consecutive_latency_breaches += 1
         logger.warning(
             "Latency breach: %s took %.0fms (threshold %.0fms) — "
-            "consecutive=%d/%d",
+            "consecutive_latency=%d/%d",
             instrument_name or "order", total_ms, threshold_ms,
-            self._consecutive_errors, self.max_consecutive_errors,
+            self._consecutive_latency_breaches, self.max_consecutive_errors,
         )
-        if self._consecutive_errors >= self.max_consecutive_errors:
+        if self._consecutive_latency_breaches >= self.max_consecutive_errors:
             self.trip(
-                f"{self._consecutive_errors} consecutive latency breaches "
-                f"(latest {total_ms:.0f}ms > {threshold_ms:.0f}ms)",
+                f"{self._consecutive_latency_breaches} consecutive latency "
+                f"breaches (latest {total_ms:.0f}ms > {threshold_ms:.0f}ms)",
             )
 
     def trip(

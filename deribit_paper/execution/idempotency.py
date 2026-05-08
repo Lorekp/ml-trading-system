@@ -30,7 +30,13 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_TTL_SECONDS: float = 60.0
+# O-3 (parity-r3 cycle 8 — 2026-05-08): TTL bumped 60 → 180s so the
+# guard window strictly exceeds ``maker_wait_seconds=60`` plus the
+# tiered-IOC ladder timeout (~30-60s). Pre-fix the TTL == maker_wait
+# meant a network hiccup at maker-expiry could let a re-issued
+# client_order_id slip past the guard and cause a duplicate submit.
+# 180s = 60s maker + ~60s IOC ladder + 60s safety margin.
+_DEFAULT_TTL_SECONDS: float = 180.0
 _DEFAULT_MAX_ENTRIES: int = 1000
 
 

@@ -668,6 +668,20 @@ class StraddleFlow:
         )
 
         # ── 2b. Notify position opened (persist to DB + tracker) ──
+        # O-8 (parity-r3 cycle 8 — 2026-05-08): record the EFFECTIVE
+        # filled straddle size = min(call_filled, put_filled). Pre-
+        # cycle-8 we recorded ``n_contracts`` (the REQUESTED amount),
+        # so a tier-3 partial fill on either leg silently overstated
+        # the position. The straddle is constrained by the smaller
+        # leg's fill (you can't be long N-call/M-put as a "straddle"
+        # — it's max(M, N) of straddle + abs(N-M) of single-leg
+        # residual). For position-tracking we use the straddle size.
+        effective_n_contracts = min(
+            float(entry_call.filled_amount),
+            float(entry_put.filled_amount),
+        )
+        if effective_n_contracts <= 0.0:
+            effective_n_contracts = float(n_contracts)
         if self._on_position_opened is not None:
             try:
                 await self._on_position_opened(
@@ -675,7 +689,7 @@ class StraddleFlow:
                     call_instrument=straddle.call_instrument,
                     put_instrument=straddle.put_instrument,
                     signal_direction=signal.direction,
-                    n_contracts_btc=n_contracts,
+                    n_contracts_btc=effective_n_contracts,
                     strike=straddle.strike,
                     expiry_dt=str(straddle.expiry_dt),
                     opened_at=str(started_at),

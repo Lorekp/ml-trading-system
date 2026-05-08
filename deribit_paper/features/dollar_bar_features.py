@@ -49,6 +49,88 @@ logger = logging.getLogger(__name__)
 _RAW_NAMES: tuple[str, ...] = ("vov", "vpin", "imbalance", "duration_s", "n_trades")
 
 
+# ── S-1b (parity-r3 cycle 5 — 2026-05-08): FFD weights cache ────────
+# Fractional differentiation weights are deterministic in (d, threshold)
+# so we cache per (d, threshold) pair across the process lifetime.
+# Mirrors offline ``src/afml/fracdiff.get_weights_ffd`` byte-for-byte
+# (same iterative recurrence + same threshold cutoff).
+_FFD_WEIGHTS_CACHE: dict[tuple[float, float], np.ndarray] = {}
+
+
+def _ffd_weights(d: float, threshold: float = 1e-5) -> np.ndarray:
+    """Cache-backed FFD weight vector. Returns weights chronological
+    (oldest first), shape (n_weights,) — flattened from the offline
+    column-vector convention so a per-bar dot-product is a single
+    ``np.dot`` call.
+
+    Mirrors `src/afml/fracdiff.get_weights_ffd` byte-for-byte.
+    """
+    key = (float(d), float(threshold))
+    cached = _FFD_WEIGHTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Iterative recurrence: w_0 = 1, w_k = -w_{k-1} * (d - k + 1) / k.
+    # Truncate at |w_k| < threshold.
+    weights: list[float] = [1.0]
+    k = 1
+    while True:
+        wk = -weights[-1] * (d - k + 1) / k
+        if abs(wk) < threshold:
+            break
+        weights.append(wk)
+        k += 1
+        if k > 10000:  # defensive cap
+            break
+    arr = np.asarray(weights, dtype=np.float64)
+    # Convolve with reversed weights elsewhere; we cache chronological.
+    _FFD_WEIGHTS_CACHE[key] = arr
+    return arr
+
+
+def _hurst_subsampled_window(returns: np.ndarray, window: int = 100) -> float | None:
+    """Compute a single Hurst exponent via R/S over the last ``window``
+    bars of ``returns``.
+
+    Live-equivalent of the per-position computation inside offline's
+    ``vol_model/features/engineer.py::_hurst_subsampled``. The offline
+    version computes Hurst at every ``step`` bars over the full series
+    and linearly interpolates between steps; live only needs the
+    LATEST value, so we evaluate once on the trailing-``window`` slice.
+    Returns None when the window has too few finite returns or when the
+    R/S regression would be degenerate.
+    """
+    if len(returns) < window:
+        return None
+    chunk = returns[-window:]
+    valid = chunk[~np.isnan(chunk)]
+    if len(valid) < 20:
+        return None
+    sub_sizes = [s for s in (8, 16, 32, 64) if s <= window // 2]
+    if len(sub_sizes) < 2:
+        return None
+    log_rs: list[float] = []
+    log_n: list[float] = []
+    for size in sub_sizes:
+        nc = len(valid) // size
+        if nc < 1:
+            continue
+        rs_list: list[float] = []
+        for j in range(nc):
+            seg = valid[j * size:(j + 1) * size]
+            std = seg.std(ddof=1)
+            if std < 1e-15:
+                continue
+            cd = np.cumsum(seg - seg.mean())
+            rs_list.append((cd.max() - cd.min()) / std)
+        if rs_list:
+            log_rs.append(np.log(np.mean(rs_list)))
+            log_n.append(np.log(size))
+    if len(log_rs) < 2:
+        return None
+    slope = np.polyfit(log_n, log_rs, 1)[0]
+    return float(np.clip(slope, 0.0, 1.0))
+
+
 class DollarBarFeatures:
     """Cached view over a DollarBarBuffer for live feature computation.
 
@@ -284,6 +366,100 @@ class DollarBarFeatures:
         if arr is None or len(arr) == 0:
             return None
         v = arr[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    # ── S-1b (parity-r3 cycle 5): hurst_100 / ffd_rv / rv_zscore_* ──
+    # All three feed the TransVol encoder's 101-feature input row.
+    # Mirrors offline `vol_model/features/engineer.py:222-240` byte-for-byte
+    # except for evaluation site: live only needs the LATEST bar's value
+    # (offline computes the full series for training).
+
+    def hurst_100(self, *, window: int = 100) -> float | None:
+        """Hurst exponent on the trailing ``window`` log-returns.
+
+        Mirrors offline ``_hurst_subsampled(returns, window=100)`` evaluated
+        at the latest bar. The offline version interpolates between
+        ``step=50`` Hurst evaluations across the full series; live takes
+        the trailing window's instantaneous Hurst, which equals offline's
+        value at every position in {window, window+step, ...}.
+        """
+        df = self._df()
+        if df is None or "log_return" not in df.columns:
+            return None
+        log_ret = df["log_return"].to_numpy(dtype=np.float64)
+        return _hurst_subsampled_window(log_ret, window=window)
+
+    def ffd_rv(
+        self, *, d: float = 0.4, threshold: float = 1e-5,
+    ) -> float | None:
+        """Latest fractionally-differenced log-close value.
+
+        Mirrors offline ``frac_diff_ffd(np.log(bars["close"]), d, threshold)``
+        evaluated at the last index. The dot-product over the cached
+        weight vector matches ``np.convolve`` exactly when we walk the
+        weights in the conventional chronological-against-most-recent
+        order.
+        """
+        df = self._df()
+        if df is None or "close" not in df.columns:
+            return None
+        weights = _ffd_weights(d=d, threshold=threshold)
+        n_weights = len(weights)
+        if len(df) < n_weights:
+            return None
+        log_close = np.log(
+            df["close"].to_numpy(dtype=np.float64)[-n_weights:]
+        )
+        # Offline: np.convolve(values, weights[::-1], mode="valid"). For
+        # the LAST output (the only one we want) the convolution sum is
+        # ``sum(values[-1-k] * weights[k] for k in range(n_weights))``,
+        # which equals ``np.dot(values[-n_weights:][::-1], weights)``.
+        result = float(np.dot(log_close[::-1], weights))
+        return None if not np.isfinite(result) else result
+
+    def _rv_bar_series(self) -> np.ndarray | None:
+        """Cached numpy view of the buffer's per-bar realised variance."""
+        df = self._df()
+        if df is None or "rv_bar" not in df.columns:
+            return None
+        return df["rv_bar"].to_numpy(dtype=np.float64)
+
+    def rv_zscore(
+        self, horizon: str, *, bpd: int | None = None,
+    ) -> float | None:
+        """Rolling z-score of realised variance over a horizon.
+
+        Mirrors offline ``vol_model/features/engineer.py:233-240``::
+
+            for mult, label, cap in [(1, "1d", 50_000), (7, "1w", 50_000),
+                                     (30, "1m", 200_000)]:
+                w = min(max(bpd * mult, 10), cap)
+                mp = max(w // 4, 10)
+                rv_roll = rv_bar.rolling(w, min_periods=mp).sum()
+                mu = rv_roll.rolling(w, min_periods=mp).mean()
+                sigma = rv_roll.rolling(w, min_periods=mp).std()
+                feats[f"rv_zscore_{label}"] = (rv_roll - mu) / sigma.clip(lower=1e-15)
+
+        ``horizon`` ∈ {"1d", "1w", "1m"} → multipliers {1, 7, 30} and
+        caps {50000, 50000, 200000}.
+        """
+        if horizon not in ("1d", "1w", "1m"):
+            raise ValueError(f"horizon must be 1d/1w/1m, got {horizon!r}")
+        rv_bar = self._rv_bar_series()
+        if rv_bar is None or len(rv_bar) < 20:
+            return None
+        if bpd is None:
+            bpd = self.bars_per_day(trailing_days=30)
+        mult, cap = {"1d": (1, 50_000), "1w": (7, 50_000), "1m": (30, 200_000)}[horizon]
+        w = min(max(bpd * mult, 10), cap)
+        mp = max(w // 4, 10)
+        ser = pd.Series(rv_bar)
+        rv_roll = ser.rolling(w, min_periods=mp).sum()
+        mu = rv_roll.rolling(w, min_periods=mp).mean()
+        sigma = rv_roll.rolling(w, min_periods=mp).std()
+        denom = sigma.clip(lower=1e-15)
+        z = (rv_roll - mu) / denom
+        v = z.iloc[-1]
         return None if not np.isfinite(v) else float(v)
 
     def parkinson_1d_ema(

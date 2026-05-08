@@ -348,52 +348,64 @@ def _time_to_funding_seconds(ts: pd.Timestamp) -> float:
     return (24.0 - h) * 3600.0
 
 
-def _h_time_to_funding(ctx: AssemblerContext) -> float:
-    """F3 Tier 6 — seconds until next 8h funding boundary at bar T.
+def _effective_timestamp_for_funding(ctx: AssemblerContext) -> pd.Timestamp:
+    """Pick the timestamp the offline pipeline used for time_to_funding.
 
-    Pure datetime arithmetic; no buffer needed. Pre-Tier-6 this fell
-    through to the historical baseline, which gave the model a stale
-    funding-time-of-day for every signal.
+    S-1c (parity-r3 cycle 6 — 2026-05-08): offline computes
+    ``time_to_funding`` on the dollar-bar grid, then aggregates to
+    15-min via ``groupby(window_labels).last()`` — i.e. the value at
+    the 15-min row is the LAST dollar bar's value in that window.
+    Pre-cycle-6 the live handler used ``ctx.bar.timestamp`` (the
+    15-min wall-clock boundary), which deviates by up to ~15 minutes
+    from the offline last-dollar-bar timestamp. The fix: when a
+    ``DollarBarBuffer`` is present, use its latest bar's timestamp
+    instead. Falls back to the bar timestamp when no buffer is wired
+    (test fixtures, cold start).
     """
-    return _time_to_funding_seconds(ctx.bar.timestamp)
+    buf = getattr(ctx, "dollar_bar_buffer", None)
+    if buf is not None and len(buf) > 0:
+        last = buf.latest_bar()
+        if last is not None and last.timestamp is not None:
+            return pd.Timestamp(last.timestamp)
+    return ctx.bar.timestamp
+
+
+def _h_time_to_funding(ctx: AssemblerContext) -> float:
+    """F3 Tier 6 — seconds until next 8h funding boundary.
+
+    Cycle 6: timestamp is the latest dollar bar's microsecond-precision
+    timestamp when a buffer is wired (matches offline ``groupby(...)
+    .last()`` semantics); falls back to ``ctx.bar.timestamp`` (the
+    15-min wall-clock boundary) when no buffer is available.
+    """
+    return _time_to_funding_seconds(_effective_timestamp_for_funding(ctx))
 
 
 def _h_time_to_funding_lag1(ctx: AssemblerContext) -> float:
-    """F3 Tier 6 — time_to_funding at bar T-1 (15 min before T).
+    """time_to_funding at bar T-1.
 
-    For a 15-min bar cadence, this is just ``time_to_funding(ts - 15min)``
-    — equivalent to offline's ``series.shift(1).iloc[-1]`` since the
-    function is deterministic in the timestamp.
+    Cycle 6: ``ts - 15min`` from the effective dollar-bar timestamp
+    (NOT the wall-clock 15-min boundary). Mirrors offline shift(1)
+    on the dollar-bar grid.
     """
-    prev_ts = ctx.bar.timestamp - pd.Timedelta(minutes=15)
-    return _time_to_funding_seconds(prev_ts)
+    eff_ts = _effective_timestamp_for_funding(ctx)
+    return _time_to_funding_seconds(eff_ts - pd.Timedelta(minutes=15))
 
 
 def _h_time_to_funding_lag3(ctx: AssemblerContext) -> float:
-    """S-1b: time_to_funding at bar T-3 (45 min before T)."""
-    return _time_to_funding_seconds(
-        ctx.bar.timestamp - pd.Timedelta(minutes=15 * 3),
-    )
+    """time_to_funding at bar T-3."""
+    eff_ts = _effective_timestamp_for_funding(ctx)
+    return _time_to_funding_seconds(eff_ts - pd.Timedelta(minutes=15 * 3))
 
 
 def _h_time_to_funding_ema10(ctx: AssemblerContext) -> float:
-    """S-1b: EWM(span=10, adjust=True) over the time_to_funding series.
-
-    The function is deterministic in the timestamp so the trailing-K
-    series is fully reconstructible from the bar's timestamp; we
-    compute it on the fly from the last (10*ratio + buffer) timestamps
-    to converge the EMA. The series is also smooth (sawtooth with 8h
-    period) so the EMA hits steady-state within ~10 bars.
-    """
-    return _time_to_funding_ema(ctx.bar.timestamp, span=10)
+    """EWM(span=10) over the time_to_funding series."""
+    return _time_to_funding_ema(_effective_timestamp_for_funding(ctx), span=10)
 
 
 def _h_time_to_funding_ema50(ctx: AssemblerContext) -> float:
-    """S-1b: EWM(span=50, adjust=True) over the time_to_funding series.
-
-    Same logic as ``_h_time_to_funding_ema10`` with span=50.
-    """
-    return _time_to_funding_ema(ctx.bar.timestamp, span=50)
+    """EWM(span=50) over the time_to_funding series."""
+    return _time_to_funding_ema(_effective_timestamp_for_funding(ctx), span=50)
 
 
 def _time_to_funding_ema(ts: pd.Timestamp, *, span: int) -> float:

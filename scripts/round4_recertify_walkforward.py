@@ -406,8 +406,14 @@ def main() -> int:
     )
 
     if to_train and not args.skip_train:
+        # C2 (parity-r3 cycle 8 — 2026-05-08): forward the --force flag
+        # to the upstream walk-forward script as --force-retrain so its
+        # internal per-month cache-skip is bypassed too.
+        extra_args = list(args.extra_arg)
+        if args.force:
+            extra_args.append("--force-retrain")
         rc = _run_walkforward_subprocess(
-            asset=args.asset, months=to_train, extra_args=args.extra_arg,
+            asset=args.asset, months=to_train, extra_args=extra_args,
         )
         if rc != 0:
             logger.error("walk-forward subprocess exited rc=%d", rc)

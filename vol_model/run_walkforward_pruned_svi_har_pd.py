@@ -272,6 +272,14 @@ def main() -> None:
                         help="Train WITHOUT the Stage-15.9 SHAP-tail DROP list — "
                              "keeps all 35 pruned features (no drop, pure top-N) "
                              "so the A/B comparison full-35 vs drop-27 is clean.")
+    parser.add_argument("--force-retrain", action="store_true",
+                        help="C2 (parity-r3 cycle 8 — 2026-05-08): retrain even "
+                             "when the per-month LightGBM checkpoint already "
+                             "exists; overwrites in-place. Default behaviour "
+                             "(no flag) skips months whose `.txt` checkpoint "
+                             "is already on disk. Used by the orchestrator's "
+                             "--force flag for the operational overnight "
+                             "recertification workflow.")
     parser.add_argument("--save-shap", action="store_true",
                         help="After each month's LGBM trains, compute TreeExplainer "
                              "SHAP on the test window and save per-month mean |SHAP| "
@@ -421,9 +429,14 @@ def main() -> None:
         month_str = M.strftime("%Y-%m")
         lgb_path = output_dir / f"{month_str}.txt"
 
-        if lgb_path.exists():
+        if lgb_path.exists() and not args.force_retrain:
             logger.info("[%d/%d] %s: cached, skipping", i + 1, len(months), month_str)
             continue
+        if lgb_path.exists() and args.force_retrain:
+            logger.warning(
+                "[%d/%d] %s: --force-retrain in effect; overwriting existing %s",
+                i + 1, len(months), month_str, lgb_path.name,
+            )
 
         if not args.no_transvol:
             tv_path = hybrid_dir / f"{month_str}_transvol.pt"

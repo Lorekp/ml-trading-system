@@ -33,6 +33,7 @@ If all three pass → ship as pruned_svi_har_pd_v1, update backtester default
 
 Usage:
     PYTHONPATH=. python vol_model/run_walkforward_pruned_svi_har_pd.py
+    # Faster smoke run with a shorter Optuna budget:
     PYTHONPATH=. python vol_model/run_walkforward_pruned_svi_har_pd.py \\
         --max-trials 100 --patience 30
 """
@@ -257,11 +258,16 @@ def main() -> None:
                         help="First month to retrain (inclusive), YYYY-MM")
     parser.add_argument("--end", default="2026-03",
                         help="Last month to retrain (inclusive), YYYY-MM")
-    parser.add_argument("--max-trials", type=int, default=100,
-                        help="Optuna trial budget per month (default 100; "
-                             "production hybrid uses 200)")
-    parser.add_argument("--patience", type=int, default=30,
-                        help="Optuna patience (default 30; production uses 50)")
+    parser.add_argument("--max-trials", type=int, default=200,
+                        help="Optuna trial budget per month. Default 200 = "
+                             "production hybrid baseline (cycle 8, 2026-05-08). "
+                             "TPE empirically converges by trial ~30, but the "
+                             "200-trial budget is the certified prod config; "
+                             "lowering it ships a model from a different "
+                             "search budget than the production training pipeline.")
+    parser.add_argument("--patience", type=int, default=50,
+                        help="Optuna patience. Default 50 = production hybrid "
+                             "baseline (cycle 8, 2026-05-08).")
     parser.add_argument("--output-dir", type=str, default="",
                         help="Override save dir (else per-asset via resolver)")
     parser.add_argument("--tf", type=int, default=900,

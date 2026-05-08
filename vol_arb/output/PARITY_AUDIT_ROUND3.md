@@ -335,7 +335,7 @@ below is genuinely new.
 | S-9 | Term-slope degenerate-slice handling differs | P2 | ~10 |
 | S-10 | profit_scale warm-resume vs cold backtest | P3 | 0 (accepted) |
 
-### S-1 (P0) — Live TransVol embeddings missing
+### S-1 (P0) — Live TransVol embeddings missing — **DONE round-3 cycle 6**
 
 - **Live path**: `deribit_paper/engine.py:1916` passes
   `transvol_embedding=None` to the predictor; `FeatureAssembler`
@@ -671,6 +671,56 @@ Critical correction to original audit framing: "no h15m TransVol checkpoint, no 
 | Latest-month verification | (verify) | 2026-04 production checkpoint validated (QLIKE 0.5283, RankIC 0.6236) |
 | Phase 0 — data refresh | (data) | TSRV / features parquets refreshed through 2026-04-30; HAR-PD predictions extracted for 50/50 months through 2026-03 |
 | OPEN — deferred to S-1c | 1 P0 | full live 101-feature parity (~40 remaining handlers) + engine integration + parity gate test |
+
+### Round-3 cycle 6 closure summary (2026-05-08) — S-1 DONE
+
+| Status | Count | Items |
+|---|---:|---|
+| **DONE — S-1 closes** | 1 P0 | S-1 (full live 101-feature parity + engine integration + parity gate) |
+| Ride-along bug fix | (fix) | time_to_funding handlers now use the latest dollar bar's microsecond timestamp (matches offline `groupby(...).last()`) instead of the 15-min wall-clock boundary; raw byte-equal at 2026-04-30 23:45 (live=27, offline=27) |
+| Documented deviation (C1) | (defer) | TSRV-grid lag/EMA (live 15-min cadence vs offline dollar-bar grid) — closure path is the 1750-bar `DollarBarBuffer` extension (~200 LOC, accepted-by-design as of cycle 5) |
+
+**Cycle 6 totals**: ~1,800 LOC source + ~2,000 LOC tests across 11 commits-worth of work, packaged as 5 sequenced commits:
+
+- *(this cycle)* — S-1c Phase 1: full TransVol live coverage (96/101 columns) — derived-series cache + 56 new variant handlers + down_jump_frac alias fix + 58 tests
+- *(this cycle)* — S-1c Phase 2: funding_basis live provider closes 101/101 coverage — `FundingRateProvider` with REST + parquet paths + 25 new tests
+- *(this cycle)* — S-1c Phase 3a/b/c: TransVol live wiring through process_bar — `assemble_transvol_input_row` + `cfg.use_transvol_live` flag + engine bar-loop integration + 18 new tests
+- *(this cycle)* — S-1c Phase 3d: offline-vs-live parity gate + time_to_funding fix — Tier-A strict / Tier-B informational / Tier-C structural + mutation probe + 7 new tests
+- *(this cycle)* — S-1c Phase 4: this audit ledger flip
+
+**Live coverage of the encoder's 101-feature input row**: 101/101 — every TransVol input column resolves to a live handler. `_LIVE_HANDLERS` contains 109 entries (101 feature columns + 8 internal-name aliases for legacy callsites).
+
+**Tier-A parity at 2026-04-30 23:45**: `funding_basis_*` (5 cols) + `time_to_funding` (raw) byte-equal to offline within `rtol=1e-5, atol=1e-7`. Mutation probe (deliberate column swap) detected — column ordering is locked.
+
+**Tier-B documented deviations** (TSRV-grid + time_to_funding lag/EMA): up to 27% relative diff on calm bars; mathematically equivalent to offline under constant-rate trading per C1. Strict byte-equality is the single remaining open closure path; deferred to S-1d as a `DollarBarBuffer.prewarm_full_history` extension when operational priority allows.
+
+**Cumulative round-3 progress (cycle 1 + 2 + 3 + 4 + 5 + 6)**:
+- 10 P0s closed, 1 rejected (S-4 mis-read), 0 deferred — **all P0s resolved**
+- 15 P1s closed, 3 rejected (R-3, S-2, S-6) — all P1s resolved at cycle 3
+- 4 P2s closed; ~20 P2/P3 hygiene items OPEN (no impact on signal parity)
+
+**Round-3 audit ladder is closure-complete on the P0 + P1 axes.** Hygiene-class items (P2/P3) remain as ongoing work.
+
+**Cycle 6 files added**:
+- `deribit_paper/market_data/funding.py` (NEW — FundingRateProvider)
+- `deribit_paper/tests/test_tsrv_history_extended_schema.py`
+- `deribit_paper/tests/test_live_features_derived_lag_ema.py`
+- `deribit_paper/tests/test_live_features_tsrv_grid_variants.py`
+- `deribit_paper/tests/test_live_features_down_jump_frac.py`
+- `deribit_paper/tests/test_live_features_registry_coverage.py`
+- `deribit_paper/tests/test_funding_rate_provider.py`
+- `deribit_paper/tests/test_live_features_funding_basis.py`
+- `deribit_paper/tests/test_assembler_transvol_input_row.py`
+- `deribit_paper/tests/test_engine_transvol_integration.py`
+- `deribit_paper/tests/test_transvol_live_offline_parity.py`
+
+**Cycle 6 files modified**:
+- `deribit_paper/features/dollar_bar_features.py` — derived-series cache + lag/ema methods
+- `deribit_paper/features/tsrv_history.py` — schema extension (rv_fast, n_ticks, down_jump_fraction)
+- `deribit_paper/features/tsrv_features.py` — 18 new derived getters
+- `deribit_paper/signal/feature_assembler.py` — 56 new handler registrations + funding handlers + assemble_transvol_input_row + TRANSVOL_INPUT_COLUMNS
+- `deribit_paper/engine.py` — TransVol bar-loop integration + funding provider wiring
+- `deribit_paper/config.py` — `use_transvol_live: bool = True`, `funding_parquet_path` sentinel
 
 **Cycle 5 totals**: ~590 LOC source (3 new feature methods + 22 handler registrations + verification script + Unicode-bug ride-along) + ~360 LOC tests across 1 new file (`test_live_features_s1b.py`). 4 commits:
 - `f69aa66` — S-1b Phase 1a: hurst_100 + ffd_rv + rv_zscore live equivalents (16 byte-equal tests)

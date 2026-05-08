@@ -535,25 +535,33 @@ order; pick whichever fit the next cycle's scope.
 | C1..C6 | varies | carryover from round-2 (see top of doc) |
 | **F-1** | P0 | **DONE** — round-3 cycle commit (TSRV append moved after `predictor.predict`; strict-past contract enforced; 3 regression tests in `test_tsrv_history_strict_past.py`) |
 | **F-2** | P0 | **DONE** — round-3 cycle commit (`parkinson_1d_ema` now operates on rolling-mean series; 6 byte-identity tests in `test_parkinson_1d_ema_source_series.py`) |
-| F-3 | P1 | OPEN — couples with F-2 (dynamic `bpd` plumbing) |
+| **F-3** | P1 | **DONE** — round-3 cycle 2 commit (dynamic `bpd` via `DollarBarFeatures.bars_per_day`; closes F-2 sibling; 8 tests in `test_dollar_bar_features_dynamic_bpd.py`; existing handler tests updated) |
 | **F-4** | P0 | **DONE** — round-3 cycle commit (`atm_vol_at_dte` filters `params_df` by shifted `bucket_ts`; 7 tests in `test_svi_atm_dte_bucket_shift.py`; predictor + assembler call sites updated) |
 | F-5..F-9 | P2/P3 | OPEN |
-| E-5 | P0 | OPEN — high-impact ($40-100K), 30 LOC; deferred to next cycle |
-| E-6, E-7, E-8 | P1 | OPEN |
+| **E-5** | P0 | **DONE** — round-3 cycle 2 commit `803be95` (`place_maker_then_taker` wired into `straddle_flow.execute` entry path; exit stays on `place_ioc_taker`; 5 tests in `test_straddle_flow_maker_then_taker.py`; existing tiered-ioc tests updated) |
+| E-6, E-7 | P1 | OPEN — backtester model-philosophy decisions; deferred |
+| **E-8** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (4 cancel/recovery paths swap naked `order_type="market"` for `place_ioc_taker(tiered=True)`; new `cfg.cancel_exit_max_slippage_pct=1.0`; tests in `test_straddle_flow_maker_then_taker.py`) |
 | E-9..E-12 | P2/P3 | OPEN |
-| D-7 | P0 | OPEN — changes V2 byte-identity baseline; deferred to a dedicated "model-recerify" cycle |
-| D-8, D-9, D-11 | P1 | OPEN |
+| **D-7** | P0 | **DONE** — round-3 cycle 2 commit `1d4ca5a` (per-tick Greeks in `DRLHedger.simulate`; V2 NC PnL $1,024,449.18 → $1,024,054.51 (-$394.67, -0.039%) with Kelly K1 sidecar regen; n_trades unchanged at 7,543; 4 unit tests + V2 byte-identity relocked; rebaseline report at `vol_arb/output/parity_r3_cycle2_d7_rebaseline.md`) |
+| **D-8** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (engine captures `vol_ann_lagged` from `tsrv_history_buffer.latest_vol_ann_lagged()` BEFORE F-1 append, plumbs through to `LiveDRLHedger.begin_trade`; matches env.py:172's `df["vol_ann"].shift(1)`; tests in `test_drl_hedger_iv_and_vol_ann_sources.py`) |
+| **D-9** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (`begin_trade` evaluates `slice.iv(K)` to recover `iv_entry` whenever a slice is provided; matches env.py:412-415 reset semantic) |
+| **D-11** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (new `drl_trade_state` SQLite table FK-linked to `open_positions`; persister/remover callbacks emit on every begin_trade/step/close_trade; `_resume_trade` rehydrates via `resume_trade_from_dict`; 13 tests in `test_drl_trade_state_persistence.py`) |
 | D-10, D-12, D-13 | P2/P3 | OPEN |
-| S-1 | P0 | OPEN — TransVol live plumbing; ~50 LOC |
+| S-1 | P0 | OPEN — multi-day feature build (no h15m TransVol checkpoint, no live inference path); split into S-1a (training) + S-1b (live wiring); deferred to dedicated TransVol-live cycle |
+| S-2 | P1 | OPEN |
+| **S-3** | P1 | **DONE** — round-3 cycle 2 commit (predictor `_lookup_iv` falls through to TSRV proxy when SVI uncalibrated/empty; new `Signal.iv_source` field tags "svi" / "tsrv_proxy"; 7 tests in `test_predictor_iv_used_fallback.py`; warmup-emit behavior change documented) |
 | **S-4** | P0 | **REJECT** — agent mis-read backtester semantics. `df["vega"]` is the COMPOSITE (call+put = straddle) vega, set in `_composite_greeks` at `vol_arb/pipeline.py:241-242`. `bsm_vega_per_vol_pt` (live) returns single-leg vega; live correctly multiplies by 2 to convert to straddle. Both sides end at straddle vega; no divergence. |
-| S-2, S-3, S-6, S-8 | P1 | OPEN |
+| S-6 | P1 | OPEN |
+| **S-8** | P1 | **DONE** — round-3 cycle 2 commit (`PaperConfig.with_v2_preset` flips `base_spread_iv 1.5 → 2.0` to match `BacktestConfig.with_realistic_costs`; 3 tests in `test_v2_preset_base_spread_iv.py` including cross-engine sanity check) |
 | S-5, S-7, S-9, S-10 | P2/P3 | OPEN |
 | **R-1** | P0 | **DONE** — round-3 cycle commit (kill-switch wired to `daily_return_pct` instead of `drawdown_pct`; existing `test_kill_switch.py` updated to assert corrected semantic; new `test_kill_switch_daily_dd_and_set_equity_peak.py` covers contract) |
 | **R-2** | P0 | **DONE** — round-3 cycle commit (`set_equity` peak advance only on `reason="deposit"`; default `reason="reconcile"` preserves peak; unknown reasons raise; 4 tests in `test_kill_switch_daily_dd_and_set_equity_peak.py`) |
-| R-3, R-4, R-5 | P1 | OPEN |
+| R-3, R-4, R-5 | P1 | OPEN — risk-engine cycle (worth a dedicated audit) |
 | R-6..R-10 | P2/P3 | OPEN |
-| O-5, O-9 | P0 | OPEN — open-order recovery + WS reconcile; ~80+20 LOC |
-| O-1, O-2, O-4, O-6 | P1 | OPEN |
+| **O-5** | P0 | **DONE** — round-3 cycle 2 commit `803be95` (the existing `_reconcile_positions_on_startup` already handled full-straddle recovery; the genuine gap was DRL hedger state — closed via D-11; orphan-close path also upgraded from naked market to tiered IOC via E-8) |
+| **O-9** | P0 | **DONE** — round-3 cycle 2 commit `803be95` (`_on_ws_reconnect` now schedules `_reconcile_open_orders_on_reconnect`; age-gated cleanup of stale orphans; new `cfg.ws_reconcile_orphan_age_seconds=300`; 8 tests in `test_engine_ws_reconnect_reconcile.py`) |
+| O-1, O-2, O-6 | P1 | OPEN — backtester semantics changes; deferred to execution-modeling cycle |
+| **O-4** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (Deribit option tick now mark-price-aware via `_option_tick_for_mark`; 0.0001 BTC for mark<0.05, else 0.0005; 8 tests in `test_order_manager_option_tick.py`) |
 | O-3, O-7, O-8 | P2/P3 | OPEN |
 
 ### Round-3 cycle 1 closure summary (2026-05-08)
@@ -566,10 +574,46 @@ order; pick whichever fit the next cycle's scope.
 
 **~65 LOC source + ~700 LOC tests** (24 new regression tests across 5
 new files). 886/886 deribit_paper tests pass; 43/43 V2 byte-identity
-preserved. The remaining 5 P0s are deferred because each carries
-either high blast radius (D-7 changes V2 baseline) or significant
-implementation cost (S-1 ~50 LOC, E-5 ~30 LOC, O-5 ~80 LOC, O-9 ~20
-LOC).
+preserved.
+
+### Round-3 cycle 2 closure summary (2026-05-08)
+
+| Status | Count | Items |
+|---|---:|---|
+| DONE — closed this cycle | 4 P0s | E-5, O-5, O-9, D-7 |
+| DONE — closed this cycle | 7 P1s | E-8, O-4, D-8, D-9, D-11, S-3, S-8, F-3 |
+| OPEN — deferred (multi-day project) | 1 P0 | S-1 (TransVol live; needs h15m checkpoint training + sequence buffer + encoder loader) |
+| OPEN — deferred (modeling debate) | 9 P1s | E-6, E-7 (cap-multiplier vs %-cap); O-1, O-2, O-6 (cancel-replace gap, tier blending, bar-aligned exit timing); R-3, R-4, R-5 (risk-engine cycle); S-2, S-6 (sidecar lookup convention) |
+| OPEN — deferred (P2/P3 hygiene) | 24 | F-5..F-9, E-9..E-12, D-10, D-12, D-13, S-5, S-7, S-9, S-10, R-6..R-10, O-3, O-7, O-8 |
+
+**Cycle 2 totals**: ~250 LOC source + ~1,500 LOC tests across 8 new
+test files + 5 modified. 4 sequenced commits:
+- `803be95` — operational P0s + DRL hygiene P1s (E-5, E-8, O-4, O-5+D-11, O-9, D-8, D-9)
+- `1d4ca5a` — DRL D-7 + V2 rebaseline ($1,024,449.18 → $1,024,054.51, -0.039%)
+- *cycle 2C* — signal/feature parity P1s (S-3, S-8, F-3)
+- *cycle 2D* — this audit ledger update
+
+V2 byte-identity preserved at the new D-7-corrected baseline of
+`$1,024,054.5149 / 7,543 trades`. Kelly K1 sidecar regenerated
+(mean multiplier 1.0025, essentially unchanged). All deribit_paper
+tests green.
+
+**Cumulative round-3 progress (cycle 1 + cycle 2)**:
+- 9 P0s closed (F-1, F-2, F-4, R-1, R-2, E-5, O-5, O-9, D-7), 1 P0
+  rejected (S-4 mis-read), 1 P0 deferred (S-1 multi-day project).
+- 8 P1s closed (E-8, O-4, D-8, D-9, D-11, S-3, S-8, F-3),
+  9 P1s deferred to dedicated cycles (modeling-philosophy debates +
+  risk-engine + sidecar conventions).
+- All P2/P3 hygiene items remain OPEN.
+
+**Files**:
+- Cycle 2 plan: `~/.claude/plans/starry-rolling-rabin.md`
+- D-7 rebaseline report: `vol_arb/output/parity_r3_cycle2_d7_rebaseline.md`
+- Test files (cycle 2): `test_straddle_flow_maker_then_taker.py`,
+  `test_engine_ws_reconnect_reconcile.py`, `test_order_manager_option_tick.py`,
+  `test_drl_trade_state_persistence.py`, `test_drl_hedger_iv_and_vol_ann_sources.py`,
+  `tests/test_drl_simulate_per_tick_greeks.py`, `test_predictor_iv_used_fallback.py`,
+  `test_v2_preset_base_spread_iv.py`, `test_dollar_bar_features_dynamic_bpd.py`
 
 ---
 

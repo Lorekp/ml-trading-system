@@ -49,7 +49,9 @@ from deribit_paper.features import LiveSVICalibrator, StrikePicker, compute_bar_
 from deribit_paper.features.dollar_bar import DollarBarAggregator
 from deribit_paper.features.dollar_bar_buffer import DollarBarBuffer
 from deribit_paper.features.dollar_bar_stream import DollarBarSpotStream
+from deribit_paper.features.transvol_history import TransVolHistoryBuffer
 from deribit_paper.features.tsrv_history import TSRVHistoryBuffer
+from deribit_paper.market_data.funding import FundingRateProvider
 from deribit_paper.market_data import (
     Bar,
     BarAggregator,
@@ -71,6 +73,11 @@ from deribit_paper.signal import (
     Predictor,
     load_model_bundle,
 )
+from deribit_paper.signal.feature_assembler import (
+    TRANSVOL_INPUT_COLUMNS,
+    TRANSVOL_TIME_COLUMNS,
+)
+from deribit_paper.signal.transvol_inference import TransVolInference
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +202,11 @@ class TradingEngine:
         self.feature_assembler: FeatureAssembler | None = None
         self.predictor: Predictor | None = None
         self.live_drl_hedger: LiveDRLHedger | None = None
+        # S-1c (parity-r3 cycle 6 — 2026-05-08): TransVol live wiring.
+        # Constructed at startup when ``cfg.use_transvol_live`` is True.
+        self.transvol_history_buffer: TransVolHistoryBuffer | None = None
+        self.transvol_inference: TransVolInference | None = None
+        self.funding_provider: FundingRateProvider | None = None
 
         self.order_manager: OrderManager | None = None
         self.straddle_flow: StraddleFlow | None = None
@@ -545,6 +557,18 @@ class TradingEngine:
             n_tsrv_rows, _tsrv_history_parquet,
         )
 
+        # S-1c (parity-r3 cycle 6 — 2026-05-08): live funding-rate provider.
+        # Loads the offline parquet for Path-B fallback; Path A
+        # (Binance ``premiumIndex``) is queried lazily on first
+        # advance() call. Default-constructed on every boot regardless
+        # of ``use_transvol_live`` because the LightGBM model also has
+        # ``funding_basis_*`` features in its baseline merge — having
+        # the live ffill is strictly better than the stale baseline.
+        self.funding_provider = FundingRateProvider(
+            symbol=cfg.asset_pair,
+            parquet_path=cfg.funding_parquet_path,
+        )
+
         self.feature_assembler = FeatureAssembler(
             features_parquet=features_parquet,
             svi_features_parquet=svi_features_parquet,
@@ -552,6 +576,7 @@ class TradingEngine:
             svi_calibrator=self.svi_calibrator,
             dollar_bar_buffer=self.dollar_bar_buffer,
             tsrv_history_buffer=self.tsrv_history_buffer,
+            funding_provider=self.funding_provider,
             rolling_history_bars=cfg.bars_per_day * 7,
         )
         # C (parity 2026-05-07): pre-warm the HAR-PD circular buffer
@@ -566,6 +591,59 @@ class TradingEngine:
             f"TSRV/output/{cfg.asset_pair}_tsrv_{cfg.bar_minutes}m.parquet"
         )
         self.feature_assembler.prewarm_har_pd_from_tsrv(tsrv_parquet)
+
+        # ── S-1c (parity-r3 cycle 6 — 2026-05-08): TransVol live wiring ──
+        # When use_transvol_live=True, build a 32-bar sequence buffer +
+        # the encoder-inference wrapper, prewarm from the offline 101-
+        # feature parquet. The bar loop then computes a fresh
+        # ``embedding_compact`` (16-dim) per bar and feeds it to
+        # ``predictor.predict``. When False (legacy / emergency), all
+        # of these stay None and the predictor receives
+        # ``transvol_embedding=None`` — the LightGBM tv_* slots fall
+        # back to their stale baseline values (pre-S-1 behaviour).
+        if cfg.use_transvol_live:
+            try:
+                tv_cfg = self.model_bundle.transvol_config
+                self.transvol_history_buffer = TransVolHistoryBuffer(
+                    n_features=int(tv_cfg.n_features),
+                    seq_len=int(tv_cfg.seq_len),
+                    max_size=int(tv_cfg.seq_len),
+                )
+                n_tv_rows = self.transvol_history_buffer.prewarm_from_parquet(
+                    features_parquet=cfg.features_parquet,
+                    feature_columns=list(TRANSVOL_INPUT_COLUMNS),
+                    time_columns=TRANSVOL_TIME_COLUMNS,
+                    feat_mean=self.model_bundle.transvol_feat_mean,
+                    feat_std=self.model_bundle.transvol_feat_std,
+                    time_mean=self.model_bundle.transvol_time_mean,
+                    time_std=self.model_bundle.transvol_time_std,
+                )
+                self.transvol_inference = TransVolInference(
+                    encoder=self.model_bundle.transvol_model,
+                    buffer=self.transvol_history_buffer,
+                )
+                logger.info(
+                    "TransVol live wiring ready: prewarmed=%d rows from %s "
+                    "(seq_len=%d, n_features=%d, inference_ready=%s)",
+                    n_tv_rows, cfg.features_parquet,
+                    self.transvol_history_buffer.seq_len,
+                    self.transvol_history_buffer.n_features,
+                    self.transvol_history_buffer.is_inference_ready,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "TransVol live wiring failed (%s); falling back to "
+                    "stale-baseline tv_* slots for this run", exc,
+                )
+                self.transvol_history_buffer = None
+                self.transvol_inference = None
+        else:
+            logger.warning(
+                "use_transvol_live=False — LightGBM will receive stale "
+                "baseline tv_* embeddings (cycle-5 cold-start path). "
+                "Toggle PaperConfig.use_transvol_live=True for full "
+                "live-vs-offline parity.",
+            )
         # ── V2 sidecar loads (aligner β* + Kelly K1) ──
         # Aligner β*: per-month QLIKE-optimal scalar bias on log-vol
         # predictions (C2 2026-04-26). Empty dict → predictor passes raw
@@ -2004,10 +2082,73 @@ class TradingEngine:
             logger.exception("Strike picker failed: %s", exc)
             straddle = None
 
+        # S-1c (parity-r3 cycle 6 — 2026-05-08): live TransVol embedding.
+        # Order matters: assemble the unnormalised 101-feature row +
+        # 2-time row, normalise via bundle stats, append to the
+        # sequence buffer, then run the encoder forward over the
+        # latest seq_len rows. The append-before-compute order matches
+        # offline ``vol_model/transvol/dataset.py``:
+        # ``features[i-seq_len+1 .. i]`` (inclusive of bar i) predicts
+        # ``labels[i+1]``. Live includes bar T in the encoder window
+        # and the resulting embedding informs the prediction for T+1.
+        # The funding provider must advance BEFORE
+        # ``assemble_transvol_input_row`` so the bar's funding_basis_*
+        # row is up-to-date.
+        transvol_embedding: np.ndarray | None = None
+        if self.funding_provider is not None:
+            try:
+                self.funding_provider.advance(bar.timestamp)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "FundingRateProvider.advance failed at %s",
+                    bar.timestamp,
+                )
+        if (
+            self.transvol_inference is not None
+            and self.transvol_history_buffer is not None
+            and self.feature_assembler is not None
+        ):
+            try:
+                raw_feats, raw_time = (
+                    self.feature_assembler.assemble_transvol_input_row(
+                        bar, bar_tsrv,
+                    )
+                )
+                feat_mean = np.asarray(
+                    self.model_bundle.transvol_feat_mean, dtype=np.float32,
+                )
+                feat_std = np.asarray(
+                    self.model_bundle.transvol_feat_std, dtype=np.float32,
+                ).clip(min=1e-8)
+                time_mean = np.asarray(
+                    self.model_bundle.transvol_time_mean, dtype=np.float32,
+                )
+                time_std = np.asarray(
+                    self.model_bundle.transvol_time_std, dtype=np.float32,
+                ).clip(min=1e-8)
+                feat_n = (raw_feats - feat_mean) / feat_std
+                time_n = (raw_time - time_mean) / time_std
+                # Defensive: zero-fill any NaN that snuck through (warmup
+                # / handler edge cases). The TransVolHistoryBuffer
+                # validates shapes but not finiteness.
+                feat_n = np.nan_to_num(feat_n, nan=0.0, posinf=0.0, neginf=0.0)
+                time_n = np.nan_to_num(time_n, nan=0.0, posinf=0.0, neginf=0.0)
+                self.transvol_history_buffer.append(
+                    bar.timestamp, feat_n, time_n,
+                )
+                transvol_embedding = self.transvol_inference.compute_embedding()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "TransVol live inference failed at %s; falling back to "
+                    "baseline tv_* embeddings for this bar",
+                    bar.timestamp,
+                )
+                transvol_embedding = None
+
         # 5. Run predictor
         signal = self.predictor.predict(
             bar=bar, bar_tsrv=bar_tsrv, straddle=straddle,
-            transvol_embedding=None,  # fresh TransVol is Phase 4B follow-up
+            transvol_embedding=transvol_embedding,
         )
         # D-8 (parity-r3 cycle 2 — 2026-05-08): capture vol_ann_lagged
         # BEFORE the F-1 append below so it reflects bar T-1's vol_ann

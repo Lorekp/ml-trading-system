@@ -963,6 +963,62 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
 _TRANSVOL_SLOTS: frozenset[str] = frozenset(f"tv_{i}" for i in range(16))
 
 
+# S-1c (parity-r3 cycle 6 — 2026-05-08): canonical 101-feature input
+# column order for the TransVol encoder. Matches
+# ``pd.read_parquet('vol_model/output/BTCUSDT_features_15m.parquet')``
+# columns minus the 25 dropped OFI/depth/OI columns (see
+# ``vol_model/transvol/dataset.py:142-144``). The encoder was trained
+# on this exact ordering; the live row built by
+# :meth:`FeatureAssembler.assemble_transvol_input_row` MUST honour it.
+TRANSVOL_INPUT_COLUMNS: tuple[str, ...] = (
+    "n_bars_in_window",
+    "hurst_100", "hurst_100_lag1", "hurst_100_lag3",
+    "hurst_100_ema10", "hurst_100_ema50",
+    "ffd_rv", "ffd_rv_lag1", "ffd_rv_lag3",
+    "ffd_rv_ema10", "ffd_rv_ema50",
+    "rv_zscore_1d", "rv_zscore_1d_lag1", "rv_zscore_1d_lag3",
+    "rv_zscore_1d_ema10", "rv_zscore_1d_ema50",
+    "rv_zscore_1w", "rv_zscore_1w_lag1", "rv_zscore_1w_lag3",
+    "rv_zscore_1w_ema10", "rv_zscore_1w_ema50",
+    "rv_zscore_1m", "rv_zscore_1m_lag1", "rv_zscore_1m_lag3",
+    "rv_zscore_1m_ema10", "rv_zscore_1m_ema50",
+    "tsrv_ffd", "tsrv_ffd_lag1", "tsrv_ffd_lag3",
+    "tsrv_ffd_ema10", "tsrv_ffd_ema50",
+    "tsrv_mean_1d", "tsrv_mean_1d_lag1", "tsrv_mean_1d_lag3",
+    "tsrv_mean_1d_ema10", "tsrv_mean_1d_ema50",
+    "tsrv_mean_1w", "tsrv_mean_1w_lag1", "tsrv_mean_1w_lag3",
+    "tsrv_mean_1w_ema10", "tsrv_mean_1w_ema50",
+    "down_jump_frac", "down_jump_frac_lag1", "down_jump_frac_lag3",
+    "down_jump_frac_ema10", "down_jump_frac_ema50",
+    "up_jump_frac", "up_jump_frac_lag1", "up_jump_frac_lag3",
+    "up_jump_frac_ema10", "up_jump_frac_ema50",
+    "noise_level", "noise_level_lag1", "noise_level_lag3",
+    "noise_level_ema10", "noise_level_ema50",
+    "bpv_tsrv_ratio", "bpv_tsrv_ratio_lag1", "bpv_tsrv_ratio_lag3",
+    "bpv_tsrv_ratio_ema10", "bpv_tsrv_ratio_ema50",
+    "parkinson_1d", "parkinson_1d_lag1", "parkinson_1d_lag3",
+    "parkinson_1d_ema10", "parkinson_1d_ema50",
+    "duration_s", "duration_s_lag1", "duration_s_lag3",
+    "duration_s_ema10", "duration_s_ema50",
+    "n_trades", "n_trades_lag1", "n_trades_lag3",
+    "n_trades_ema10", "n_trades_ema50",
+    "imbalance", "imbalance_lag1", "imbalance_lag3",
+    "imbalance_ema10", "imbalance_ema50",
+    "vov", "vov_lag1", "vov_lag3", "vov_ema10", "vov_ema50",
+    "vpin", "vpin_lag1", "vpin_lag3", "vpin_ema10", "vpin_ema50",
+    "funding_basis", "funding_basis_lag1", "funding_basis_lag3",
+    "funding_basis_ema10", "funding_basis_ema50",
+    "time_to_funding", "time_to_funding_lag1", "time_to_funding_lag3",
+    "time_to_funding_ema10", "time_to_funding_ema50",
+)
+TRANSVOL_TIME_COLUMNS: tuple[str, str] = ("duration_s", "n_bars_in_window")
+
+assert len(TRANSVOL_INPUT_COLUMNS) == 101, (
+    f"TRANSVOL_INPUT_COLUMNS must have 101 entries, got "
+    f"{len(TRANSVOL_INPUT_COLUMNS)}"
+)
+
+
 # ────────────────────────────────────────────────────────────
 # FeatureRow output + FeatureAssembler class
 # ────────────────────────────────────────────────────────────
@@ -1016,6 +1072,7 @@ class FeatureAssembler:
         svi_calibrator: Any | None = None,
         dollar_bar_buffer: DollarBarBuffer | None = None,
         tsrv_history_buffer: TSRVHistoryBuffer | None = None,
+        funding_provider: Any | None = None,
         rolling_history_bars: int = 672,  # 7 days at 15min
         har_pd_k_bars: int = HAR_PD_K_BARS_DEFAULT,
     ):
@@ -1035,6 +1092,10 @@ class FeatureAssembler:
         # the engine to call ``buffer.append_bar`` per process_bar.
         # While None, the 6 TSRV-derived handlers fall back to baseline.
         self._tsrv_history_buffer = tsrv_history_buffer
+        # S-1c (parity-r3 cycle 6 — 2026-05-08): live funding-rate
+        # provider. ``None`` until the engine wires it; while None
+        # the 5 ``funding_basis_*`` handlers fall back to baseline.
+        self._funding_provider = funding_provider
         self._rolling_history_bars = rolling_history_bars
         # C (parity 2026-05-07): live HAR-PD state. Each call to
         # ``build_row`` reads strict-past values from this buffer
@@ -1281,6 +1342,7 @@ class FeatureAssembler:
             dollar_bar_features=dollar_bar_features,
             tsrv_history_buffer=self._tsrv_history_buffer,
             tsrv_features=tsrv_features,
+            funding_provider=self._funding_provider,
         )
 
         for i, name in enumerate(feature_names):
@@ -1360,3 +1422,89 @@ class FeatureAssembler:
             as_dict=as_dict,
             transvol_embedding=transvol_embedding,
         )
+
+    # ── S-1c (parity-r3 cycle 6 — 2026-05-08): TransVol input row ──
+
+    def assemble_transvol_input_row(
+        self,
+        bar: Bar,
+        bar_tsrv: BarTSRV,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build the encoder's UNNORMALISED 101-feature + 2-time row.
+
+        Walks ``TRANSVOL_INPUT_COLUMNS`` (the encoder's training-time
+        column ordering) using the same ``_LIVE_HANDLERS`` dispatch as
+        :meth:`build_row`, but produces the encoder-input layout rather
+        than the LightGBM manifest layout.
+
+        Returns
+        -------
+        (features_101, time_features_2)
+            ``features_101`` is shape ``(101,) float32`` in
+            ``TRANSVOL_INPUT_COLUMNS`` order.
+            ``time_features_2`` is shape ``(2,) float32`` for
+            ``(duration_s, n_bars_in_window)`` (matches
+            ``vol_model/transvol/dataset.py:TIME_COLS``).
+
+        Both arrays are UNNORMALISED — the caller (engine) applies
+        the bundle's ``transvol_feat_mean/std`` before appending to
+        the ``TransVolHistoryBuffer``. Decoupling normalisation from
+        feature extraction keeps the buffer reusable across encoder
+        checkpoints with different stats.
+
+        NaN handling: any handler returning NaN propagates here. The
+        caller (or :class:`TransVolHistoryBuffer.prewarm_from_parquet`)
+        decides the policy (typically ``np.nan_to_num(0)`` for the
+        warmup window, then strict NaN-fail in steady state).
+        """
+        # Build a context that mirrors build_row's setup so every
+        # handler sees the same dependency graph (HAR-PD, dollar-bar
+        # cached features, TSRV cached features, funding provider).
+        har_pd_features = self._har_pd_state.compute_features()
+        dollar_bar_features = (
+            DollarBarFeatures(self._dollar_bar_buffer)
+            if self._dollar_bar_buffer is not None else None
+        )
+        tsrv_features = (
+            TSRVFeatures(self._tsrv_history_buffer)
+            if self._tsrv_history_buffer is not None else None
+        )
+        ctx = AssemblerContext(
+            bar=bar,
+            bar_tsrv=bar_tsrv,
+            svi_calibrator=self._svi_calibrator,
+            baseline_row=self._baseline_row,
+            har_pd_features=har_pd_features,
+            dollar_bar_buffer=self._dollar_bar_buffer,
+            dollar_bar_features=dollar_bar_features,
+            tsrv_history_buffer=self._tsrv_history_buffer,
+            tsrv_features=tsrv_features,
+            funding_provider=self._funding_provider,
+        )
+
+        n = len(TRANSVOL_INPUT_COLUMNS)
+        features = np.zeros(n, dtype=np.float32)
+        for i, name in enumerate(TRANSVOL_INPUT_COLUMNS):
+            handler = _LIVE_HANDLERS.get(name)
+            if handler is not None:
+                try:
+                    features[i] = float(handler(ctx))
+                except Exception as exc:  # noqa: BLE001 - defensive
+                    logger.warning(
+                        "TransVol handler failed for %s (%s); using baseline",
+                        name, exc,
+                    )
+                    raw = self._baseline_row.get(name, np.nan)
+                    features[i] = float(raw) if pd.notna(raw) else float("nan")
+            else:
+                # Pure baseline fallback — should be empty after S-1c
+                # Phase 2 closes 101/101 coverage, but kept defensive.
+                raw = self._baseline_row.get(name, np.nan)
+                features[i] = float(raw) if pd.notna(raw) else float("nan")
+
+        time_features = np.array([
+            features[TRANSVOL_INPUT_COLUMNS.index(TRANSVOL_TIME_COLUMNS[0])],
+            features[TRANSVOL_INPUT_COLUMNS.index(TRANSVOL_TIME_COLUMNS[1])],
+        ], dtype=np.float32)
+
+        return features, time_features

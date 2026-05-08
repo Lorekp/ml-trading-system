@@ -271,6 +271,19 @@ class PaperConfig:
     features_parquet: str = ""              # sentinel -> resolved from currency + bar_minutes
     svi_features_parquet: str = ""          # sentinel -> resolved from bar_minutes
 
+    # ── S-1c (parity-r3 cycle 6 — 2026-05-08): TransVol live wiring ──
+    # When True, the engine constructs a ``TransVolHistoryBuffer`` +
+    # ``TransVolInference`` at startup, prewarms from the offline
+    # features parquet, and feeds fresh 16-dim ``embedding_compact``
+    # to ``predictor.predict`` per bar. When False (legacy /
+    # emergency-disable), the predictor receives ``transvol_embedding=
+    # None`` and the LightGBM ``tv_*`` slots fall back to baseline.
+    # Default ON per round-3 audit decision (closes S-1).
+    use_transvol_live: bool = True
+    # Funding-rate parquet for the FundingRateProvider Path B fallback
+    # (sentinel -> resolved from ``data/funding-rates/{currency}USDT_funding.parquet``).
+    funding_parquet_path: str = ""
+
     # ── Config preset metadata (set by CLI / with_v2_preset) ────────
     # Tagged into harness trade rows so the I4 reproduction analysis
     # can attribute drift to a specific preset. "default" preserves
@@ -384,6 +397,10 @@ class PaperConfig:
         if not self.svi_features_parquet:
             self.svi_features_parquet = (
                 f"vol_arb/output/svi_features_{tf}.parquet"
+            )
+        if not self.funding_parquet_path:
+            self.funding_parquet_path = (
+                f"data/funding-rates/{asset_pair}_funding.parquet"
             )
 
     @property

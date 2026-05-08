@@ -50,6 +50,7 @@ from deribit_paper.features.har_pd_live import (
     K_BARS_DEFAULT as HAR_PD_K_BARS_DEFAULT,
     HARPDState,
 )
+from deribit_paper.features.tsrv_dollar_bar_grid import TSRVDollarBarFeatures
 from deribit_paper.features.tsrv_features import TSRVFeatures
 from deribit_paper.features.tsrv_history import TSRVHistoryBuffer
 from deribit_paper.features.tsrv_live import BarTSRV
@@ -97,6 +98,13 @@ class AssemblerContext:
     # fall back to the historical baseline.
     tsrv_history_buffer: Any | None = None      # TSRVHistoryBuffer, late-bound
     tsrv_features: Any | None = None            # TSRVFeatures, late-bound
+    # S-1d (parity-r3 cycle 7 — 2026-05-08): TSRV-on-dollar-bar-grid
+    # wrapper. When wired (both DollarBarBuffer + TSRVHistoryBuffer
+    # present), provides byte-equivalent-to-offline computations for
+    # the 30 Tier-B columns. Falls back to ``tsrv_features``
+    # (15-min-cadence) when None — preserves cycle-5/6 behaviour for
+    # tests + cold start.
+    tsrv_db_features: Any | None = None         # TSRVDollarBarFeatures, late-bound
     # S-1c (parity-r3 cycle 6 — 2026-05-08): live funding-rate provider
     # for the 5 ``funding_basis_*`` columns. ``None`` falls back to
     # baseline-fallback (matches HAR-PD warmup pattern).
@@ -148,7 +156,24 @@ def _h_down_jump_fraction(ctx: AssemblerContext) -> float:
 
 
 def _h_up_jump_frac(ctx: AssemblerContext) -> float:
-    return float(ctx.bar_tsrv.up_jump_fraction)
+    """S-1d (parity-r3 cycle 7 — 2026-05-08): prefer the dollar-bar-
+    grid value (offline byte-equivalent via ``_ffill_to_bars``) over
+    the current BarTSRV value. The current BarTSRV value is a
+    1-bar look-ahead vs offline (offline uses shift(1) before ffill)."""
+    db = ctx.tsrv_db_features
+    if db is not None:
+        v = db.up_jump_frac()
+        if v is not None and np.isfinite(v):
+            return float(v)
+    feats = ctx.tsrv_features
+    if feats is not None:
+        v = feats.up_jump_frac()
+        if v is not None and np.isfinite(v):
+            return float(v)
+    # Legacy fallback (test fixtures with only bar_tsrv, no buffers).
+    if ctx.bar_tsrv is not None:
+        return float(ctx.bar_tsrv.up_jump_fraction)
+    return _baseline_or_nan(ctx, "up_jump_frac")
 
 
 def _h_vol_ann(ctx: AssemblerContext) -> float:
@@ -258,16 +283,16 @@ def _baseline_or_nan(ctx: AssemblerContext, name: str) -> float:
 
 
 def _h_tsrv_mean_1d(ctx: AssemblerContext) -> float:
-    """F3 Tier 5 (parity-cycle round 3 — 2026-05-07): live rolling mean
-    of ``log(vol_ann)`` over the last 96 15-min bars.
-
-    Pre-Tier-5 this was a baseline-fallback handler (always returned
-    the static parquet value at engine startup). With the
-    ``TSRVHistoryBuffer`` wired by Tier 6, returns a fresh rolling-mean
-    value per bar. Falls back to ``_baseline_or_nan`` when the buffer
-    is None or has fewer than the rolling-window's ``min_periods=24``
-    entries.
-    """
+    """tsrv_mean_1d: rolling mean of log(vol_ann) over the bpd × 1
+    window. S-1d (cycle 7) prefers the dollar-bar-grid path (byte-
+    equivalent to offline ``rolling(w).mean()`` on ffilled-to-db
+    log_vol_ann); falls back to the cycle-5/6 15-min cadence path
+    when no DollarBarBuffer is wired."""
+    db = ctx.tsrv_db_features
+    if db is not None:
+        v = db.tsrv_mean_1d()
+        if v is not None and np.isfinite(v):
+            return float(v)
     feats = ctx.tsrv_features
     if feats is not None:
         v = feats.tsrv_mean_1d()
@@ -382,30 +407,72 @@ def _h_time_to_funding(ctx: AssemblerContext) -> float:
 
 
 def _h_time_to_funding_lag1(ctx: AssemblerContext) -> float:
-    """time_to_funding at bar T-1.
+    """time_to_funding at the 1-bar-prior dollar bar.
 
-    Cycle 6: ``ts - 15min`` from the effective dollar-bar timestamp
-    (NOT the wall-clock 15-min boundary). Mirrors offline shift(1)
-    on the dollar-bar grid.
+    S-1d (parity-r3 cycle 7 — 2026-05-08): walks back through actual
+    sub-15-min DollarBarBuffer timestamps. Offline computes
+    ``series.shift(1)`` on the dollar-bar grid; the n-th-prior dollar
+    bar's timestamp is what offline reads, NOT the 15-min wall-clock
+    earlier value. Falls back to the cycle-6 ``eff_ts - 15min`` path
+    when no DollarBarBuffer is wired.
     """
+    buf = getattr(ctx, "dollar_bar_buffer", None)
+    if buf is not None and len(buf) >= 2:
+        prev_ts = buf.timestamp_at(-2)
+        if prev_ts is not None:
+            return _time_to_funding_seconds(prev_ts)
     eff_ts = _effective_timestamp_for_funding(ctx)
     return _time_to_funding_seconds(eff_ts - pd.Timedelta(minutes=15))
 
 
 def _h_time_to_funding_lag3(ctx: AssemblerContext) -> float:
-    """time_to_funding at bar T-3."""
+    """time_to_funding at the 3-bars-prior dollar bar."""
+    buf = getattr(ctx, "dollar_bar_buffer", None)
+    if buf is not None and len(buf) >= 4:
+        prev_ts = buf.timestamp_at(-4)
+        if prev_ts is not None:
+            return _time_to_funding_seconds(prev_ts)
     eff_ts = _effective_timestamp_for_funding(ctx)
     return _time_to_funding_seconds(eff_ts - pd.Timedelta(minutes=15 * 3))
 
 
+def _time_to_funding_ema_on_dollar_bars(
+    ctx: AssemblerContext, *, span: int,
+) -> float:
+    """EWM(span) over the time_to_funding series at each dollar-bar
+    timestamp in the buffer (S-1d cycle 7).
+
+    Mirrors offline ``feats["time_to_funding"].ewm(span=span,
+    min_periods=1).mean()``, which is computed on the dollar-bar grid
+    and then aggregated to 15-min via ``.groupby(window_labels)
+    .last()``. The latest dollar bar IS the last in the current
+    15-min window so its EMA value matches offline byte-equal.
+
+    Falls back to the cycle-6 15-min-cadence reconstruction when no
+    DollarBarBuffer is wired.
+    """
+    buf = getattr(ctx, "dollar_bar_buffer", None)
+    if buf is not None and len(buf) > 0:
+        timestamps = list(buf.as_index())
+        series = pd.Series(
+            [_time_to_funding_seconds(t) for t in timestamps],
+            dtype=np.float64,
+        )
+        ema_val = series.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]
+        return float(ema_val)
+    return _time_to_funding_ema(
+        _effective_timestamp_for_funding(ctx), span=span,
+    )
+
+
 def _h_time_to_funding_ema10(ctx: AssemblerContext) -> float:
-    """EWM(span=10) over the time_to_funding series."""
-    return _time_to_funding_ema(_effective_timestamp_for_funding(ctx), span=10)
+    """EWM(span=10) over the time_to_funding series on the dollar-bar grid."""
+    return _time_to_funding_ema_on_dollar_bars(ctx, span=10)
 
 
 def _h_time_to_funding_ema50(ctx: AssemblerContext) -> float:
-    """EWM(span=50) over the time_to_funding series."""
-    return _time_to_funding_ema(_effective_timestamp_for_funding(ctx), span=50)
+    """EWM(span=50) over the time_to_funding series on the dollar-bar grid."""
+    return _time_to_funding_ema_on_dollar_bars(ctx, span=50)
 
 
 def _time_to_funding_ema(ts: pd.Timestamp, *, span: int) -> float:
@@ -597,6 +664,46 @@ def _make_tsrv_handler(
     return _handler
 
 
+def _make_tsrv_db_handler(
+    name: str,
+    db_method: str,
+    fallback_method: str,
+    *args: Any,
+) -> Callable[[AssemblerContext], float]:
+    """S-1d (parity-r3 cycle 7 — 2026-05-08): handler that prefers
+    the dollar-bar-grid computation (byte-equivalent to offline)
+    over the 15-min-cadence fallback.
+
+    Resolution order:
+    1. ``ctx.tsrv_db_features.<db_method>(*args)`` — strict-parity
+       path on the dollar-bar grid.
+    2. ``ctx.tsrv_features.<fallback_method>(*args)`` — cycle-5/6
+       15-min-cadence path; preserved for cold start / tests.
+    3. ``_baseline_or_nan`` — historical baseline fallback (F9 NaN
+       propagation contract).
+    """
+    def _handler(ctx: AssemblerContext) -> float:
+        db_feats = ctx.tsrv_db_features
+        if db_feats is not None:
+            try:
+                v = getattr(db_feats, db_method)(*args)
+            except (KeyError, ValueError, TypeError):
+                v = None
+            if v is not None and np.isfinite(v):
+                return float(v)
+        feats = ctx.tsrv_features
+        if feats is not None:
+            try:
+                v = getattr(feats, fallback_method)(*args)
+            except (KeyError, ValueError, TypeError):
+                v = None
+            if v is not None and np.isfinite(v):
+                return float(v)
+        return _baseline_or_nan(ctx, name)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
 # ── S-1c (parity-r3 cycle 6 — 2026-05-08): variant-specific factories ──
 # parkinson_1d_{lag1, lag3, ema10}: read the ROLLING-mean series (window
 # = bpd) per the F-2/F-3 contract. The wrapper's ``parkinson_1d_lag``
@@ -758,6 +865,15 @@ def _make_rv_zscore_ema_handler(
 # lag/EMA variants below.
 
 def _h_down_jump_frac(ctx: AssemblerContext) -> float:
+    """S-1d (parity-r3 cycle 7 — 2026-05-08): prefer the dollar-bar-
+    grid value (offline byte-equivalent) over the BarTSRV direct path.
+    The BarTSRV direct value is a 1-bar look-ahead vs offline (offline
+    uses shift(1) before ffill onto bars)."""
+    db = ctx.tsrv_db_features
+    if db is not None:
+        v = db.down_jump_frac()
+        if v is not None and np.isfinite(v):
+            return float(v)
     feats = ctx.tsrv_features
     if feats is not None:
         v = feats.down_jump_frac()
@@ -868,15 +984,17 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     # F-3 (parity-r3 cycle 2 — 2026-05-08): dynamic bpd-driven window.
     "parkinson_1d":        _h_parkinson_1d,
     "parkinson_1d_ema50":  _h_parkinson_1d_ema50,
-    # F3 Tier 5 — TSRV-grid handlers. Live values when the
-    # TSRVHistoryBuffer is wired (Tier 6); baseline-fallback otherwise.
-    # tsrv_mean_1d already overridden above (was baseline-fallback only).
-    "tsrv_mean_1d_lag3":    _make_tsrv_handler("tsrv_mean_1d_lag3", "tsrv_mean_1d_lag3"),
-    "tsrv_mean_1d_ema50":   _make_tsrv_handler("tsrv_mean_1d_ema50", "tsrv_mean_1d_ema50", 50),
-    "tsrv_mean_1w":         _make_tsrv_handler("tsrv_mean_1w", "tsrv_mean_1w"),
-    "tsrv_ffd":             _make_tsrv_handler("tsrv_ffd", "tsrv_ffd"),
-    "up_jump_frac_ema50":   _make_tsrv_handler("up_jump_frac_ema50", "up_jump_frac_ema50", 50),
-    "bpv_tsrv_ratio_ema50": _make_tsrv_handler("bpv_tsrv_ratio_ema50", "bpv_tsrv_ratio_ema50", 50),
+    # F3 Tier 5 — TSRV-grid handlers, S-1d-rerouted to the dollar-
+    # bar-grid path (offline byte-equivalent). The factory's first
+    # arg is the DB-method (TSRVDollarBarFeatures); second is the
+    # 15-min-cadence fallback method (TSRVFeatures). tsrv_mean_1d
+    # already prefers the DB path above.
+    "tsrv_mean_1d_lag3":    _make_tsrv_db_handler("tsrv_mean_1d_lag3", "tsrv_mean_1d_lag", "tsrv_mean_1d_lag", 3),
+    "tsrv_mean_1d_ema50":   _make_tsrv_db_handler("tsrv_mean_1d_ema50", "tsrv_mean_1d_ema", "tsrv_mean_1d_ema", 50),
+    "tsrv_mean_1w":         _make_tsrv_db_handler("tsrv_mean_1w", "tsrv_mean_1w", "tsrv_mean_1w"),
+    "tsrv_ffd":             _make_tsrv_db_handler("tsrv_ffd", "tsrv_ffd", "tsrv_ffd"),
+    "up_jump_frac_ema50":   _make_tsrv_db_handler("up_jump_frac_ema50", "up_jump_frac_ema", "up_jump_frac_ema", 50),
+    "bpv_tsrv_ratio_ema50": _make_tsrv_db_handler("bpv_tsrv_ratio_ema50", "bpv_tsrv_ratio_ema", "bpv_tsrv_ratio_ema", 50),
     # F3 Tier 6 (parity-cycle round 3 — 2026-05-07): time-to-funding.
     # Pure datetime arithmetic — no buffer needed. Mirrors offline
     # ``vol_model/features/engineer.py:417-419``.
@@ -923,42 +1041,40 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "rv_zscore_1m_lag3":     _make_rv_zscore_lag_handler("1m", 3),
     "rv_zscore_1m_ema10":    _make_rv_zscore_ema_handler("1m", 10),
     "rv_zscore_1m_ema50":    _make_rv_zscore_ema_handler("1m", 50),
-    # tsrv_mean_1d / 1w / tsrv_ffd missing variants (raw + lag3 + ema50
-    # for tsrv_mean_1d already wired earlier; raw for tsrv_mean_1w +
-    # tsrv_ffd via _make_tsrv_handler above).
-    "tsrv_mean_1d_lag1":     _make_tsrv_handler("tsrv_mean_1d_lag1", "tsrv_mean_1d_lag", 1),
-    "tsrv_mean_1d_ema10":    _make_tsrv_handler("tsrv_mean_1d_ema10", "tsrv_mean_1d_ema", 10),
-    "tsrv_mean_1w_lag1":     _make_tsrv_handler("tsrv_mean_1w_lag1", "tsrv_mean_1w_lag", 1),
-    "tsrv_mean_1w_lag3":     _make_tsrv_handler("tsrv_mean_1w_lag3", "tsrv_mean_1w_lag", 3),
-    "tsrv_mean_1w_ema10":    _make_tsrv_handler("tsrv_mean_1w_ema10", "tsrv_mean_1w_ema", 10),
-    "tsrv_mean_1w_ema50":    _make_tsrv_handler("tsrv_mean_1w_ema50", "tsrv_mean_1w_ema", 50),
-    "tsrv_ffd_lag1":         _make_tsrv_handler("tsrv_ffd_lag1", "tsrv_ffd_lag", 1),
-    "tsrv_ffd_lag3":         _make_tsrv_handler("tsrv_ffd_lag3", "tsrv_ffd_lag", 3),
-    "tsrv_ffd_ema10":        _make_tsrv_handler("tsrv_ffd_ema10", "tsrv_ffd_ema", 10),
-    "tsrv_ffd_ema50":        _make_tsrv_handler("tsrv_ffd_ema50", "tsrv_ffd_ema", 50),
-    # up_jump_frac variants — raw at _h_up_jump_frac, ema50 via earlier
-    # _make_tsrv_handler. Add lag1 / lag3 / ema10.
-    "up_jump_frac_lag1":     _make_tsrv_handler("up_jump_frac_lag1", "up_jump_frac_lag", 1),
-    "up_jump_frac_lag3":     _make_tsrv_handler("up_jump_frac_lag3", "up_jump_frac_lag", 3),
-    "up_jump_frac_ema10":    _make_tsrv_handler("up_jump_frac_ema10", "up_jump_frac_ema", 10),
-    # bpv_tsrv_ratio: raw + 4 variants (ema50 already wired earlier).
-    "bpv_tsrv_ratio":        _make_tsrv_handler("bpv_tsrv_ratio", "bpv_tsrv_ratio"),
-    "bpv_tsrv_ratio_lag1":   _make_tsrv_handler("bpv_tsrv_ratio_lag1", "bpv_tsrv_ratio_lag", 1),
-    "bpv_tsrv_ratio_lag3":   _make_tsrv_handler("bpv_tsrv_ratio_lag3", "bpv_tsrv_ratio_lag", 3),
-    "bpv_tsrv_ratio_ema10":  _make_tsrv_handler("bpv_tsrv_ratio_ema10", "bpv_tsrv_ratio_ema", 10),
-    # down_jump_frac: alias fix (offline column) + 4 variants.
+    # ── S-1d (parity-r3 cycle 7 — 2026-05-08): all rerouted ──
+    # tsrv_mean_1d/1w/tsrv_ffd lag/EMA variants, plus raw + 4 variants
+    # for up_jump_frac, down_jump_frac, noise_level, bpv_tsrv_ratio.
+    # First positional arg of _make_tsrv_db_handler is the DB-method
+    # name on TSRVDollarBarFeatures; second is the 15-min-cadence
+    # fallback method on TSRVFeatures (preserves cycle-5/6 behaviour
+    # when no DollarBarBuffer is wired — tests, cold start).
+    "tsrv_mean_1d_lag1":     _make_tsrv_db_handler("tsrv_mean_1d_lag1", "tsrv_mean_1d_lag", "tsrv_mean_1d_lag", 1),
+    "tsrv_mean_1d_ema10":    _make_tsrv_db_handler("tsrv_mean_1d_ema10", "tsrv_mean_1d_ema", "tsrv_mean_1d_ema", 10),
+    "tsrv_mean_1w_lag1":     _make_tsrv_db_handler("tsrv_mean_1w_lag1", "tsrv_mean_1w_lag", "tsrv_mean_1w_lag", 1),
+    "tsrv_mean_1w_lag3":     _make_tsrv_db_handler("tsrv_mean_1w_lag3", "tsrv_mean_1w_lag", "tsrv_mean_1w_lag", 3),
+    "tsrv_mean_1w_ema10":    _make_tsrv_db_handler("tsrv_mean_1w_ema10", "tsrv_mean_1w_ema", "tsrv_mean_1w_ema", 10),
+    "tsrv_mean_1w_ema50":    _make_tsrv_db_handler("tsrv_mean_1w_ema50", "tsrv_mean_1w_ema", "tsrv_mean_1w_ema", 50),
+    "tsrv_ffd_lag1":         _make_tsrv_db_handler("tsrv_ffd_lag1", "tsrv_ffd_lag", "tsrv_ffd_lag", 1),
+    "tsrv_ffd_lag3":         _make_tsrv_db_handler("tsrv_ffd_lag3", "tsrv_ffd_lag", "tsrv_ffd_lag", 3),
+    "tsrv_ffd_ema10":        _make_tsrv_db_handler("tsrv_ffd_ema10", "tsrv_ffd_ema", "tsrv_ffd_ema", 10),
+    "tsrv_ffd_ema50":        _make_tsrv_db_handler("tsrv_ffd_ema50", "tsrv_ffd_ema", "tsrv_ffd_ema", 50),
+    "up_jump_frac_lag1":     _make_tsrv_db_handler("up_jump_frac_lag1", "up_jump_frac_lag", "up_jump_frac_lag", 1),
+    "up_jump_frac_lag3":     _make_tsrv_db_handler("up_jump_frac_lag3", "up_jump_frac_lag", "up_jump_frac_lag", 3),
+    "up_jump_frac_ema10":    _make_tsrv_db_handler("up_jump_frac_ema10", "up_jump_frac_ema", "up_jump_frac_ema", 10),
+    "bpv_tsrv_ratio":        _make_tsrv_db_handler("bpv_tsrv_ratio", "bpv_tsrv_ratio", "bpv_tsrv_ratio"),
+    "bpv_tsrv_ratio_lag1":   _make_tsrv_db_handler("bpv_tsrv_ratio_lag1", "bpv_tsrv_ratio_lag", "bpv_tsrv_ratio_lag", 1),
+    "bpv_tsrv_ratio_lag3":   _make_tsrv_db_handler("bpv_tsrv_ratio_lag3", "bpv_tsrv_ratio_lag", "bpv_tsrv_ratio_lag", 3),
+    "bpv_tsrv_ratio_ema10":  _make_tsrv_db_handler("bpv_tsrv_ratio_ema10", "bpv_tsrv_ratio_ema", "bpv_tsrv_ratio_ema", 10),
     "down_jump_frac":        _h_down_jump_frac,
-    "down_jump_frac_lag1":   _make_tsrv_handler("down_jump_frac_lag1", "down_jump_frac_lag", 1),
-    "down_jump_frac_lag3":   _make_tsrv_handler("down_jump_frac_lag3", "down_jump_frac_lag", 3),
-    "down_jump_frac_ema10":  _make_tsrv_handler("down_jump_frac_ema10", "down_jump_frac_ema", 10),
-    "down_jump_frac_ema50":  _make_tsrv_handler("down_jump_frac_ema50", "down_jump_frac_ema", 50),
-    # noise_level: raw + 4 variants (5 features; needed schema extension
-    # in Phase 1a so TSRVHistoryRow now persists rv_fast + n_ticks).
-    "noise_level":           _make_tsrv_handler("noise_level", "noise_level"),
-    "noise_level_lag1":      _make_tsrv_handler("noise_level_lag1", "noise_level_lag", 1),
-    "noise_level_lag3":      _make_tsrv_handler("noise_level_lag3", "noise_level_lag", 3),
-    "noise_level_ema10":     _make_tsrv_handler("noise_level_ema10", "noise_level_ema", 10),
-    "noise_level_ema50":     _make_tsrv_handler("noise_level_ema50", "noise_level_ema", 50),
+    "down_jump_frac_lag1":   _make_tsrv_db_handler("down_jump_frac_lag1", "down_jump_frac_lag", "down_jump_frac_lag", 1),
+    "down_jump_frac_lag3":   _make_tsrv_db_handler("down_jump_frac_lag3", "down_jump_frac_lag", "down_jump_frac_lag", 3),
+    "down_jump_frac_ema10":  _make_tsrv_db_handler("down_jump_frac_ema10", "down_jump_frac_ema", "down_jump_frac_ema", 10),
+    "down_jump_frac_ema50":  _make_tsrv_db_handler("down_jump_frac_ema50", "down_jump_frac_ema", "down_jump_frac_ema", 50),
+    "noise_level":           _make_tsrv_db_handler("noise_level", "noise_level", "noise_level"),
+    "noise_level_lag1":      _make_tsrv_db_handler("noise_level_lag1", "noise_level_lag", "noise_level_lag", 1),
+    "noise_level_lag3":      _make_tsrv_db_handler("noise_level_lag3", "noise_level_lag", "noise_level_lag", 3),
+    "noise_level_ema10":     _make_tsrv_db_handler("noise_level_ema10", "noise_level_ema", "noise_level_ema", 10),
+    "noise_level_ema50":     _make_tsrv_db_handler("noise_level_ema50", "noise_level_ema", "noise_level_ema", 50),
     # funding_basis: 5 columns. Live provider wires Binance perp REST
     # (Path A) + offline parquet fallback (Path B); see
     # ``deribit_paper/market_data/funding.py``.
@@ -1344,6 +1460,17 @@ class FeatureAssembler:
             if self._tsrv_history_buffer is not None else None
         )
 
+        # S-1d (parity-r3 cycle 7 — 2026-05-08): TSRV-on-dollar-bar-
+        # grid wrapper, byte-equivalent to offline. Constructed only
+        # when both buffers are wired; falls through to ``tsrv_features``
+        # otherwise.
+        tsrv_db_features = (
+            TSRVDollarBarFeatures(self._tsrv_history_buffer, self._dollar_bar_buffer)
+            if (self._tsrv_history_buffer is not None
+                and self._dollar_bar_buffer is not None)
+            else None
+        )
+
         ctx = AssemblerContext(
             bar=bar,
             bar_tsrv=bar_tsrv,
@@ -1354,6 +1481,7 @@ class FeatureAssembler:
             dollar_bar_features=dollar_bar_features,
             tsrv_history_buffer=self._tsrv_history_buffer,
             tsrv_features=tsrv_features,
+            tsrv_db_features=tsrv_db_features,
             funding_provider=self._funding_provider,
         )
 
@@ -1481,6 +1609,13 @@ class FeatureAssembler:
             TSRVFeatures(self._tsrv_history_buffer)
             if self._tsrv_history_buffer is not None else None
         )
+        # S-1d (parity-r3 cycle 7): TSRV-on-dollar-bar-grid wrapper.
+        tsrv_db_features = (
+            TSRVDollarBarFeatures(self._tsrv_history_buffer, self._dollar_bar_buffer)
+            if (self._tsrv_history_buffer is not None
+                and self._dollar_bar_buffer is not None)
+            else None
+        )
         ctx = AssemblerContext(
             bar=bar,
             bar_tsrv=bar_tsrv,
@@ -1491,6 +1626,7 @@ class FeatureAssembler:
             dollar_bar_features=dollar_bar_features,
             tsrv_history_buffer=self._tsrv_history_buffer,
             tsrv_features=tsrv_features,
+            tsrv_db_features=tsrv_db_features,
             funding_provider=self._funding_provider,
         )
 

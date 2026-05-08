@@ -68,8 +68,17 @@ def test_larger_than_minimum_blocked_at_small_equity():
     assert "margin_util" in check.reason
 
 
-def test_minimum_lot_blocked_when_position_already_open():
-    """0.1 BTC when n_open=1 is NOT exempt — exemption is first position only."""
+def test_minimum_lot_exempt_even_when_position_already_open():
+    """R-4 (parity-r3 cycle 3): the floor lot is exempt regardless of
+    open-position count. Pre-fix this test asserted the opposite — the
+    exemption only fired when ``n_open == 0`` — which silently blocked
+    DD-recovery scenarios where the engine restarted with one min-lot
+    trade still on the book and could not enter a second min-lot trade.
+    Forward-looking semantic: Deribit's 0.1 BTC floor is the smallest
+    expressible size, so the operator's only avenue to scale OUT of a
+    degraded equity state is to keep entering floor lots. Larger
+    proposals still go through the normal margin gate.
+    """
     tracker = PositionTracker()
     equity = EquityTracker(initial_equity_usd=750.0)
     limits = RiskLimits(
@@ -95,8 +104,11 @@ def test_minimum_lot_blocked_when_position_already_open():
     )
     signal = _make_signal()
     check = limits.check_signal(signal, proposed_n_contracts_btc=0.1)
-    assert check.passed is False
-    assert "margin_util" in check.reason
+    assert check.passed is True
+    # Sanity: a NON-floor proposal in the same state IS still gated.
+    check_oversize = limits.check_signal(signal, proposed_n_contracts_btc=0.5)
+    assert check_oversize.passed is False
+    assert "margin_util" in check_oversize.reason
 
 
 # ── Normal margin check at higher equity ─────────────────────────

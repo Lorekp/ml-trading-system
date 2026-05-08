@@ -102,8 +102,20 @@ class RiskLimits:
         *,
         proposed_n_contracts_btc: float,
         now: pd.Timestamp | None = None,
+        bar_index_price: float | None = None,
     ) -> RiskCheck:
-        """Validate a signal + proposed trade size against all limits."""
+        """Validate a signal + proposed trade size against all limits.
+
+        ``bar_index_price`` (R-9, parity-r3 cycle 3 — 2026-05-08): the
+        current bar's spot. If provided, used for the margin envelope's
+        BTC→USD conversion; otherwise falls back to
+        ``signal.straddle.index_price`` (the snapshot taken at signal
+        emit). Pre-fix the gate always used the snapshot, which can lag
+        the bar by tens of seconds during high-volatility ticks and
+        under-/over-state the gate by the spot-drift × notional. The
+        backtester's sizing layer reads the bar's spot directly
+        (``vol_arb/sizing.py:31-55``); this kwarg restores parity.
+        """
         if not signal.is_actionable:
             return RiskCheck(False, "signal not actionable")
 
@@ -152,19 +164,29 @@ class RiskLimits:
                 f"dte {dte_days:.2f} > max {self.dte_max_days:.2f}",
             )
 
-        # 4. Index price sanity
-        spot = signal.straddle.index_price
-        if spot < self.min_index_price:
+        # 4. Index price sanity (uses signal snapshot — staleness here
+        # would let a degenerate spot sneak through; the snapshot's
+        # ATM strike pairing was anchored to it, so it is the correct
+        # check for "is the trade idea well-formed").
+        spot_signal = signal.straddle.index_price
+        if spot_signal < self.min_index_price:
             return RiskCheck(
                 False,
-                f"index_price {spot:.2f} < min {self.min_index_price:.2f}",
+                f"index_price {spot_signal:.2f} < min {self.min_index_price:.2f}",
             )
 
         # 5. Margin utilisation hard cap
+        # R-9 (parity-r3 cycle 3 — 2026-05-08): use the live bar spot
+        # for BTC→USD when available; offline ``vol_arb/sizing.py``
+        # uses the bar's spot, not a stale snapshot. Snapshot fallback
+        # preserves test-stub callers and the no-bar legacy contract.
+        spot = bar_index_price if (
+            bar_index_price is not None
+            and bar_index_price >= self.min_index_price
+        ) else spot_signal
         # Approximate margin used: im_fraction × (current open notional + this trade's notional)
         current_notional_btc = self._positions.total_notional_btc()
         total_notional_btc = current_notional_btc + proposed_n_contracts_btc
-        # Convert notional to USD via the signal's spot
         total_notional_usd = total_notional_btc * spot
         margin_used_usd = self.im_fraction * total_notional_usd
         equity_usd = self._equity.current_equity
@@ -172,12 +194,24 @@ class RiskLimits:
             return RiskCheck(False, f"equity {equity_usd:.2f} is non-positive")
         margin_util = margin_used_usd / equity_usd
 
-        # Minimum lot exemption: at small equity the sizing formula
-        # can't produce ≥0.1 BTC, so the floor kicks in.  The margin
-        # util will be very high but there's no smaller trade on Deribit.
-        # Allow exactly ONE minimum-size trade as the first position.
-        is_minimum_lot = abs(proposed_n_contracts_btc - self.min_single_trade_btc) < 0.01
-        if is_minimum_lot and n_open == 0:
+        # R-4 (parity-r3 cycle 3 — 2026-05-08): minimum-lot exemption.
+        # Pre-fix this gate cleared only when ``n_open == 0``, which
+        # silently blocked DD-recovery: an engine that crashed with one
+        # min-lot trade open and restarted into a depleted-equity state
+        # could not enter a second min-lot trade because the gate now
+        # saw ``n_open == 1`` and required margin_util ≤ hard_cap. The
+        # forward-looking semantic is **"the absolute floor lot is
+        # always exempt regardless of book size"** — Deribit does not
+        # expose a smaller tradeable size, so the operator's only way
+        # to scale OUT of a degraded equity state is to keep entering
+        # min-lot trades. The gate's protective intent (stop runaway
+        # margin growth) is preserved because the exemption only
+        # applies when the proposed size IS the absolute floor; any
+        # larger size still passes through the margin gate normally.
+        is_floor_lot = (
+            abs(proposed_n_contracts_btc - self.min_single_trade_btc) < 1e-9
+        )
+        if is_floor_lot:
             pass  # skip margin util check — can't trade smaller
         elif margin_util > self.max_margin_util_hard:
             return RiskCheck(

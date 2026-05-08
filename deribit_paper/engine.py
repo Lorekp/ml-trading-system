@@ -1094,6 +1094,49 @@ class TradingEngine:
                     ks_errors,
                 )
 
+            # R-5 (parity-r3 cycle 3 — 2026-05-08): restore the data-stale
+            # consecutive-empty-bars counter so an engine 1 bar from
+            # tripping doesn't get a free reset on restart.
+            empties = int(
+                self._persisted_engine_state.get(
+                    "consecutive_empty_bars", 0,
+                )
+            )
+            if empties > 0:
+                self._consecutive_empty_bars = empties
+                logger.info(
+                    "R-5: consecutive_empty_bars restored to %d (cap %d)",
+                    empties, self.config.max_consecutive_empty_bars,
+                )
+
+            # R-6 (parity-r3 cycle 3 — 2026-05-08): restore the H15
+            # per-hour rate limiter's deque. Old engine_state files that
+            # predate this key load cleanly with an empty deque.
+            try:
+                ts_iso_list = self._persisted_engine_state.get(
+                    "recent_trade_timestamps", [],
+                ) or []
+                restored_count = 0
+                for ts_str in ts_iso_list:
+                    try:
+                        ts = pd.Timestamp(ts_str)
+                        if ts.tzinfo is None:
+                            ts = ts.tz_localize("UTC")
+                        self.risk_limits._recent_trade_timestamps.append(ts)
+                        restored_count += 1
+                    except (ValueError, TypeError):
+                        continue
+                if restored_count > 0:
+                    logger.info(
+                        "R-6: _recent_trade_timestamps restored — %d entries",
+                        restored_count,
+                    )
+            except Exception:  # noqa: BLE001 — defensive, never block startup
+                logger.exception(
+                    "R-6: failed to restore _recent_trade_timestamps; "
+                    "starting with empty deque",
+                )
+
         # H1: restore prior halt state (or clear if --clear-kill-state).
         prior_halted, prior_reason, prior_at = await self.store.get_kill_switch_state()
         if prior_halted and getattr(cfg, "clear_kill_state", False):
@@ -2174,6 +2217,10 @@ class TradingEngine:
             signal=signal,
             proposed_n_contracts_btc=n_contracts,
             now=bar.timestamp,
+            # R-9 (parity-r3 cycle 3 — 2026-05-08): use the live bar's
+            # spot, not the snapshot embedded in signal.straddle. Mirrors
+            # offline ``vol_arb/sizing.py`` which sizes off the bar.
+            bar_index_price=float(bar.index_price),
         )
         if not risk_check.passed:
             logger.info(
@@ -2651,6 +2698,25 @@ class TradingEngine:
         Includes S1+S3 (equity/EMAs), S5 (kill_switch errors), S8 (svi
         recal counters).
         """
+        # R-5 (parity-r3 cycle 3 — 2026-05-08): the data-stale kill-switch
+        # counter survives restart. Pre-fix it reset to 0 on every boot,
+        # so an engine that was 1 bar from tripping got a free reset.
+        # R-6 (parity-r3 cycle 3 — 2026-05-08): the H15 per-hour rate
+        # limiter's deque survives restart so the cap doesn't silently
+        # re-base after a crash. Timestamps serialise as ISO strings
+        # (UTC) so `pd.Timestamp(...)` round-trips cleanly.
+        recent_trade_timestamps_iso: list[str] = []
+        try:
+            if self.risk_limits is not None:
+                recent_trade_timestamps_iso = [
+                    pd.Timestamp(ts).isoformat()
+                    for ts in self.risk_limits._recent_trade_timestamps
+                ]
+        except Exception:  # noqa: BLE001 - best-effort, never block a save
+            logger.exception(
+                "R-6: failed to serialise _recent_trade_timestamps; "
+                "engine_state will record empty deque",
+            )
         return {
             "current_equity_usd": self.equity_tracker.current_equity,
             "peak_equity_usd": self.equity_tracker.peak_equity,
@@ -2664,6 +2730,8 @@ class TradingEngine:
             ),
             "svi_recal_count": int(self._svi_recal_count),
             "svi_recal_failures": int(self._svi_recal_failures),
+            "consecutive_empty_bars": int(self._consecutive_empty_bars),
+            "recent_trade_timestamps": recent_trade_timestamps_iso,
         }
 
     def _fetch_exit_iv_decimal(self, outcome) -> float:

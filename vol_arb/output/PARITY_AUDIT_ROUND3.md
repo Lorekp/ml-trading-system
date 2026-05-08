@@ -550,7 +550,7 @@ order; pick whichever fit the next cycle's scope.
 | **D-11** | P1 | **DONE** — round-3 cycle 2 commit `803be95` (new `drl_trade_state` SQLite table FK-linked to `open_positions`; persister/remover callbacks emit on every begin_trade/step/close_trade; `_resume_trade` rehydrates via `resume_trade_from_dict`; 13 tests in `test_drl_trade_state_persistence.py`) |
 | **D-10** | P2 | **DONE** — round-3 cycle 3 (`StraddleFlow.execute` VPIN provider call now guards non-finite + provider exceptions; falls back to neutral 0.5 with warning log; 8 tests in `test_straddle_flow_vpin_nan_guard.py`) |
 | D-12, D-13 | P3 | OPEN |
-| S-1 | P0 | OPEN — multi-day feature build (no h15m TransVol checkpoint, no live inference path); split into S-1a (training) + S-1b (live wiring); deferred to dedicated TransVol-live cycle |
+| S-1 | P0 | **PARTIAL** — round-3 cycle 4 (infrastructure shipped; live feature builder + engine integration deferred). Cycle-4 closures: live `TransVolHistoryBuffer` (32-bar deque + parquet pre-warm + Z-norm); `TransVolInference` (encoder forward-pass wrapper, returns 16-dim `embedding_compact` or None during warmup; fail-soft on non-finite/wrong-shape). Real-checkpoint smoke test passes against `expanding_hybrid/2026-04_transvol.pt`. **Deferred to S-1b**: live 101-feature row builder (~70 new handler entries + 5+ base features: `ffd_rv`, `funding_basis`, `hurst_100`, `noise_level`, `rv_zscore_*`); engine `process_bar` integration; parity test vs offline `BTCUSDT_transvol_embeddings.parquet`. Audit's original "no h15m checkpoint" framing was incorrect — `expanding_hybrid/{YYYY-MM}_transvol.pt` covers 50 months through 2026-04 (default freq_s=900s = h15m); training is NOT required. 30 tests in `test_transvol_history.py` (18) + `test_transvol_inference.py` (12). |
 | **S-2** | P1 | **REJECT** — accepted by design. `vol_arb/sidecars.py:72-89` already documents this is correct-per-domain: backtester's `reindex()` exact-match is correct on canonical training bars (V2 K1 sidecar locked under exact-match); live's `searchsorted(side='right')-1` walk-forward asof is correct for drift-tolerant real-time. Switching backtester to `method='ffill'` previously drifted V2 byte-identity by **+$64.8K (+6.75%)** — confirmed not a parity bug. |
 | **S-3** | P1 | **DONE** — round-3 cycle 2 commit (predictor `_lookup_iv` falls through to TSRV proxy when SVI uncalibrated/empty; new `Signal.iv_source` field tags "svi" / "tsrv_proxy"; 7 tests in `test_predictor_iv_used_fallback.py`; warmup-emit behavior change documented) |
 | **S-4** | P0 | **REJECT** — agent mis-read backtester semantics. `df["vega"]` is the COMPOSITE (call+put = straddle) vega, set in `_composite_greeks` at `vol_arb/pipeline.py:241-242`. `bsm_vega_per_vol_pt` (live) returns single-leg vega; live correctly multiplies by 2 to convert to straddle. Both sides end at straddle vega; no divergence. |
@@ -645,6 +645,23 @@ Convergence achieved at iteration 2 of the V2↔Kelly loop.
   except those covered by S-1's deferral path (S-1 alone is the
   single open P0; no P1s remain blocking)
 - 4 P2s closed (R-6, R-9, D-10, F-7); ~20 P2/P3 hygiene items OPEN
+
+### Round-3 cycle 4 closure summary (2026-05-08)
+
+| Status | Count | Items |
+|---|---:|---|
+| PARTIAL — infrastructure shipped | 1 P0 | S-1 Phase 1+2 (sequence buffer + encoder inference wrapper); 30 new tests; real-checkpoint smoke verified |
+| OPEN — deferred (S-1b) | 1 P0 | live 101-feature row builder + engine `process_bar` integration + offline-vs-live parity test; ~5+ new base feature handlers + ~70 windowed-variant entries |
+
+**Cycle 4 totals**: ~310 LOC source (`features/transvol_history.py` 240 LOC + `signal/transvol_inference.py` 70 LOC) + ~480 LOC tests across 2 new files. 1 commit:
+- *cycle 4* — S-1 Phase 1+2 (TransVol infrastructure)
+
+Critical correction to original audit framing: "no h15m TransVol checkpoint, no live inference path" was wrong. The `vol_model/output/models/expanding_hybrid/{YYYY-MM}_transvol.pt` checkpoint set covers 50 months through 2026-04 at the default `freq_s=900s` (h15m). Training is NOT required for live wiring; only the live 101-feature pipeline + engine integration remain.
+
+**Cumulative round-3 progress (cycle 1 + cycle 2 + cycle 3 + cycle 4)**:
+- 9 P0s closed, 1 rejected (S-4), 1 PARTIAL (S-1 — infrastructure done, live feature builder + integration deferred to S-1b)
+- 15 P1s closed, 3 rejected (R-3, S-2, S-6); all P1s resolved
+- 4 P2s closed; ~20 P2/P3 hygiene items OPEN
 
 **Files**:
 - Cycle 3 plan: `~/.claude/plans/glimmering-snacking-turing.md`

@@ -428,7 +428,22 @@ class TestNCPathMirror:
     # The DRL hedger sees a different VPIN distribution → +$75.21 NC PnL
     # drift, which matches the corrupted-obs-fix mechanism documented in
     # ``vol_arb/output/PARITY_AUDIT_ROUND2.md``.
-    V2_NC_PNL_BASELINE = 1_024_449.1810
+    #
+    # Updated 2026-05-08 (parity-cycle round 3, D-7) after the per-tick
+    # Greeks fix in ``vol_arb/drl_hedging/env.py:simulate``: pre-fix the
+    # path froze ``sigma_sqrt_T`` and ``half_sigma2_T`` at entry T, but
+    # ``tau_t`` decays each tick — biasing ``d1`` (and therefore
+    # delta_obs / gamma_obs) into a distribution the SAC v4 policy was
+    # NOT trained on. Post-fix per-tick recompute matches the env path
+    # (env.py:418) and the live inference path (drl_hedger_live.py:315-322)
+    # byte-for-byte. NC PnL drifts -$394.67 (-0.039%) after Kelly K1
+    # sidecar regeneration; n_trades unchanged at 7,543. Drift is within
+    # noise floor — most ticks the policy action is sub-dust regardless
+    # of the obs perturbation, and the small per-trade differences fold
+    # back into the K1 multipliers in a converged loop (verified via
+    # 3-iteration ``scripts/parity_r3_cycle2_d7_rebaseline.py`` run).
+    # Rebaseline report: ``vol_arb/output/parity_r3_cycle2_d7_rebaseline.md``.
+    V2_NC_PNL_BASELINE = 1_024_054.5149
     V2_NC_TRADES_BASELINE = 7_543
 
     def test_preventative_sizing_actually_binds_on_NC(self):

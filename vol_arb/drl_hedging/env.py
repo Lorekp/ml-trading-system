@@ -780,14 +780,27 @@ class DRLHedger:
         # Random path
         dW = rng.standard_normal((n, n_steps))
 
-        # Precompute BSM constants
+        # D-7 (parity-r3 cycle 2 — 2026-05-08): per-tick BSM recompute.
+        # Pre-fix this precomputed ``sigma_sqrt_T``, ``half_sigma2_T`` at
+        # entry σ × entry T and reused them for every tick's d1 — but
+        # ``tau_t`` decays each tick. As a result the time-decay term
+        # ``half_sigma²·T`` was up to 9× too large at the last tick, so
+        # ``d1`` (and therefore delta_obs / gamma_obs) was systematically
+        # biased into a distribution the SAC v4 policy was NOT trained
+        # on. The training env (env.py:418) and live inference path
+        # (drl_hedger_live.py:315-322) both use ``tau_t`` per tick — the
+        # simulate path was the only one reading frozen ``T``.
+        # Now: keep ``sigma`` frozen at entry (matches env's reset-time
+        # SVI snapshot) but compute ``sigma_sqrt_tau_t`` and
+        # ``half_sigma²·tau_t`` per tick using the live ``tau_t``.
         safe_sigma = np.where(sigma > 0, sigma, 0.01)
-        safe_T = np.where(T_years > 0, T_years, 0.001)
-        sigma_sqrt_T = safe_sigma * np.sqrt(safe_T)
-        half_sigma2_T = 0.5 * safe_sigma * safe_sigma * safe_T
+        safe_T_entry = np.where(T_years > 0, T_years, 0.001)
+        sigma_sq = safe_sigma * safe_sigma  # frozen at entry; cached for the loop
 
-        # Initial straddle delta (short convention: delta_portfolio = signal * long_delta)
-        d1_0 = (np.log(S_entry / K) + half_sigma2_T) / sigma_sqrt_T
+        # Initial straddle delta uses entry T (matches env.reset semantics).
+        d1_0 = (
+            np.log(S_entry / K) + 0.5 * sigma_sq * safe_T_entry
+        ) / (safe_sigma * np.sqrt(safe_T_entry))
         delta_theo_0 = signal * (2.0 * norm.cdf(d1_0) - 1.0)
 
         # Normalisation denominator for hedge inventory (matches env)
@@ -811,20 +824,32 @@ class DRLHedger:
             dS = S_new - S_current
 
             # 2) Build observation for this tick (N x 8 batch)
-            tau_t = np.maximum(safe_T - (j + 1) * dt_step, 1e-10)
-            tau_rel = tau_t / safe_T
+            tau_t = np.maximum(safe_T_entry - (j + 1) * dt_step, 1e-10)
+            tau_rel = tau_t / safe_T_entry
+
+            # D-7: per-tick BSM recompute. ``sigma`` is frozen at entry
+            # (matches env reset semantics — env stores σ once per
+            # episode and reuses it across step() calls), but the
+            # time-decay terms scale with the LIVE ``tau_t``. This is
+            # the same formula the env uses at line 418 and live uses
+            # at drl_hedger_live.py:315-322.
+            sqrt_tau_t = np.sqrt(tau_t)
+            sigma_sqrt_tau_t = safe_sigma * sqrt_tau_t
+            half_sigma2_tau_t = 0.5 * sigma_sq * tau_t
 
             # Straddle delta at new spot.  Portfolio delta in the TRUE signed
             # coordinates (positive when long, negative when short).
-            d1 = (np.log(S_new / K) + half_sigma2_T) / sigma_sqrt_T
+            d1 = (np.log(S_new / K) + half_sigma2_tau_t) / sigma_sqrt_tau_t
             delta_long_t = 2.0 * norm.cdf(d1) - 1.0
             delta_theo_t = signal * delta_long_t  # actual portfolio delta
 
             log_S = np.log(np.maximum(S_new, 1e-12) / np.maximum(S_entry, 1e-12))
 
-            # Gamma of the actual portfolio (negated relative to long gamma for shorts)
+            # Gamma of the actual portfolio. Pre-D-7 this used a stale
+            # ``d1`` from frozen-T; now d1 is per-tick consistent and the
+            # denominator (S_new × σ × √τ_t) matches the env path exactly.
             pdf_d1 = np.exp(-0.5 * d1 * d1) * inv_sqrt_2pi
-            gamma_long = 2.0 * pdf_d1 / (S_new * safe_sigma * np.sqrt(np.maximum(tau_t, 1e-10)))
+            gamma_long = 2.0 * pdf_d1 / (S_new * safe_sigma * sqrt_tau_t)
             notional = np.maximum(S_new * np.abs(delta_theo_t) + 1.0, 1.0)
 
             # ── Sign-flip normalisation: the env trains ONLY on short straddles,

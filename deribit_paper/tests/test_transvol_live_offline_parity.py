@@ -64,24 +64,35 @@ from deribit_paper.signal.feature_assembler import (
 
 
 # Tier classification for the parity gate.
+# S-1d (parity-r3 cycle 7 — 2026-05-08): all 30 cycle-6 Tier-B columns
+# are PROMOTED to Tier-A — the dollar-bar-grid path
+# (TSRVDollarBarFeatures + dollar-bar-stamped time_to_funding lags)
+# closes the C1 deviation strictly. Tier-B is now empty.
 TIER_A_COLUMNS: tuple[str, ...] = (
+    # cycle-6 strict-already.
     "funding_basis", "funding_basis_lag1", "funding_basis_lag3",
     "funding_basis_ema10", "funding_basis_ema50",
-    # time_to_funding RAW byte-equal (uses last dollar bar's timestamp);
-    # lag/EMA variants are Tier-B because offline shifts on the
-    # dollar-bar grid (sub-15-min) while live shifts on the 15-min
-    # cadence — same C1-class deviation as the TSRV-grid features.
     "time_to_funding",
+    # cycle-7 promoted: time_to_funding lag/EMA on dollar-bar grid.
+    "time_to_funding_lag1", "time_to_funding_lag3",
+    "time_to_funding_ema10", "time_to_funding_ema50",
+    # cycle-7 promoted: TSRV-on-dollar-bar-grid (30 columns).
+    "tsrv_mean_1d", "tsrv_mean_1d_lag1", "tsrv_mean_1d_lag3",
+    "tsrv_mean_1d_ema10", "tsrv_mean_1d_ema50",
+    "tsrv_mean_1w", "tsrv_mean_1w_lag1", "tsrv_mean_1w_lag3",
+    "tsrv_mean_1w_ema10", "tsrv_mean_1w_ema50",
+    "tsrv_ffd", "tsrv_ffd_lag1", "tsrv_ffd_lag3",
+    "tsrv_ffd_ema10", "tsrv_ffd_ema50",
+    "up_jump_frac", "up_jump_frac_lag1", "up_jump_frac_lag3",
+    "up_jump_frac_ema10", "up_jump_frac_ema50",
+    "down_jump_frac", "down_jump_frac_lag1", "down_jump_frac_lag3",
+    "down_jump_frac_ema10", "down_jump_frac_ema50",
+    "noise_level", "noise_level_lag1", "noise_level_lag3",
+    "noise_level_ema10", "noise_level_ema50",
+    "bpv_tsrv_ratio", "bpv_tsrv_ratio_lag1", "bpv_tsrv_ratio_lag3",
+    "bpv_tsrv_ratio_ema10", "bpv_tsrv_ratio_ema50",
 )
-TIER_B_COLUMNS: tuple[str, ...] = tuple(
-    c for c in TRANSVOL_INPUT_COLUMNS
-    if any(c.startswith(prefix) for prefix in (
-        "tsrv_mean_", "tsrv_ffd",
-        "up_jump_frac", "down_jump_frac",
-        "bpv_tsrv_ratio", "noise_level",
-        "time_to_funding_",  # lag1/lag3/ema10/ema50 only (not raw)
-    ))
-)
+TIER_B_COLUMNS: tuple[str, ...] = ()  # cycle-7: empty (C1 closed).
 TIER_C_COLUMNS: tuple[str, ...] = tuple(
     c for c in TRANSVOL_INPUT_COLUMNS
     if c not in TIER_A_COLUMNS and c not in TIER_B_COLUMNS
@@ -91,12 +102,17 @@ TIER_C_COLUMNS: tuple[str, ...] = tuple(
 _FEATURES_PARQUET = Path(__file__).resolve().parents[2] / "vol_model" / "output" / "BTCUSDT_features_15m.parquet"
 _TSRV_PARQUET = Path(__file__).resolve().parents[2] / "TSRV" / "output" / "BTCUSDT_tsrv_15m.parquet"
 _FUNDING_PARQUET = Path(__file__).resolve().parents[2] / "data" / "funding-rates" / "BTCUSDT_funding.parquet"
-_DOLLAR_BAR_CACHE = Path(__file__).resolve().parents[2] / "vol_arb" / "output" / "BTC_dollar_bar_cache.parquet"
+# S-1d (cycle 7): the parity gate loads dollar bars directly from
+# the offline bar-series parquet so it can pull 30+ days of history
+# (~600k bars) without bloating the committed live-engine cache
+# (which stays at 60k bars / 5.5 MB). 30-day history is required so
+# the trailing-30-day ``bpd`` estimate matches offline byte-equivalent.
+_BAR_SERIES_PARQUET = Path(__file__).resolve().parents[2] / "vol_model" / "output" / "BTCUSDT_bar_series.parquet"
 
 
 def _have_offline_data() -> bool:
     return all(p.exists() for p in (
-        _FEATURES_PARQUET, _TSRV_PARQUET, _FUNDING_PARQUET, _DOLLAR_BAR_CACHE,
+        _FEATURES_PARQUET, _TSRV_PARQUET, _FUNDING_PARQUET, _BAR_SERIES_PARQUET,
     ))
 
 
@@ -114,7 +130,7 @@ def parity_setup():
         pytest.skip(
             f"Offline parity test requires {_FEATURES_PARQUET.name}, "
             f"{_TSRV_PARQUET.name}, {_FUNDING_PARQUET.name}, "
-            f"{_DOLLAR_BAR_CACHE.name} to be present.",
+            f"{_BAR_SERIES_PARQUET.name} to be present.",
         )
 
     # Load the offline features parquet (ground truth).
@@ -132,9 +148,57 @@ def parity_setup():
     tsrv_buffer = TSRVHistoryBuffer(max_size=672)
     tsrv_buffer.prewarm_from_parquet(_TSRV_PARQUET)
 
-    # Build the DollarBarBuffer from the small live-engine cache.
-    dollar_bar_buffer = DollarBarBuffer(max_size=2000)
-    dollar_bar_buffer.prewarm_from_parquet(_DOLLAR_BAR_CACHE)
+    # S-1d (cycle 7): load 600k+ bars (~35 days) directly from the
+    # offline bar-series parquet — the committed live cache (60k
+    # bars / 5.5 MB) covers 1-week rolling but not the trailing-30-
+    # day ``bpd`` window needed for tsrv_mean_1d/1w byte-equal closure.
+    # Read just the last few row groups for memory efficiency.
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(str(_BAR_SERIES_PARQUET))
+    n_total = pf.metadata.num_rows
+    target_n = 700_000
+    cumulative = 0
+    rg_indices: list[int] = []
+    for i in range(pf.num_row_groups - 1, -1, -1):
+        cumulative += pf.metadata.row_group(i).num_rows
+        rg_indices.insert(0, i)
+        if cumulative >= target_n + 10_000:
+            break
+    bar_table = pf.read_row_groups(rg_indices).to_pandas()
+    bar_table = bar_table.tail(target_n)
+    bar_table["n_trades"] = bar_table["n_trades"].astype("int64")
+    dollar_bar_buffer = DollarBarBuffer(max_size=target_n)
+    base_idx = bar_table.index
+    if not isinstance(base_idx, pd.DatetimeIndex):
+        # Fall back to the parquet's __index_level_0__ column.
+        from deribit_paper.features.dollar_bar import DollarBar
+        # Re-read with index preservation by reading a single row group + index.
+        ts_table = pf.read_row_groups(rg_indices, columns=["__index_level_0__"]) \
+            if "__index_level_0__" in pf.schema.names else None
+        if ts_table is not None:
+            tsdf = ts_table.to_pandas().tail(target_n)
+            base_idx = pd.DatetimeIndex(tsdf["__index_level_0__"])
+            if base_idx.tz is None:
+                base_idx = base_idx.tz_localize("UTC")
+    if base_idx.tz is None:
+        base_idx = pd.DatetimeIndex(base_idx, tz="UTC")
+    bar_table.index = base_idx
+    from deribit_paper.features.dollar_bar import DollarBar
+    for ts, row in bar_table.iterrows():
+        dollar_bar_buffer.append(DollarBar(
+            timestamp=pd.Timestamp(ts),
+            open=float(row["open"]), close=float(row["close"]),
+            high=float(row["high"]), low=float(row["low"]),
+            duration_s=float(row["duration_s"]),
+            n_trades=int(row["n_trades"]),
+            dollar_volume=float(row["dollar_volume"]),
+            buy_volume=float(row["buy_volume"]),
+            sell_volume=float(row["sell_volume"]),
+            vov=float(row["vov"]),
+            imbalance=float(row["imbalance"]),
+            log_return=float(row["log_return"]),
+            rv_bar=float(row["rv_bar"]),
+        ))
 
     # Stub bundle: minimal LightGBM features list so the assembler
     # constructor's manifest validator passes.
@@ -220,69 +284,13 @@ def test_tier_a_strict_byte_equal(parity_setup):
     )
 
 
-def test_tier_b_finiteness_and_directional(parity_setup, capsys):
-    """Tier-B: TSRV-grid features compute on the 15-min cadence (live)
-    vs the dollar-bar cadence (offline). C1 of PARITY_AUDIT_ROUND2.md
-    documents this as an accepted by-design deviation; full
-    byte-equality requires a 1750-bar dollar-bar buffer extension
-    (~200 LOC, deferred to S-1d).
-
-    The gate asserts:
-    1. Every Tier-B column produces a FINITE live value (handler did
-       not silently NaN out).
-    2. Sign and order-of-magnitude track the offline parquet — i.e.
-       live deviation is not "10x larger / opposite sign" but
-       "in the same regime."
-
-    Diffs are reported via stdout for observability without failing
-    the build.
-    """
-    live = parity_setup["live_feats"]
-    offline = parity_setup["offline_row"]
-    finiteness_failures: list[str] = []
-    sign_failures: list[str] = []
-    diffs: list[str] = []
-    for col in TIER_B_COLUMNS:
-        idx = TRANSVOL_INPUT_COLUMNS.index(col)
-        live_val = float(live[idx])
-        offline_val = float(offline[col])
-        if not np.isfinite(live_val):
-            finiteness_failures.append(
-                f"{col}: live={live_val} (non-finite)"
-            )
-            continue
-        if not np.isfinite(offline_val):
-            continue  # offline NaN — skip directional check
-        # Sign-flip check: live and offline within 10x of each other,
-        # OR both near-zero (|abs| < 1e-3), OR same sign.
-        same_sign = (live_val * offline_val) >= 0
-        within_10x = (
-            abs(offline_val) < 1e-3
-            or abs(live_val) <= 10 * abs(offline_val)
-        )
-        if not (same_sign and within_10x):
-            sign_failures.append(
-                f"{col}: live={live_val:.6g} offline={offline_val:.6g} "
-                f"reldiff={(live_val - offline_val)/max(abs(offline_val), 1e-12):+.3e}"
-            )
-        rel = (live_val - offline_val) / max(abs(offline_val), 1e-12)
-        diffs.append(f"{col}: live={live_val:.6g} offline={offline_val:.6g} reldiff={rel:+.2%}")
-
-    # Print full diff table to stdout for review.
-    print("\nTier-B diff table (informational, not failing):")
-    print("\n".join(diffs))
-
-    assert not finiteness_failures, (
-        f"Tier-B FINITENESS gate FAILED for {len(finiteness_failures)}/"
-        f"{len(TIER_B_COLUMNS)} cols:\n" + "\n".join(finiteness_failures)
-    )
-    # Sign / order-of-magnitude failures are allowed up to 10 cols
-    # before we treat as structural breakage. Empirically the
-    # cycle-6 baseline shows ~5-6 sign-flip outliers on calm bars
-    # (e.g. noise_level when offline=0 and live=tiny-positive).
-    assert len(sign_failures) <= 10, (
-        f"Tier-B SIGN/MAGNITUDE gate FAILED for {len(sign_failures)} cols "
-        f"(allowed ≤10):\n" + "\n".join(sign_failures)
+def test_tier_b_is_empty_after_cycle_7():
+    """S-1d (cycle 7) closes C1 strictly: all 30 former Tier-B
+    columns are promoted to Tier-A byte-equal. This test locks the
+    structural invariant — Tier-B must stay empty going forward."""
+    assert TIER_B_COLUMNS == (), (
+        f"Tier-B should be empty after cycle 7 closure; got "
+        f"{len(TIER_B_COLUMNS)} columns: {TIER_B_COLUMNS}"
     )
 
 
@@ -318,24 +326,57 @@ def test_mutation_probe_swapped_column_order_breaks_strict_gate(
     """Deliberately swap two columns in ``TRANSVOL_INPUT_COLUMNS`` and
     assert that the Tier-A strict-parity gate would now fail. Locks
     the canonical column ordering against silent reordering."""
-    # Take the live row and offline row from the fixture.
     live = parity_setup["live_feats"].copy()
     offline = parity_setup["offline_row"]
-
-    # Swap two columns: funding_basis (col 91) and time_to_funding (col 96).
     fb_idx = TRANSVOL_INPUT_COLUMNS.index("funding_basis")
     ttf_idx = TRANSVOL_INPUT_COLUMNS.index("time_to_funding")
     live[fb_idx], live[ttf_idx] = live[ttf_idx], live[fb_idx]
-
-    # Now Tier-A check should detect the swap because:
-    # - funding_basis offline ~ -7.4e-5
-    # - time_to_funding offline ~ thousands of seconds
-    # The swapped live row has them in the wrong slots → big diff.
     fb_live = float(live[fb_idx])
     fb_offline = float(offline["funding_basis"])
     assert not np.allclose(fb_live, fb_offline, rtol=1e-5, atol=1e-7), (
         "Mutation probe failed: swapping funding_basis and time_to_funding "
         "should produce a diff > 1e-7 in the Tier-A gate."
+    )
+
+
+def test_mutation_probe_tsrv_grid_column_swap_breaks_strict_gate(
+    parity_setup,
+):
+    """S-1d (cycle 7): now that the 30 former Tier-B columns are
+    Tier-A strict-byte-equal, extend the mutation probe to lock at
+    least one of the newly-promoted columns. Swapping a TSRV-on-db-
+    grid column with a funding-grid column produces large diffs
+    because the value distributions are entirely different (TSRV
+    columns range ~[-2, 0]; funding ~ -7e-5)."""
+    live = parity_setup["live_feats"].copy()
+    offline = parity_setup["offline_row"]
+    a_idx = TRANSVOL_INPUT_COLUMNS.index("tsrv_mean_1d")
+    b_idx = TRANSVOL_INPUT_COLUMNS.index("funding_basis_ema50")
+    live[a_idx], live[b_idx] = live[b_idx], live[a_idx]
+    a_live = float(live[a_idx])
+    a_offline = float(offline["tsrv_mean_1d"])
+    assert not np.allclose(a_live, a_offline, rtol=1e-5, atol=1e-7), (
+        "Mutation probe failed: swapping tsrv_mean_1d and "
+        "funding_basis_ema50 should produce a diff in the Tier-A gate."
+    )
+
+
+def test_mutation_probe_lag_variant_swap_breaks_strict_gate(
+    parity_setup,
+):
+    """Cycle 7: also lock the lag-variant ordering. tsrv_mean_1w_lag1
+    and tsrv_mean_1w_lag3 are *very* close in value (~0.00003 apart);
+    a strict 1e-7 abs gate still detects the swap."""
+    live = parity_setup["live_feats"].copy()
+    offline = parity_setup["offline_row"]
+    a_idx = TRANSVOL_INPUT_COLUMNS.index("tsrv_mean_1w_lag1")
+    b_idx = TRANSVOL_INPUT_COLUMNS.index("tsrv_mean_1w_lag3")
+    live[a_idx], live[b_idx] = live[b_idx], live[a_idx]
+    a_live = float(live[a_idx])
+    a_offline = float(offline["tsrv_mean_1w_lag1"])
+    assert not np.allclose(a_live, a_offline, rtol=1e-5, atol=1e-7), (
+        "Mutation probe failed: swapping tsrv_mean_1w_lag1 and "
+        "tsrv_mean_1w_lag3 should produce a detectable diff."
     )
 
 
@@ -360,9 +401,16 @@ def test_tier_classification_covers_all_101():
     )
 
 
-def test_tier_a_covers_funding_and_time_to_funding():
-    assert all(c.startswith("funding_basis") or c.startswith("time_to_funding")
-               for c in TIER_A_COLUMNS)
+def test_tier_a_size_matches_cycle_7_closure():
+    """Cycle 7 promotion math:
+    - Cycle-6 Tier-A (funding_basis ×5 + time_to_funding raw) = 6
+    - Cycle-7 promoted: time_to_funding lag/EMA ×4 + 7 TSRV-base groups
+      × 5 variants = 4 + 35 = 39
+    Total = 6 + 39 = 45 columns under strict-byte-equal."""
+    assert len(TIER_A_COLUMNS) == 45, (
+        f"Tier-A should have 45 columns after cycle 7; got "
+        f"{len(TIER_A_COLUMNS)}"
+    )
 
 
 def test_time_features_match_named_indices(parity_setup):

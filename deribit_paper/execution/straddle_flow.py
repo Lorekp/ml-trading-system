@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import secrets
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -45,6 +46,7 @@ import pandas as pd
 from deribit_paper.execution.amounts import option_amount_btc
 from deribit_paper.execution.order_manager import OrderManager, OrderResult
 from deribit_paper.execution.perp_hedger import HedgeRunSummary, PerpHedger
+from deribit_paper.execution.profit_scale import bsm_vega_per_vol_pt
 from deribit_paper.features.straddle import StraddleSelection
 from deribit_paper.signal.drl_hedger_live import LiveDRLHedger
 from deribit_paper.signal.predictor import Signal
@@ -61,7 +63,16 @@ _SCALE_EPS: float = 1e-9
 
 @dataclass
 class TradeOutcome:
-    """Full result of one straddle trade's lifecycle."""
+    """Full result of one straddle trade's lifecycle.
+
+    ``maker_adverse_selection_charge_usd`` (E-7, parity-r3 cycle 3 —
+    2026-05-08): USD penalty applied to legs that filled as maker.
+    Mirrors the offline backtester at ``vol_arb/backtester.py:2256-2259``
+    which charges ``vega_s × cfg.maker_adverse_selection_iv`` on
+    ``maker_filled_arr[i] == True`` trades. Live now charges
+    proportionally based on the per-leg maker fill fraction. Engine's
+    PnL accounting deducts this from ``realized_pnl_usd``.
+    """
     trade_id: str
     signal: Signal
     entry_call: OrderResult | None
@@ -74,6 +85,7 @@ class TradeOutcome:
     error: str | None = None
     started_at: pd.Timestamp | None = None
     ended_at: pd.Timestamp | None = None
+    maker_adverse_selection_charge_usd: float = 0.0
 
 
 class StraddleFlow:
@@ -109,6 +121,9 @@ class StraddleFlow:
         min_trade_floor: bool = False,         # return exchange min instead of 0.0
         use_tiered_taker: bool = False,        # E.1.6: 3-tier IOC ladder
         cancel_exit_max_slippage_pct: float = 1.0,  # E-8 (2026-05-08): cap for recovery exits
+        # E-7 (parity-r3 cycle 3 — 2026-05-08): vol-points penalty charged
+        # per BTC of maker-filled leg; mirrors offline `cfg.maker_adverse_selection_iv`.
+        maker_adverse_selection_iv: float = 0.5,
         on_position_opened: Callable[..., Awaitable[None]] | None = None,
         on_position_closed: Callable[..., Awaitable[None]] | None = None,
     ):
@@ -135,6 +150,7 @@ class StraddleFlow:
         self._sizing_dd_floor = sizing_dd_floor
         self._use_tiered_taker = use_tiered_taker
         self._cancel_exit_max_slippage_pct = float(cancel_exit_max_slippage_pct)
+        self._maker_adverse_selection_iv = float(maker_adverse_selection_iv)
 
     # ── Sizing ──────────────────────────────────────────────────────
 
@@ -282,6 +298,74 @@ class StraddleFlow:
         return n_rounded
 
     # ── Full lifecycle ──────────────────────────────────────────────
+
+    def _maker_adverse_selection_charge(
+        self,
+        *,
+        entry_call: OrderResult,
+        entry_put: OrderResult,
+        n_contracts: float,
+        spot: float,
+        strike: float,
+        iv_entry_decimal: float,
+        tau_entry_years: float,
+    ) -> float:
+        """E-7 (parity-r3 cycle 3 — 2026-05-08): per-leg maker adverse-
+        selection charge in USD.
+
+        Mirrors offline ``vol_arb/backtester.py:2256-2272`` semantic
+        ``maker_adv_sel_penalty = vega_s * cfg.maker_adverse_selection_iv``
+        applied per-BTC and scaled by ``N`` — but live charges
+        proportionally based on the per-leg maker fill fraction (more
+        granular than the backtester's trade-level boolean).
+
+        Returns 0.0 when neither leg filled as maker, when the penalty
+        is configured off (``maker_adverse_selection_iv <= 0``), or
+        when the BSM vega computation degenerates. The cost is
+        ``vega_per_vol_pt × penalty × n_filled_as_maker``.
+        """
+        if self._maker_adverse_selection_iv <= 0.0:
+            return 0.0
+
+        def _maker_filled_btc(result: OrderResult, fallback_n: float) -> float:
+            raw = result.raw or {}
+            exec_type = str(raw.get("execution_type", "")).lower()
+            if exec_type == "maker":
+                # Full leg filled at maker; in the rare partial maker
+                # finished case, ``maker_filled`` would be < total.
+                return float(raw.get("maker_filled", result.filled_amount))
+            if exec_type == "partial_maker":
+                return float(raw.get("maker_filled", 0.0))
+            # ``taker`` / unknown: nothing to charge.
+            return 0.0
+
+        n_call_maker = _maker_filled_btc(entry_call, n_contracts)
+        n_put_maker = _maker_filled_btc(entry_put, n_contracts)
+        total_maker_btc = max(n_call_maker + n_put_maker, 0.0)
+        if total_maker_btc <= 0.0:
+            return 0.0
+
+        # Per-leg vega in USD per vol-pt (BS vega is direction-symmetric;
+        # call vega == put vega at the same K, T, σ).
+        leg_vega_usd_per_vol_pt = bsm_vega_per_vol_pt(
+            spot=spot,
+            strike=strike,
+            iv_decimal=iv_entry_decimal,
+            tau_years=tau_entry_years,
+        )
+        if leg_vega_usd_per_vol_pt <= 0.0:
+            return 0.0
+
+        # Total USD charge = per-leg vega × penalty × BTC of leg-fills
+        # marked as maker. When BOTH legs maker-fill the full size, this
+        # equals ``2 × leg_vega × penalty × n_contracts`` — i.e. the
+        # composite straddle vega × penalty × N, matching the backtester's
+        # ``vega_s × cfg.maker_adverse_selection_iv × N`` exactly.
+        return float(
+            leg_vega_usd_per_vol_pt
+            * self._maker_adverse_selection_iv
+            * total_maker_btc
+        )
 
     async def execute(
         self,
@@ -479,6 +563,45 @@ class StraddleFlow:
                 ended_at=pd.Timestamp.now(tz="UTC"),
             )
 
+        # ── 1b. E-7: maker adverse-selection charge (parity-r3 cycle 3) ──
+        # The V2 backtester at ``vol_arb/backtester.py:2256-2259`` charges
+        # ``vega_s × cfg.maker_adverse_selection_iv`` (per-BTC USD, scaled
+        # by N at line 2274) on trades whose SOR confirmed a maker fill.
+        # Pre-fix the live engine charged nothing on its maker entries
+        # (E-5 closed in cycle 2 enabled maker-then-taker but the penalty
+        # was never wired in).
+        # Live now charges proportionally based on the per-leg maker fill
+        # fraction — more honest than the backtester's trade-level
+        # boolean. ``execution_type == "maker"`` means full maker;
+        # ``"partial_maker"`` reports the partial fill in `raw["maker_filled"]`.
+        # ``"taker"`` (or absent) means no maker → zero charge for that leg.
+        maker_adverse_selection_charge_usd = self._maker_adverse_selection_charge(
+            entry_call=entry_call,
+            entry_put=entry_put,
+            n_contracts=n_contracts,
+            spot=spot,
+            strike=straddle.strike,
+            iv_entry_decimal=(
+                float(signal.iv_used_pct) / 100.0
+                if signal.iv_used_pct and signal.iv_used_pct > 0
+                else 0.75
+            ),
+            tau_entry_years=max(
+                (straddle.expiry_dt - started_at).total_seconds()
+                / (365.25 * 24 * 3600),
+                1e-6,
+            ),
+        )
+        if maker_adverse_selection_charge_usd > 0.0:
+            logger.info(
+                "E-7: maker adverse-selection charge $%.2f "
+                "(call=%s put=%s, vol_pts=%.2f)",
+                maker_adverse_selection_charge_usd,
+                (entry_call.raw or {}).get("execution_type", "taker"),
+                (entry_put.raw or {}).get("execution_type", "taker"),
+                self._maker_adverse_selection_iv,
+            )
+
         # ── 2. BEGIN DRL hedge trade ───────────────────────────────
         tau_entry_years = max(
             (straddle.expiry_dt - started_at).total_seconds() / (365.25 * 24 * 3600),
@@ -506,6 +629,31 @@ class StraddleFlow:
             vol_ann_entry_value = float(signal.bar_tsrv.vol_ann_continuous)
         else:
             vol_ann_entry_value = 0.8
+        # D-10 (parity-r3 cycle 3 — 2026-05-08): VPIN stream can drop
+        # mid-trade (Binance WebSocket reconnect, sub disconnect) or
+        # return non-finite values (degenerate aggregation). Pre-fix the
+        # raw provider value flowed straight into ``begin_trade`` →
+        # downstream the SAC v4 obs vector took NaN, silently mispricing
+        # the hedge ratio. Fall back to neutral 0.5 (matching the
+        # ``vpin_provider is None`` path) when non-finite, with a
+        # rate-limited warning so the operator sees stream degradation.
+        vpin_value = 0.5
+        if self._vpin_provider is not None:
+            try:
+                vpin_raw = float(self._vpin_provider())
+                if math.isfinite(vpin_raw):
+                    vpin_value = vpin_raw
+                else:
+                    logger.warning(
+                        "D-10: VPIN provider returned non-finite (%s); "
+                        "falling back to 0.5 for begin_trade",
+                        vpin_raw,
+                    )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "D-10: VPIN provider raised %s; falling back to 0.5",
+                    exc,
+                )
         trade_id = self._drl.begin_trade(
             signal=signal.direction,
             S_entry=spot,
@@ -515,7 +663,7 @@ class StraddleFlow:
             tau_entry=tau_entry_years,
             V_bg=float(trailing_1h_volume_btc) if trailing_1h_volume_btc else 100.0,
             jump_fraction=float(signal.bar_tsrv.jump_fraction) if signal.bar_tsrv else 0.0,
-            vpin=self._vpin_provider() if self._vpin_provider else 0.5,
+            vpin=vpin_value,
             svi_slice_params=signal.svi_slice,
         )
 
@@ -695,6 +843,7 @@ class StraddleFlow:
             hedge_summary=hedge_summary,
             started_at=started_at,
             ended_at=ended_at,
+            maker_adverse_selection_charge_usd=maker_adverse_selection_charge_usd,
         )
 
     async def _close_if_filled(

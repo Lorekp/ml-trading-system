@@ -889,6 +889,10 @@ class TradingEngine:
             min_trade_floor=cfg.min_trade_floor,
             use_tiered_taker=cfg.use_tiered_taker,
             cancel_exit_max_slippage_pct=cfg.cancel_exit_max_slippage_pct,
+            # E-7 (parity-r3 cycle 3 — 2026-05-08): mirror the offline
+            # `cfg.maker_adverse_selection_iv` charge applied at
+            # `vol_arb/backtester.py:2256-2259` on maker fills.
+            maker_adverse_selection_iv=cfg.maker_adverse_selection_iv,
             on_position_opened=self._on_position_opened,
             on_position_closed=self._on_position_closed,
         )
@@ -2422,9 +2426,18 @@ class TradingEngine:
                 )
                 hedge_fees_usd = cost_rate * total_usd_traded
 
+            # E-7 (parity-r3 cycle 3 — 2026-05-08): deduct the maker
+            # adverse-selection charge for any leg that filled as maker.
+            # Mirrors the offline ``maker_adv_sel_penalty`` deduction at
+            # ``vol_arb/backtester.py:2272``. ``maker_adverse_selection_charge_usd``
+            # defaults to 0 (no maker fill, or feature disabled).
+            maker_adverse_selection_usd = float(getattr(
+                outcome, "maker_adverse_selection_charge_usd", 0.0,
+            ) or 0.0)
             realized_pnl_usd = (
                 option_pnl_usd + hedge_pnl_usd
                 - option_fees_usd - hedge_fees_usd
+                - maker_adverse_selection_usd
             )
 
             self.equity_tracker.on_trade_closed(realized_pnl_usd)

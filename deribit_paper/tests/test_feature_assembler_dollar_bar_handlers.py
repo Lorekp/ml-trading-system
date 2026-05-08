@@ -315,8 +315,16 @@ def test_h_duration_s_falls_back_when_buffer_none(stub_parquets):
     assert math_finite(row.as_dict["duration_s"])
 
 
-def test_h_n_trades_falls_back_to_n_perp_trades_when_buffer_none(stub_parquets):
-    """Backward compat: buffer=None → ctx.bar.n_perp_trades."""
+def test_h_n_trades_warmup_uses_baseline_row_not_wall_clock(stub_parquets):
+    """F-7 (parity-r3 cycle 3 — 2026-05-08): when the dollar-bar
+    buffer is empty (warmup) the handler reads ``baseline_row["n_trades"]``
+    instead of the wall-clock 15-min count from
+    ``ctx.bar.n_perp_trades``. Pre-F-7 the wall-clock count flowed
+    through, diverging from offline's last-sub-bar groupby semantic.
+
+    Setting ``n_perp_trades=42`` on the bar and asserting the handler
+    DOES NOT return 42 verifies the baseline-row preference.
+    """
     base_path, _ = stub_parquets
     bundle = _StubBundle(lgbm_features=["n_trades"])
     assembler = FeatureAssembler(
@@ -327,10 +335,18 @@ def test_h_n_trades_falls_back_to_n_perp_trades_when_buffer_none(stub_parquets):
     )
     bar = _StubBar(
         timestamp=pd.Timestamp("2026-05-07 12:15", tz="UTC"),
-        n_perp_trades=42,
+        n_perp_trades=42,  # would have dominated pre-F-7
     )
     row = assembler.build_row(bar, _StubTSRV())
-    assert row.as_dict["n_trades"] == pytest.approx(42.0)
+    n_trades = row.as_dict["n_trades"]
+    assert math_finite(n_trades)
+    assert n_trades != pytest.approx(42.0), (
+        "F-7 regression: warmup fallback must prefer baseline_row over "
+        "wall-clock n_perp_trades, but n_trades resolved to wall-clock 42."
+    )
+    # And the baseline parquet's n_trades column drives the answer.
+    baseline_n_trades = float(assembler._baseline_row.get("n_trades", 0.0))
+    assert n_trades == pytest.approx(baseline_n_trades)
 
 
 # ── 3. backward-compat — buffer=None still works ────────────────────

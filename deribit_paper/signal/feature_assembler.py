@@ -169,15 +169,26 @@ def _h_n_trades(ctx: AssemblerContext) -> float:
     a different quantity. With the dollar-bar buffer wired live, we
     return the latest dollar bar's n_trades to match offline.
 
-    Fallback when buffer is None or empty (engine warmup / test fixtures
-    that don't wire a buffer): use the wall-clock count, matching
-    pre-F5 behaviour for backward compat.
+    F-7 (parity-r3 cycle 3 — 2026-05-08): warmup fallback now reads
+    ``baseline_row["n_trades"]`` rather than the WALL-CLOCK 15-min
+    count from ``ctx.bar.n_perp_trades``. The wall-clock count is a
+    sum across the full 15-min window — a different quantity from
+    offline's last-sub-bar groupby. The baseline row preserves
+    last-sub-bar semantics built from offline parquet at warmup, so
+    using it keeps the warmup row monotonic with offline. Buffer
+    fallback is fine for tests that explicitly avoid a baseline.
     """
     buf = ctx.dollar_bar_buffer
     if buf is not None and len(buf) > 0:
         bar = buf.latest_bar()
         if bar is not None:
             return float(bar.n_trades)
+    # Warmup fallback (F-7): prefer the baseline_row's last-sub-bar
+    # value over the 15-min wall-clock sum.
+    if ctx.baseline_row is not None and "n_trades" in ctx.baseline_row.index:
+        baseline_val = ctx.baseline_row.get("n_trades", np.nan)
+        if pd.notna(baseline_val):
+            return float(baseline_val)
     return float(ctx.bar.n_perp_trades)
 
 
@@ -189,16 +200,27 @@ def _h_duration_s(ctx: AssemblerContext) -> float:
     on the dollar-bar duration_s series — i.e. the last sub-bar's full
     duration. With the dollar-bar buffer wired live, we mirror that.
 
-    Fallback when buffer is None or empty: use the existing mean
-    inter-trade gap calculation for backward compat.
+    F-7 (parity-r3 cycle 3 — 2026-05-08): warmup fallback now reads
+    ``baseline_row["duration_s"]`` instead of synthesising a mean
+    inter-trade gap from ``ctx.bar.perp_trades``. The mean-gap
+    calculation is wall-clock-window-derived and diverges from
+    offline's last-sub-bar groupby; the baseline row holds the offline
+    last-sub-bar value built at warmup. Falls back to the inter-trade
+    gap only if no baseline column is available (legacy contract).
     """
     buf = ctx.dollar_bar_buffer
     if buf is not None and len(buf) > 0:
         bar = buf.latest_bar()
         if bar is not None and np.isfinite(bar.duration_s):
             return float(bar.duration_s)
+    # Warmup fallback (F-7): prefer the baseline_row's last-sub-bar
+    # value over the synthesised mean inter-trade gap.
+    if ctx.baseline_row is not None and "duration_s" in ctx.baseline_row.index:
+        baseline_val = ctx.baseline_row.get("duration_s", np.nan)
+        if pd.notna(baseline_val) and float(baseline_val) > 0.0:
+            return float(baseline_val)
     if not ctx.bar.perp_trades:
-        return float(ctx.baseline_row.get("duration_s", 1.0) or 1.0)
+        return 1.0
     first = ctx.bar.perp_trades[0].timestamp
     last = ctx.bar.perp_trades[-1].timestamp
     n_pairs = max(len(ctx.bar.perp_trades) - 1, 1)

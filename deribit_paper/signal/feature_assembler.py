@@ -365,6 +365,53 @@ def _h_time_to_funding_lag1(ctx: AssemblerContext) -> float:
     return _time_to_funding_seconds(prev_ts)
 
 
+def _h_time_to_funding_lag3(ctx: AssemblerContext) -> float:
+    """S-1b: time_to_funding at bar T-3 (45 min before T)."""
+    return _time_to_funding_seconds(
+        ctx.bar.timestamp - pd.Timedelta(minutes=15 * 3),
+    )
+
+
+def _h_time_to_funding_ema10(ctx: AssemblerContext) -> float:
+    """S-1b: EWM(span=10, adjust=True) over the time_to_funding series.
+
+    The function is deterministic in the timestamp so the trailing-K
+    series is fully reconstructible from the bar's timestamp; we
+    compute it on the fly from the last (10*ratio + buffer) timestamps
+    to converge the EMA. The series is also smooth (sawtooth with 8h
+    period) so the EMA hits steady-state within ~10 bars.
+    """
+    return _time_to_funding_ema(ctx.bar.timestamp, span=10)
+
+
+def _h_time_to_funding_ema50(ctx: AssemblerContext) -> float:
+    """S-1b: EWM(span=50, adjust=True) over the time_to_funding series.
+
+    Same logic as ``_h_time_to_funding_ema10`` with span=50.
+    """
+    return _time_to_funding_ema(ctx.bar.timestamp, span=50)
+
+
+def _time_to_funding_ema(ts: pd.Timestamp, *, span: int) -> float:
+    """Helper: compute the EWM(span) of the time_to_funding series at
+    ``ts`` with enough historical bars to converge.
+
+    Mirrors offline ``feats["time_to_funding"].ewm(span=span,
+    min_periods=1).mean().iloc[-1]``. We reconstruct the trailing
+    ``5*span`` bars (more than enough for the EMA to converge given
+    the smooth 8h-period sawtooth) and evaluate the EMA at the last
+    point.
+    """
+    n = max(5 * span, 32)
+    timestamps = [ts - pd.Timedelta(minutes=15 * (n - 1 - i)) for i in range(n)]
+    series = pd.Series(
+        [_time_to_funding_seconds(t) for t in timestamps],
+        dtype=np.float64,
+    )
+    ema_val = series.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]
+    return float(ema_val)
+
+
 def _make_dollar_bar_handler(
     name: str,
     method: str,
@@ -411,6 +458,77 @@ def _h_parkinson_1d(ctx: "AssemblerContext") -> float:
     if v is None or not np.isfinite(v):
         return _baseline_or_nan(ctx, "parkinson_1d")
     return float(v)
+
+
+# ── S-1b (parity-r3 cycle 5 — 2026-05-08): 3 TransVol-input bases ──
+# The encoder consumes 101 features; pre-S-1b the live engine had no
+# path to hurst_100 / ffd_rv / rv_zscore_*, so the corresponding
+# `tv_X` slots silently fell back to baseline_row. These handlers now
+# bind the live computation; lag/EMA variants follow in S-1c (require
+# additional per-bar caching).
+
+
+def _h_hurst_100(ctx: "AssemblerContext") -> float:
+    """S-1b: rolling Hurst exponent over the trailing 100 dollar-bar
+    log-returns. Mirrors offline ``_hurst_subsampled(returns, window=100)``
+    evaluated at the latest bar (with the offline subsample-interpolate
+    path collapsing to the bar's own R/S regression — they agree at every
+    position p ∈ {window, window+step, ...})."""
+    feats = ctx.dollar_bar_features
+    if feats is None:
+        return _baseline_or_nan(ctx, "hurst_100")
+    try:
+        v = feats.hurst_100(window=100)
+    except (KeyError, ValueError, TypeError):
+        return _baseline_or_nan(ctx, "hurst_100")
+    if v is None or not np.isfinite(v):
+        return _baseline_or_nan(ctx, "hurst_100")
+    return float(v)
+
+
+def _h_ffd_rv(ctx: "AssemblerContext") -> float:
+    """S-1b: latest fractionally-differenced log-close (d=0.4, threshold=1e-5).
+    Byte-equal to offline ``frac_diff_ffd(np.log(close))`` at the last
+    index. Falls back to baseline when the buffer is shorter than the
+    FFD weight window (~1458 bars at d=0.4)."""
+    feats = ctx.dollar_bar_features
+    if feats is None:
+        return _baseline_or_nan(ctx, "ffd_rv")
+    try:
+        v = feats.ffd_rv(d=0.4, threshold=1e-5)
+    except (KeyError, ValueError, TypeError):
+        return _baseline_or_nan(ctx, "ffd_rv")
+    if v is None or not np.isfinite(v):
+        return _baseline_or_nan(ctx, "ffd_rv")
+    return float(v)
+
+
+def _make_rv_zscore_handler(
+    horizon: str,
+) -> "Callable[[AssemblerContext], float]":
+    """S-1b: build a handler for ``rv_zscore_{horizon}``.
+
+    Mirrors offline ``engineer.py:233-240``. ``horizon`` ∈ {1d, 1w, 1m};
+    the underlying window is ``bpd × {1, 7, 30}`` clipped at offline's
+    caps. ``DollarBarFeatures.rv_zscore`` resolves bpd live so the
+    window adapts to per-asset bar density.
+    """
+    feature_name = f"rv_zscore_{horizon}"
+
+    def _handler(ctx: "AssemblerContext") -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, feature_name)
+        try:
+            v = feats.rv_zscore(horizon)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, feature_name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, feature_name)
+        return float(v)
+
+    _handler.__name__ = f"_h_{feature_name}"
+    return _handler
 
 
 def _h_parkinson_1d_ema50(ctx: "AssemblerContext") -> float:
@@ -501,12 +619,23 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "vpin_ema10":          _make_dollar_bar_handler("vpin_ema10", "ema", "vpin", 10),
     "vpin_ema50":          _make_dollar_bar_handler("vpin_ema50", "ema", "vpin", 50),
     "vpin_lag1":           _make_dollar_bar_handler("vpin_lag1", "lag", "vpin", 1),
+    # imbalance: 5 variants (raw + 4 windows) — S-1b: ema50 already
+    # present pre-cycle; raw + ema10 + lag1 + lag3 added cycle 5.
+    "imbalance":           _make_dollar_bar_handler("imbalance", "latest_raw", "imbalance"),
+    "imbalance_ema10":     _make_dollar_bar_handler("imbalance_ema10", "ema", "imbalance", 10),
     "imbalance_ema50":     _make_dollar_bar_handler("imbalance_ema50", "ema", "imbalance", 50),
+    "imbalance_lag1":      _make_dollar_bar_handler("imbalance_lag1", "lag", "imbalance", 1),
+    "imbalance_lag3":      _make_dollar_bar_handler("imbalance_lag3", "lag", "imbalance", 3),
     "duration_s_ema10":    _make_dollar_bar_handler("duration_s_ema10", "ema", "duration_s", 10),
     "duration_s_ema50":    _make_dollar_bar_handler("duration_s_ema50", "ema", "duration_s", 50),
+    "duration_s_lag1":     _make_dollar_bar_handler("duration_s_lag1", "lag", "duration_s", 1),
     "duration_s_lag3":     _make_dollar_bar_handler("duration_s_lag3", "lag", "duration_s", 3),
     "n_trades_ema10":      _make_dollar_bar_handler("n_trades_ema10", "ema", "n_trades", 10),
     "n_trades_ema50":      _make_dollar_bar_handler("n_trades_ema50", "ema", "n_trades", 50),
+    "n_trades_lag1":       _make_dollar_bar_handler("n_trades_lag1", "lag", "n_trades", 1),
+    "n_trades_lag3":       _make_dollar_bar_handler("n_trades_lag3", "lag", "n_trades", 3),
+    "vov_lag1":            _make_dollar_bar_handler("vov_lag1", "lag", "vov", 1),
+    "vpin_lag3":           _make_dollar_bar_handler("vpin_lag3", "lag", "vpin", 3),
     # F-3 (parity-r3 cycle 2 — 2026-05-08): dynamic bpd-driven window.
     "parkinson_1d":        _h_parkinson_1d,
     "parkinson_1d_ema50":  _h_parkinson_1d_ema50,
@@ -524,6 +653,17 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     # ``vol_model/features/engineer.py:417-419``.
     "time_to_funding":       _h_time_to_funding,
     "time_to_funding_lag1":  _h_time_to_funding_lag1,
+    "time_to_funding_lag3":  _h_time_to_funding_lag3,
+    "time_to_funding_ema10": _h_time_to_funding_ema10,
+    "time_to_funding_ema50": _h_time_to_funding_ema50,
+    # S-1b (parity-r3 cycle 5 — 2026-05-08): TransVol-input bases that
+    # were previously baseline-fallback. Lag/EMA variants follow in
+    # S-1c (require dedicated per-bar series caching).
+    "hurst_100":             _h_hurst_100,
+    "ffd_rv":                _h_ffd_rv,
+    "rv_zscore_1d":          _make_rv_zscore_handler("1d"),
+    "rv_zscore_1w":          _make_rv_zscore_handler("1w"),
+    "rv_zscore_1m":          _make_rv_zscore_handler("1m"),
 }
 
 

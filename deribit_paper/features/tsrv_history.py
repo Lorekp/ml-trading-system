@@ -20,8 +20,11 @@ Buffer schema:
 * ``timestamp`` (UTC, 15-min cadence)
 * ``vol_ann`` (TSRV-based annualised vol — same as offline parquet column)
 * ``up_jump_fraction``
+* ``down_jump_fraction`` (S-1c — needed for live ``down_jump_frac``)
 * ``bpv``
 * ``rv_slow``
+* ``rv_fast`` (S-1c — needed for live ``noise_level``)
+* ``n_ticks`` (S-1c — needed for live ``noise_level``)
 
 Pre-warm via ``prewarm_from_parquet`` reads ``TSRV/output/<asset>_tsrv_15m.parquet``
 which the engineer pipeline maintains as canonical.
@@ -45,15 +48,30 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TSRVHistoryRow:
-    """One 15-min-bar's TSRV values, stored in :class:`TSRVHistoryBuffer`."""
+    """One 15-min-bar's TSRV values, stored in :class:`TSRVHistoryBuffer`.
+
+    S-1c (parity-r3 cycle 6 — 2026-05-08): extended schema with
+    ``down_jump_fraction``, ``rv_fast``, ``n_ticks`` so the live
+    pipeline can compute ``down_jump_frac``, ``noise_level``, and
+    ``bpv_tsrv_ratio`` (and their lag/EMA variants) directly from the
+    bar grid — matching the offline ``vol_model/features/engineer.py``
+    column derivations exactly. BarTSRV already carries these fields;
+    they are simply persisted now.
+    """
     timestamp: pd.Timestamp
     vol_ann: float
     up_jump_fraction: float
+    down_jump_fraction: float
     bpv: float
     rv_slow: float
+    rv_fast: float
+    n_ticks: int
 
 
-_PARQUET_COLUMNS: tuple[str, ...] = ("vol_ann", "up_jump_fraction", "bpv", "rv_slow")
+_PARQUET_COLUMNS: tuple[str, ...] = (
+    "vol_ann", "up_jump_fraction", "down_jump_fraction",
+    "bpv", "rv_slow", "rv_fast", "n_ticks",
+)
 
 
 class TSRVHistoryBuffer:
@@ -85,8 +103,11 @@ class TSRVHistoryBuffer:
             timestamp=pd.Timestamp(timestamp),
             vol_ann=float(bar_tsrv.vol_ann),
             up_jump_fraction=float(bar_tsrv.up_jump_fraction),
+            down_jump_fraction=float(bar_tsrv.down_jump_fraction),
             bpv=float(bar_tsrv.bpv),
             rv_slow=float(bar_tsrv.rv_slow),
+            rv_fast=float(bar_tsrv.rv_fast),
+            n_ticks=int(bar_tsrv.n_ticks),
         ))
 
     def latest(self) -> TSRVHistoryRow | None:
@@ -166,8 +187,11 @@ class TSRVHistoryBuffer:
                 timestamp=pd.Timestamp(ts),
                 vol_ann=float(row["vol_ann"]),
                 up_jump_fraction=float(row["up_jump_fraction"]),
+                down_jump_fraction=float(row["down_jump_fraction"]),
                 bpv=float(row["bpv"]),
                 rv_slow=float(row["rv_slow"]),
+                rv_fast=float(row["rv_fast"]),
+                n_ticks=int(row["n_ticks"]),
             ))
             n_loaded += 1
         logger.info(

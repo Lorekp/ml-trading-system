@@ -64,6 +64,11 @@ class TSRVFeatures:
         self._cached_len: int = -1
         self._cached_log_vol_ann: pd.Series | None = None
         self._cached_tsrv_mean_1d: pd.Series | None = None
+        # S-1c (parity-r3 cycle 6 — 2026-05-08): cached series for
+        # the 1w / FFD / noise_level / bpv_tsrv_ratio / down_jump_frac /
+        # up_jump_frac variants. Each entry is a pandas Series aligned
+        # with the buffer's bar grid; invalidated on length change.
+        self._cached_derived: dict[str, pd.Series] = {}
 
     # ── cache management ─────────────────────────────────────────────
 
@@ -75,12 +80,14 @@ class TSRVFeatures:
         if n == 0:
             self._cached_log_vol_ann = None
             self._cached_tsrv_mean_1d = None
+            self._cached_derived.clear()
             return
         # ln(vol_ann) — match offline ``np.log(tsrv_df["vol_ann"].clip(lower=1e-10))``
         vol_ann = self._buffer.as_series("vol_ann")
         self._cached_log_vol_ann = np.log(vol_ann.clip(lower=1e-10))
         # Invalidate dependent caches
         self._cached_tsrv_mean_1d = None
+        self._cached_derived.clear()
 
     def _log_vol_ann(self) -> pd.Series | None:
         self._refresh()
@@ -110,30 +117,62 @@ class TSRVFeatures:
         return None if not np.isfinite(v) else float(v)
 
     def tsrv_mean_1d_lag3(self) -> float | None:
-        ser = self._tsrv_mean_1d_series()
-        if ser is None or len(ser) < 4:
-            return None
-        v = ser.iloc[-4]
-        return None if not np.isfinite(v) else float(v)
+        return self.tsrv_mean_1d_lag(3)
 
     def tsrv_mean_1d_ema50(self, span: int = 50) -> float | None:
-        ser = self._tsrv_mean_1d_series()
-        if ser is None or ser.empty:
-            return None
-        v = ser.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]
-        return None if not np.isfinite(v) else float(v)
+        return self.tsrv_mean_1d_ema(span)
 
     def tsrv_mean_1w(self) -> float | None:
-        ln = self._log_vol_ann()
-        if ln is None or len(ln) == 0:
+        ser = self._tsrv_mean_1w_series()
+        if ser is None or ser.empty:
             return None
-        v = ln.rolling(
-            _BARS_PER_WEEK, min_periods=max(_BARS_PER_WEEK // 4, 10),
-        ).mean().iloc[-1]
+        v = ser.iloc[-1]
         return None if not np.isfinite(v) else float(v)
 
     def tsrv_ffd(self) -> float | None:
         """Fractional differencing of log(vol_ann), d=0.4 (mirrors offline)."""
+        ser = self._tsrv_ffd_series()
+        if ser is None or ser.empty:
+            return None
+        v = ser.iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    def up_jump_frac(self) -> float | None:
+        ser = self._buffer.as_series("up_jump_fraction")
+        if ser.empty:
+            return None
+        v = ser.iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    def up_jump_frac_ema50(self, span: int = 50) -> float | None:
+        return self.up_jump_frac_ema(span)
+
+    def bpv_tsrv_ratio_ema50(self, span: int = 50) -> float | None:
+        return self.bpv_tsrv_ratio_ema(span)
+
+    # ── S-1c (parity-r3 cycle 6 — 2026-05-08): generalised lag/EMA ──
+    # Variants for tsrv_mean_1d, tsrv_mean_1w, tsrv_ffd, up_jump_frac,
+    # bpv_tsrv_ratio, down_jump_frac, noise_level. Pattern: cache the
+    # underlying series (per-bar pandas Series), then ``.shift(n)`` /
+    # ``.ewm(span)`` at the latest bar.
+
+    def _tsrv_mean_1w_series(self) -> pd.Series | None:
+        cached = self._cached_derived.get("tsrv_mean_1w")
+        if cached is not None:
+            return cached
+        ln = self._log_vol_ann()
+        if ln is None or len(ln) == 0:
+            return None
+        ser = ln.rolling(
+            _BARS_PER_WEEK, min_periods=max(_BARS_PER_WEEK // 4, 10),
+        ).mean()
+        self._cached_derived["tsrv_mean_1w"] = ser
+        return ser
+
+    def _tsrv_ffd_series(self) -> pd.Series | None:
+        cached = self._cached_derived.get("tsrv_ffd")
+        if cached is not None:
+            return cached
         ln = self._log_vol_ann()
         if ln is None or len(ln) < 30:
             return None
@@ -141,11 +180,10 @@ class TSRVFeatures:
             from src.afml.fracdiff import frac_diff_ffd
         except ImportError:
             logger.warning(
-                "TSRVFeatures.tsrv_ffd: src.afml.fracdiff not importable; "
-                "returning None (handler falls back to baseline)",
+                "TSRVFeatures._tsrv_ffd_series: src.afml.fracdiff not "
+                "importable; returning None (handler falls back to baseline)",
             )
             return None
-        # frac_diff_ffd expects a DataFrame; wrap then unwrap.
         df = ln.to_frame(name="tsrv")
         try:
             ffd = frac_diff_ffd(df, d=_FRACDIFF_D, threshold=_FRACDIFF_THRESHOLD)
@@ -154,26 +192,154 @@ class TSRVFeatures:
             return None
         if ffd is None or "tsrv" not in ffd.columns or ffd["tsrv"].empty:
             return None
-        v = ffd["tsrv"].iloc[-1]
-        return None if not np.isfinite(v) else float(v)
+        # Reindex to the full buffer index so lag/EMA align positionally
+        # with the bar grid (offline does the same when ffilling the FFD
+        # output back onto the dollar-bar grid before lag/EMA aggregation).
+        ser = ffd["tsrv"].reindex(ln.index)
+        self._cached_derived["tsrv_ffd"] = ser
+        return ser
 
-    def up_jump_frac_ema50(self, span: int = 50) -> float | None:
-        ser = self._buffer.as_series("up_jump_fraction")
-        if ser.empty:
-            return None
-        v = ser.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]
-        return None if not np.isfinite(v) else float(v)
-
-    def bpv_tsrv_ratio_ema50(self, span: int = 50) -> float | None:
-        """EMA50 of ``bpv / rv_slow`` per the offline definition."""
+    def _bpv_tsrv_ratio_series(self) -> pd.Series | None:
+        cached = self._cached_derived.get("bpv_tsrv_ratio")
+        if cached is not None:
+            return cached
         bpv = self._buffer.as_series("bpv")
         rv_slow = self._buffer.as_series("rv_slow")
         if bpv.empty or rv_slow.empty:
             return None
-        # Mirror offline ``tsrv_df["bpv"] / tsrv_df["rv_slow"].clip(lower=1e-20)``
         ratio = bpv / rv_slow.clip(lower=1e-20)
-        v = ratio.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]
+        self._cached_derived["bpv_tsrv_ratio"] = ratio
+        return ratio
+
+    def _noise_level_series(self) -> pd.Series | None:
+        """``rv_fast / (2 × max(n_ticks, 1))`` per bar.
+
+        Mirrors offline ``vol_model/features/engineer.py:350``::
+
+            feats["noise_level"] = _ffill_to_bars(
+                tsrv_df["rv_fast"] / (2 * tsrv_df["n_ticks"].clip(lower=1)))
+        """
+        cached = self._cached_derived.get("noise_level")
+        if cached is not None:
+            return cached
+        rv_fast = self._buffer.as_series("rv_fast")
+        n_ticks = self._buffer.as_series("n_ticks")
+        if rv_fast.empty or n_ticks.empty:
+            return None
+        ser = rv_fast / (2.0 * n_ticks.clip(lower=1.0))
+        self._cached_derived["noise_level"] = ser
+        return ser
+
+    def _down_jump_frac_series(self) -> pd.Series | None:
+        cached = self._cached_derived.get("down_jump_frac")
+        if cached is not None:
+            return cached
+        ser = self._buffer.as_series("down_jump_fraction")
+        if ser.empty:
+            return None
+        self._cached_derived["down_jump_frac"] = ser
+        return ser
+
+    def _up_jump_frac_series(self) -> pd.Series | None:
+        cached = self._cached_derived.get("up_jump_frac")
+        if cached is not None:
+            return cached
+        ser = self._buffer.as_series("up_jump_fraction")
+        if ser.empty:
+            return None
+        self._cached_derived["up_jump_frac"] = ser
+        return ser
+
+    @staticmethod
+    def _series_lag(ser: pd.Series | None, n: int) -> float | None:
+        if ser is None or len(ser) <= n:
+            return None
+        v = ser.iloc[-1 - n]
         return None if not np.isfinite(v) else float(v)
+
+    @staticmethod
+    def _series_ema_at_last(ser: pd.Series | None, span: int) -> float | None:
+        if ser is None or ser.empty:
+            return None
+        v = ser.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    # ── tsrv_mean_1d generalised lag/EMA ────────────────────────────
+
+    def tsrv_mean_1d_lag(self, n: int) -> float | None:
+        return self._series_lag(self._tsrv_mean_1d_series(), n)
+
+    def tsrv_mean_1d_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._tsrv_mean_1d_series(), span)
+
+    # ── tsrv_mean_1w generalised lag/EMA ────────────────────────────
+
+    def tsrv_mean_1w_lag(self, n: int) -> float | None:
+        return self._series_lag(self._tsrv_mean_1w_series(), n)
+
+    def tsrv_mean_1w_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._tsrv_mean_1w_series(), span)
+
+    # ── tsrv_ffd generalised lag/EMA ────────────────────────────────
+
+    def tsrv_ffd_lag(self, n: int) -> float | None:
+        return self._series_lag(self._tsrv_ffd_series(), n)
+
+    def tsrv_ffd_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._tsrv_ffd_series(), span)
+
+    # ── up_jump_frac generalised lag/EMA ────────────────────────────
+
+    def up_jump_frac_lag(self, n: int) -> float | None:
+        return self._series_lag(self._up_jump_frac_series(), n)
+
+    def up_jump_frac_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._up_jump_frac_series(), span)
+
+    # ── down_jump_frac (raw + lag/EMA) ─────────────────────────────
+
+    def down_jump_frac(self) -> float | None:
+        ser = self._down_jump_frac_series()
+        if ser is None or ser.empty:
+            return None
+        v = ser.iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    def down_jump_frac_lag(self, n: int) -> float | None:
+        return self._series_lag(self._down_jump_frac_series(), n)
+
+    def down_jump_frac_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._down_jump_frac_series(), span)
+
+    # ── bpv_tsrv_ratio (raw + lag/EMA) ─────────────────────────────
+
+    def bpv_tsrv_ratio(self) -> float | None:
+        ser = self._bpv_tsrv_ratio_series()
+        if ser is None or ser.empty:
+            return None
+        v = ser.iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    def bpv_tsrv_ratio_lag(self, n: int) -> float | None:
+        return self._series_lag(self._bpv_tsrv_ratio_series(), n)
+
+    def bpv_tsrv_ratio_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._bpv_tsrv_ratio_series(), span)
+
+    # ── noise_level (raw + lag/EMA) ────────────────────────────────
+
+    def noise_level(self) -> float | None:
+        ser = self._noise_level_series()
+        if ser is None or ser.empty:
+            return None
+        v = ser.iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    def noise_level_lag(self, n: int) -> float | None:
+        return self._series_lag(self._noise_level_series(), n)
+
+    def noise_level_ema(self, span: int) -> float | None:
+        return self._series_ema_at_last(self._noise_level_series(), span)
 
 
 __all__ = ["TSRVFeatures"]

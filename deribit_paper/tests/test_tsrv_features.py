@@ -110,8 +110,11 @@ def test_prewarm_from_parquet_loads_synthetic(tmp_path):
     df = pd.DataFrame({
         "vol_ann": np.linspace(0.5, 0.6, 5),
         "up_jump_fraction": np.linspace(0.01, 0.05, 5),
+        "down_jump_fraction": np.linspace(0.005, 0.02, 5),
         "bpv": np.linspace(0.04, 0.06, 5),
         "rv_slow": np.linspace(0.05, 0.07, 5),
+        "rv_fast": np.linspace(0.03, 0.05, 5),
+        "n_ticks": np.arange(5, dtype=np.int64) + 100,
         "extra": np.zeros(5),  # ignored
     }, index=idx)
     p = tmp_path / "tsrv.parquet"
@@ -122,6 +125,9 @@ def test_prewarm_from_parquet_loads_synthetic(tmp_path):
     assert len(buf) == 5
     last = buf.latest()
     assert last.vol_ann == pytest.approx(0.6)
+    assert last.n_ticks == 104
+    assert last.rv_fast == pytest.approx(0.05)
+    assert last.down_jump_fraction == pytest.approx(0.02)
 
 
 def test_prewarm_missing_file_returns_zero(tmp_path):
@@ -149,8 +155,11 @@ def test_prewarm_respects_max_size():
     df = pd.DataFrame({
         "vol_ann": np.arange(20, dtype=np.float64),
         "up_jump_fraction": np.zeros(20),
+        "down_jump_fraction": np.zeros(20),
         "bpv": np.zeros(20),
         "rv_slow": np.zeros(20),
+        "rv_fast": np.zeros(20),
+        "n_ticks": np.zeros(20, dtype=np.int64),
     }, index=idx)
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:

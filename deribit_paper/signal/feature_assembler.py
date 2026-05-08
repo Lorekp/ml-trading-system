@@ -581,6 +581,178 @@ def _make_tsrv_handler(
     return _handler
 
 
+# ── S-1c (parity-r3 cycle 6 — 2026-05-08): variant-specific factories ──
+# parkinson_1d_{lag1, lag3, ema10}: read the ROLLING-mean series (window
+# = bpd) per the F-2/F-3 contract. The wrapper's ``parkinson_1d_lag``
+# / ``parkinson_1d_ema`` accept a ``rolling_window`` kwarg that we
+# bind to the live-resolved bpd value at handler-call time.
+
+def _make_parkinson_1d_lag_handler(n: int) -> Callable[[AssemblerContext], float]:
+    name = f"parkinson_1d_lag{n}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            bpd = feats.bars_per_day()
+            v = feats.parkinson_1d_lag(n, rolling_window=bpd)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_parkinson_1d_ema_handler(span: int) -> Callable[[AssemblerContext], float]:
+    name = f"parkinson_1d_ema{span}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            bpd = feats.bars_per_day()
+            v = feats.parkinson_1d_ema(span, rolling_window=bpd)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+# ── S-1c: hurst_100 / ffd_rv / rv_zscore variant factories ──
+
+def _make_hurst_lag_handler(n: int) -> Callable[[AssemblerContext], float]:
+    name = f"hurst_100_lag{n}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = feats.hurst_100_lag(n)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_hurst_ema_handler(span: int) -> Callable[[AssemblerContext], float]:
+    name = f"hurst_100_ema{span}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = feats.hurst_100_ema(span)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_ffd_rv_lag_handler(n: int) -> Callable[[AssemblerContext], float]:
+    name = f"ffd_rv_lag{n}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = feats.ffd_rv_lag(n)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_ffd_rv_ema_handler(span: int) -> Callable[[AssemblerContext], float]:
+    name = f"ffd_rv_ema{span}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = feats.ffd_rv_ema(span)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_rv_zscore_lag_handler(
+    horizon: str, n: int,
+) -> Callable[[AssemblerContext], float]:
+    name = f"rv_zscore_{horizon}_lag{n}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = feats.rv_zscore_lag(horizon, n)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+def _make_rv_zscore_ema_handler(
+    horizon: str, span: int,
+) -> Callable[[AssemblerContext], float]:
+    name = f"rv_zscore_{horizon}_ema{span}"
+    def _handler(ctx: AssemblerContext) -> float:
+        feats = ctx.dollar_bar_features
+        if feats is None:
+            return _baseline_or_nan(ctx, name)
+        try:
+            v = feats.rv_zscore_ema(horizon, span)
+        except (KeyError, ValueError, TypeError):
+            return _baseline_or_nan(ctx, name)
+        if v is None or not np.isfinite(v):
+            return _baseline_or_nan(ctx, name)
+        return float(v)
+    _handler.__name__ = f"_h_{name}"
+    return _handler
+
+
+# ── S-1c: down_jump_frac alias (column-name fix) ──
+# The 101-feature TransVol input column is ``down_jump_frac`` (no
+# "ion" suffix). Pre-cycle-6 the registry only had
+# ``down_jump_fraction`` → ``_h_down_jump_fraction`` so the ``frac``
+# column resolved to baseline-fallback. The alias closes that gap.
+# Prefers TSRVFeatures.down_jump_frac() (last value in the buffer)
+# over the current bar's BarTSRV — they are identical at decision time
+# but the buffer-driven path ensures consistency with the bar-grid
+# lag/EMA variants below.
+
+def _h_down_jump_frac(ctx: AssemblerContext) -> float:
+    feats = ctx.tsrv_features
+    if feats is not None:
+        v = feats.down_jump_frac()
+        if v is not None and np.isfinite(v):
+            return float(v)
+    # Buffer-less path (tests / cold start): use BarTSRV directly.
+    if ctx.bar_tsrv is not None:
+        return float(ctx.bar_tsrv.down_jump_fraction)
+    return _baseline_or_nan(ctx, "down_jump_frac")
+
+
 # Registry: feature name → handler.  Adding a new live-computable
 # feature is one line here, not a tuple edit + imperative loop edit.
 _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
@@ -657,13 +829,79 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "time_to_funding_ema10": _h_time_to_funding_ema10,
     "time_to_funding_ema50": _h_time_to_funding_ema50,
     # S-1b (parity-r3 cycle 5 — 2026-05-08): TransVol-input bases that
-    # were previously baseline-fallback. Lag/EMA variants follow in
-    # S-1c (require dedicated per-bar series caching).
+    # were previously baseline-fallback. Lag/EMA variants are S-1c.
     "hurst_100":             _h_hurst_100,
     "ffd_rv":                _h_ffd_rv,
     "rv_zscore_1d":          _make_rv_zscore_handler("1d"),
     "rv_zscore_1w":          _make_rv_zscore_handler("1w"),
     "rv_zscore_1m":          _make_rv_zscore_handler("1m"),
+    # ── S-1c (parity-r3 cycle 6 — 2026-05-08): full 101-feature live ──
+    # 38 variant handlers + 3 new bases (down_jump_frac, noise_level
+    # need handlers; funding_basis is wired in Phase 2). Closes the
+    # baseline-fallback gap for every TransVol input column.
+    # parkinson_1d variants (raw + ema50 already wired earlier in dict).
+    "parkinson_1d_lag1":     _make_parkinson_1d_lag_handler(1),
+    "parkinson_1d_lag3":     _make_parkinson_1d_lag_handler(3),
+    "parkinson_1d_ema10":    _make_parkinson_1d_ema_handler(10),
+    # hurst_100 variants.
+    "hurst_100_lag1":        _make_hurst_lag_handler(1),
+    "hurst_100_lag3":        _make_hurst_lag_handler(3),
+    "hurst_100_ema10":       _make_hurst_ema_handler(10),
+    "hurst_100_ema50":       _make_hurst_ema_handler(50),
+    # ffd_rv variants.
+    "ffd_rv_lag1":           _make_ffd_rv_lag_handler(1),
+    "ffd_rv_lag3":           _make_ffd_rv_lag_handler(3),
+    "ffd_rv_ema10":          _make_ffd_rv_ema_handler(10),
+    "ffd_rv_ema50":          _make_ffd_rv_ema_handler(50),
+    # rv_zscore variants (3 horizons × 4 windows = 12 entries).
+    "rv_zscore_1d_lag1":     _make_rv_zscore_lag_handler("1d", 1),
+    "rv_zscore_1d_lag3":     _make_rv_zscore_lag_handler("1d", 3),
+    "rv_zscore_1d_ema10":    _make_rv_zscore_ema_handler("1d", 10),
+    "rv_zscore_1d_ema50":    _make_rv_zscore_ema_handler("1d", 50),
+    "rv_zscore_1w_lag1":     _make_rv_zscore_lag_handler("1w", 1),
+    "rv_zscore_1w_lag3":     _make_rv_zscore_lag_handler("1w", 3),
+    "rv_zscore_1w_ema10":    _make_rv_zscore_ema_handler("1w", 10),
+    "rv_zscore_1w_ema50":    _make_rv_zscore_ema_handler("1w", 50),
+    "rv_zscore_1m_lag1":     _make_rv_zscore_lag_handler("1m", 1),
+    "rv_zscore_1m_lag3":     _make_rv_zscore_lag_handler("1m", 3),
+    "rv_zscore_1m_ema10":    _make_rv_zscore_ema_handler("1m", 10),
+    "rv_zscore_1m_ema50":    _make_rv_zscore_ema_handler("1m", 50),
+    # tsrv_mean_1d / 1w / tsrv_ffd missing variants (raw + lag3 + ema50
+    # for tsrv_mean_1d already wired earlier; raw for tsrv_mean_1w +
+    # tsrv_ffd via _make_tsrv_handler above).
+    "tsrv_mean_1d_lag1":     _make_tsrv_handler("tsrv_mean_1d_lag1", "tsrv_mean_1d_lag", 1),
+    "tsrv_mean_1d_ema10":    _make_tsrv_handler("tsrv_mean_1d_ema10", "tsrv_mean_1d_ema", 10),
+    "tsrv_mean_1w_lag1":     _make_tsrv_handler("tsrv_mean_1w_lag1", "tsrv_mean_1w_lag", 1),
+    "tsrv_mean_1w_lag3":     _make_tsrv_handler("tsrv_mean_1w_lag3", "tsrv_mean_1w_lag", 3),
+    "tsrv_mean_1w_ema10":    _make_tsrv_handler("tsrv_mean_1w_ema10", "tsrv_mean_1w_ema", 10),
+    "tsrv_mean_1w_ema50":    _make_tsrv_handler("tsrv_mean_1w_ema50", "tsrv_mean_1w_ema", 50),
+    "tsrv_ffd_lag1":         _make_tsrv_handler("tsrv_ffd_lag1", "tsrv_ffd_lag", 1),
+    "tsrv_ffd_lag3":         _make_tsrv_handler("tsrv_ffd_lag3", "tsrv_ffd_lag", 3),
+    "tsrv_ffd_ema10":        _make_tsrv_handler("tsrv_ffd_ema10", "tsrv_ffd_ema", 10),
+    "tsrv_ffd_ema50":        _make_tsrv_handler("tsrv_ffd_ema50", "tsrv_ffd_ema", 50),
+    # up_jump_frac variants — raw at _h_up_jump_frac, ema50 via earlier
+    # _make_tsrv_handler. Add lag1 / lag3 / ema10.
+    "up_jump_frac_lag1":     _make_tsrv_handler("up_jump_frac_lag1", "up_jump_frac_lag", 1),
+    "up_jump_frac_lag3":     _make_tsrv_handler("up_jump_frac_lag3", "up_jump_frac_lag", 3),
+    "up_jump_frac_ema10":    _make_tsrv_handler("up_jump_frac_ema10", "up_jump_frac_ema", 10),
+    # bpv_tsrv_ratio: raw + 4 variants (ema50 already wired earlier).
+    "bpv_tsrv_ratio":        _make_tsrv_handler("bpv_tsrv_ratio", "bpv_tsrv_ratio"),
+    "bpv_tsrv_ratio_lag1":   _make_tsrv_handler("bpv_tsrv_ratio_lag1", "bpv_tsrv_ratio_lag", 1),
+    "bpv_tsrv_ratio_lag3":   _make_tsrv_handler("bpv_tsrv_ratio_lag3", "bpv_tsrv_ratio_lag", 3),
+    "bpv_tsrv_ratio_ema10":  _make_tsrv_handler("bpv_tsrv_ratio_ema10", "bpv_tsrv_ratio_ema", 10),
+    # down_jump_frac: alias fix (offline column) + 4 variants.
+    "down_jump_frac":        _h_down_jump_frac,
+    "down_jump_frac_lag1":   _make_tsrv_handler("down_jump_frac_lag1", "down_jump_frac_lag", 1),
+    "down_jump_frac_lag3":   _make_tsrv_handler("down_jump_frac_lag3", "down_jump_frac_lag", 3),
+    "down_jump_frac_ema10":  _make_tsrv_handler("down_jump_frac_ema10", "down_jump_frac_ema", 10),
+    "down_jump_frac_ema50":  _make_tsrv_handler("down_jump_frac_ema50", "down_jump_frac_ema", 50),
+    # noise_level: raw + 4 variants (5 features; needed schema extension
+    # in Phase 1a so TSRVHistoryRow now persists rv_fast + n_ticks).
+    "noise_level":           _make_tsrv_handler("noise_level", "noise_level"),
+    "noise_level_lag1":      _make_tsrv_handler("noise_level_lag1", "noise_level_lag", 1),
+    "noise_level_lag3":      _make_tsrv_handler("noise_level_lag3", "noise_level_lag", 3),
+    "noise_level_ema10":     _make_tsrv_handler("noise_level_ema10", "noise_level_ema", 10),
+    "noise_level_ema50":     _make_tsrv_handler("noise_level_ema50", "noise_level_ema", 50),
 }
 
 

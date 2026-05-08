@@ -159,6 +159,13 @@ class DollarBarFeatures:
         # window so different callers (handler with window=250 today,
         # F-3's bpd-driven future) don't recompute.
         self._cached_parkinson_rolling: dict[int, np.ndarray] = {}
+        # S-1c (parity-r3 cycle 6 — 2026-05-08): cache for derived
+        # bar-grid SERIES used by lag/EMA variants of hurst_100, ffd_rv,
+        # and rv_zscore_{1d,1w,1m}. Keyed on ``(name, params...)``;
+        # invalidated together with ``_cached_df`` on every buffer
+        # length change. Each entry is a numpy array aligned 1:1 with
+        # the buffer's bars (NaN-padded prefix for warmup positions).
+        self._cached_derived: dict[tuple, np.ndarray] = {}
 
     # ── cache management ─────────────────────────────────────────────
 
@@ -172,6 +179,7 @@ class DollarBarFeatures:
         self._cached_vpin = None
         self._cached_parkinson_bar = None
         self._cached_parkinson_rolling.clear()
+        self._cached_derived.clear()
 
     def _df(self) -> pd.DataFrame:
         self._refresh()
@@ -460,6 +468,184 @@ class DollarBarFeatures:
         denom = sigma.clip(lower=1e-15)
         z = (rv_roll - mu) / denom
         v = z.iloc[-1]
+        return None if not np.isfinite(v) else float(v)
+
+    # ── S-1c (parity-r3 cycle 6): derived-series + lag/EMA variants ──
+    # The 4 windowed variants (lag1, lag3, ema10, ema50) of hurst_100,
+    # ffd_rv, and rv_zscore_{1d,1w,1m} need to be computed against the
+    # FULL bar-grid series (offline ``_window_and_aggregate`` evaluates
+    # ``shift(lag).iloc[-1]`` and ``ewm(span).mean().iloc[-1]`` over the
+    # complete pre-aggregation column). We compute the trailing series
+    # once per bar advance, cache, and have lag/ema methods read from it.
+
+    def _hurst_series(self, *, window: int = 100) -> np.ndarray | None:
+        """Per-bar Hurst series aligned 1:1 with ``self._df()``.
+
+        Each entry is the Hurst computed via ``_hurst_subsampled_window``
+        on ``log_return.iloc[i-window:i]`` for that bar's position; NaN
+        for positions where the trailing slice is too short / degenerate.
+        """
+        key = ("hurst_series", int(window))
+        cached = self._cached_derived.get(key)
+        if cached is not None:
+            return cached
+        df = self._df()
+        if df is None or "log_return" not in df.columns:
+            return None
+        log_ret = df["log_return"].to_numpy(dtype=np.float64)
+        n = len(log_ret)
+        out = np.full(n, np.nan, dtype=np.float64)
+        for i in range(window, n + 1):
+            v = _hurst_subsampled_window(log_ret[:i], window=window)
+            if v is not None:
+                out[i - 1] = v
+        self._cached_derived[key] = out
+        return out
+
+    def hurst_100_lag(self, n: int, *, window: int = 100) -> float | None:
+        """``hurst_100.shift(n).iloc[-1]`` — value n bars before latest."""
+        if n < 1:
+            raise ValueError(f"lag n must be >= 1, got {n}")
+        arr = self._hurst_series(window=window)
+        if arr is None or len(arr) <= n:
+            return None
+        v = arr[-1 - n]
+        return None if not np.isfinite(v) else float(v)
+
+    def hurst_100_ema(self, span: int, *, window: int = 100) -> float | None:
+        """``hurst_100.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]``."""
+        if span <= 0:
+            raise ValueError(f"span must be positive, got {span}")
+        arr = self._hurst_series(window=window)
+        if arr is None or len(arr) == 0:
+            return None
+        ema_val = pd.Series(arr).ewm(
+            span=span, adjust=True, min_periods=1,
+        ).mean().iloc[-1]
+        return None if not np.isfinite(ema_val) else float(ema_val)
+
+    def _ffd_rv_series(
+        self, *, d: float = 0.4, threshold: float = 1e-5,
+    ) -> np.ndarray | None:
+        """Per-bar FFD series aligned 1:1 with ``self._df()``.
+
+        Offline does ``np.convolve(values, get_weights_ffd[::-1])`` where
+        ``get_weights_ffd`` returns weights in REVERSED chronological
+        order (oldest weight at the END), so ``get_weights_ffd[::-1]``
+        is the chronological-ordered vector. Live's ``_ffd_weights``
+        already stores chronological — so the convolution argument is
+        ``weights`` directly, NOT ``weights[::-1]``.
+        """
+        key = ("ffd_rv_series", float(d), float(threshold))
+        cached = self._cached_derived.get(key)
+        if cached is not None:
+            return cached
+        df = self._df()
+        if df is None or "close" not in df.columns:
+            return None
+        weights = _ffd_weights(d=d, threshold=threshold)  # chronological
+        n_w = len(weights)
+        log_close = np.log(df["close"].to_numpy(dtype=np.float64))
+        n = len(log_close)
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n >= n_w:
+            # Equivalent to offline's np.convolve(values,
+            # get_weights_ffd[::-1]) since live's weights are already
+            # chronological. Aligns to indices [n_w-1 .. n-1].
+            conv = np.convolve(log_close, weights, mode="valid")
+            out[n_w - 1:] = conv
+        self._cached_derived[key] = out
+        return out
+
+    def ffd_rv_lag(
+        self, n: int, *, d: float = 0.4, threshold: float = 1e-5,
+    ) -> float | None:
+        if n < 1:
+            raise ValueError(f"lag n must be >= 1, got {n}")
+        arr = self._ffd_rv_series(d=d, threshold=threshold)
+        if arr is None or len(arr) <= n:
+            return None
+        v = arr[-1 - n]
+        return None if not np.isfinite(v) else float(v)
+
+    def ffd_rv_ema(
+        self, span: int, *, d: float = 0.4, threshold: float = 1e-5,
+    ) -> float | None:
+        if span <= 0:
+            raise ValueError(f"span must be positive, got {span}")
+        arr = self._ffd_rv_series(d=d, threshold=threshold)
+        if arr is None or len(arr) == 0:
+            return None
+        ema_val = pd.Series(arr).ewm(
+            span=span, adjust=True, min_periods=1,
+        ).mean().iloc[-1]
+        return None if not np.isfinite(ema_val) else float(ema_val)
+
+    def _rv_zscore_series(
+        self, horizon: str, *, bpd: int | None = None,
+    ) -> np.ndarray | None:
+        """Per-bar rv_zscore series aligned 1:1 with ``self._df()``.
+
+        Vectorised pandas rolling chain — one shot for the full series.
+        """
+        if horizon not in ("1d", "1w", "1m"):
+            raise ValueError(f"horizon must be 1d/1w/1m, got {horizon!r}")
+        if bpd is None:
+            bpd = self.bars_per_day(trailing_days=30)
+        key = ("rv_zscore_series", horizon, int(bpd))
+        cached = self._cached_derived.get(key)
+        if cached is not None:
+            return cached
+        rv_bar = self._rv_bar_series()
+        if rv_bar is None or len(rv_bar) == 0:
+            return None
+        mult, cap = {"1d": (1, 50_000), "1w": (7, 50_000), "1m": (30, 200_000)}[horizon]
+        w = min(max(bpd * mult, 10), cap)
+        mp = max(w // 4, 10)
+        ser = pd.Series(rv_bar)
+        rv_roll = ser.rolling(w, min_periods=mp).sum()
+        mu = rv_roll.rolling(w, min_periods=mp).mean()
+        sigma = rv_roll.rolling(w, min_periods=mp).std()
+        denom = sigma.clip(lower=1e-15)
+        z = (rv_roll - mu) / denom
+        out = z.to_numpy(dtype=np.float64)
+        self._cached_derived[key] = out
+        return out
+
+    def rv_zscore_lag(
+        self, horizon: str, n: int, *, bpd: int | None = None,
+    ) -> float | None:
+        if n < 1:
+            raise ValueError(f"lag n must be >= 1, got {n}")
+        arr = self._rv_zscore_series(horizon, bpd=bpd)
+        if arr is None or len(arr) <= n:
+            return None
+        v = arr[-1 - n]
+        return None if not np.isfinite(v) else float(v)
+
+    def rv_zscore_ema(
+        self, horizon: str, span: int, *, bpd: int | None = None,
+    ) -> float | None:
+        if span <= 0:
+            raise ValueError(f"span must be positive, got {span}")
+        arr = self._rv_zscore_series(horizon, bpd=bpd)
+        if arr is None or len(arr) == 0:
+            return None
+        ema_val = pd.Series(arr).ewm(
+            span=span, adjust=True, min_periods=1,
+        ).mean().iloc[-1]
+        return None if not np.isfinite(ema_val) else float(ema_val)
+
+    def parkinson_1d_lag(
+        self, n: int, *, rolling_window: int = 250,
+    ) -> float | None:
+        """``parkinson_1d.shift(n).iloc[-1]`` over the rolling-mean series."""
+        if n < 1:
+            raise ValueError(f"lag n must be >= 1, got {n}")
+        arr = self._parkinson_1d_rolling_series(rolling_window)
+        if arr is None or len(arr) <= n:
+            return None
+        v = arr[-1 - n]
         return None if not np.isfinite(v) else float(v)
 
     def parkinson_1d_ema(

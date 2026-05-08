@@ -406,9 +406,13 @@ class LiveDRLHedger:
 
         t.tick += 1
 
-        # Compute the tau at this tick
+        # Compute the tau at this tick. D-13 (parity-r3 cycle 8 —
+        # 2026-05-08): use the shared ``derive_dt_years`` helper so
+        # cfg / env / live converge on the same formula. Pre-cycle-8
+        # the formula was duplicated inline.
         if dt_years is None:
-            dt_years = (self._bar_minutes / 60.0 / 24.0 / 365.25) / self._n_steps
+            from vol_arb.drl_hedging.config import derive_dt_years
+            dt_years = derive_dt_years(self._bar_minutes, self._n_steps)
         tau_t = max(t.tau_entry - t.tick * dt_years, 1e-10)
 
         # IV from frozen SVI slice (or fall back to entry iv)

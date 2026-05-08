@@ -717,8 +717,20 @@ class StraddleFlow:
         # ``bar_minutes == holding_minutes`` here (the StraddleFlow
         # constructor passes ``bar_minutes=self._holding_minutes`` to
         # the PerpHedger above, so for V2 this is bar-aligned).
+        # E-9 (parity-r3 cycle 8 — 2026-05-08): anchor the holding-
+        # period target to the SIGNAL's bar timestamp, not the
+        # post-fill ``started_at``. The latter floats with broker
+        # latency (entry-fill latency, IOC tier sleeps, etc.); the
+        # offline backtester models the exit at exactly bar T+1's
+        # boundary regardless of fill time. Falls back to
+        # ``started_at`` when the signal lacks a usable timestamp.
         holding_seconds = self._holding_minutes * 60.0
-        target_exit = started_at + pd.Timedelta(seconds=holding_seconds)
+        anchor = (
+            signal.timestamp
+            if signal.timestamp is not None
+            else started_at
+        )
+        target_exit = anchor + pd.Timedelta(seconds=holding_seconds)
         # Round UP to the next bar boundary. ``bar_seconds == 0`` (test
         # configurations with holding_minutes=0) skips the alignment.
         bar_seconds = int(self._holding_minutes * 60)

@@ -134,11 +134,11 @@ def test_shipped_sidecar_has_expected_schema():
     assert df.index.tz is not None
     assert df["n_trades"].dtype == np.int64
     # S-1d (parity-r3 cycle 7 — 2026-05-08): cache extended from
-    # ~300 bars (~1.6h) to 600000 bars (~35 days). 30+ days is
-    # required so the trailing-30-day ``bpd`` estimate (offline
-    # ``avg_bars_per_day``) matches offline byte-equivalent — needed
-    # for tsrv_mean_1d/1w byte-equal closure of C1.
-    assert 500_000 <= len(df) <= 1_000_000
+    # ~300 bars to 60000 bars (~3.8 days at $500K threshold).
+    # ~5.5 MB committed; the parity gate test loads ~600k from
+    # vol_model/output/BTCUSDT_bar_series.parquet directly when
+    # the trailing-30-day bpd window is needed.
+    assert 50_000 <= len(df) <= 100_000
 
 
 def test_shipped_sidecar_loads_into_buffer():

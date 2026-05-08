@@ -182,6 +182,21 @@ class TradingEngine:
     def __init__(self, config: PaperConfig):
         self.config = config
         self.config.ensure_dirs()
+        # S-7 (parity-r3 cycle 8 — 2026-05-08): defence-in-depth
+        # check that V2-preset configs haven't been silently mutated
+        # away from the canonical V2 invariants
+        # (``with_v2_preset()``'s expected output). Logs WARNINGs;
+        # does not refuse to start (operators may legitimately tweak
+        # individual knobs while keeping config_preset="v2" for the
+        # rest of the V2 stack).
+        for mismatch in config.validate_preset_invariants():
+            logger.warning(
+                "V2 preset invariant mismatch: %s — defence-in-depth "
+                "warning per round-3 audit S-7. Reconstruct the config "
+                "via ``PaperConfig.with_v2_preset()`` if this drift was "
+                "unintentional.",
+                mismatch,
+            )
 
         # Service handles — populated by :meth:`initialize`
         self.auth: DeribitAuth | None = None

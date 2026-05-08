@@ -45,8 +45,12 @@ def _make_signal(direction: int = -1) -> Signal:
         n_ticks=100, n_sub_bars=10, n_dash=9.0,
         vol_ann=0.8, vol_ann_continuous=0.8,
     )
+    # E-9 (parity-r3 cycle 8 — 2026-05-08): signal.timestamp now anchors
+    # the holding-period target_exit. Use ``now()`` so the
+    # ``target_exit - now()`` sleep is positive in tests that exercise
+    # the cancellation path.
     return Signal(
-        timestamp=pd.Timestamp("2026-04-10 12:00:00", tz="UTC"),
+        timestamp=pd.Timestamp.now(tz="UTC"),
         direction=direction,
         edge_vol_pts=-1.5 if direction == -1 else 1.5,
         rv_pred_pct=73.0,

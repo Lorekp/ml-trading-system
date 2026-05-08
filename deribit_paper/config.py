@@ -523,6 +523,13 @@ class PaperConfig:
         # so dynamic_btc_cap is the only ceiling. The cap is still
         # honoured under non-V2 presets where the field stays at 2.0.
         cfg.max_single_trade_btc = 0.0
+        # R-7 (parity-r3 cycle 8 — 2026-05-08): V2 backtester has no
+        # per-trade BTC min-lot floor either (the exchange's own 0.1
+        # BTC option minimum is the binding constraint at fill time).
+        # Disable the live floor symmetrically with D10's max-side
+        # disable. The V2 risk-limit's ``min_single_trade_btc <= 0``
+        # check skips the floor when this field is set to 0.0.
+        cfg.min_single_trade_btc = 0.0
         # D6 (parity 2026-05-07): no RND monitor in V2 backtester. Stays
         # False under the V2 preset; opt-in for non-V2 live deployments
         # via ``cfg.use_rnd_scaling = True``.
@@ -554,6 +561,47 @@ class PaperConfig:
         """Create state and logs directories if they don't exist."""
         for path in (self.state_dir, self.logs_dir):
             Path(path).mkdir(parents=True, exist_ok=True)
+
+    def validate_preset_invariants(self) -> list[str]:
+        """S-7 (parity-r3 cycle 8 — 2026-05-08): defence-in-depth
+        check that V2-preset config fields match the canonical V2
+        invariants.
+
+        Pre-fix the V2 preset method ``with_v2_preset()`` was the
+        single source of truth, but a CLI / user constructing a
+        ``PaperConfig`` and manually setting ``config_preset="v2"``
+        without flipping the threshold knobs would silently run
+        with V1 thresholds. ``test_config_v2_parity.py`` locks the
+        expected output of ``with_v2_preset()``, but doesn't catch
+        downstream mutation.
+
+        Returns a list of human-readable mismatch strings (empty
+        when all invariants hold). Engine startup logs WARNINGs for
+        each mismatch.
+        """
+        if self.config_preset != "v2":
+            return []
+        mismatches: list[str] = []
+        v2_invariants: list[tuple[str, object]] = [
+            ("entry_threshold", 22.0),
+            ("entry_threshold_long", 12.0),
+            ("skip_long_if_term_slope_gt", 0.0),
+            ("skip_long_hours_utc", (14, 15, 16)),
+            ("dte_min_days", 5),
+            ("target_margin_utilization", 0.15),
+            ("use_profit_scaling", True),
+            ("max_single_trade_btc", 0.0),
+            ("min_single_trade_btc", 0.0),
+            ("base_spread_iv", 2.0),
+        ]
+        for name, expected in v2_invariants:
+            actual = getattr(self, name, None)
+            if actual != expected:
+                mismatches.append(
+                    f"{name}: expected {expected!r} (V2 canon) "
+                    f"but got {actual!r}"
+                )
+        return mismatches
 
     def switch_to_prod(self, *, paper_mode: bool = False) -> None:
         """Flip the venue URLs to production Deribit.

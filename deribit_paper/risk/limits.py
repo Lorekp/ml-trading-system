@@ -131,7 +131,16 @@ class RiskLimits:
             )
 
         # 2. Trade size bounds
-        if proposed_n_contracts_btc < self.min_single_trade_btc:
+        # R-7 (parity-r3 cycle 8 — 2026-05-08): ``min_single_trade_btc
+        # <= 0`` disables the floor, mirroring D10's max-side disable
+        # (``max_single_trade_btc <= 0`` semantic). V2 preset sets
+        # this to 0.0 because the backtester has no per-trade min-
+        # lot floor; the exchange's own 0.1-BTC option minimum is
+        # the binding constraint either way.
+        if (
+            self.min_single_trade_btc > 0.0
+            and proposed_n_contracts_btc < self.min_single_trade_btc
+        ):
             return RiskCheck(
                 False,
                 f"trade_size {proposed_n_contracts_btc:.3f} < min {self.min_single_trade_btc:.3f}",

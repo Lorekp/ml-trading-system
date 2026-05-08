@@ -15,6 +15,26 @@ from dataclasses import dataclass, field
 LAMBDA_REWARD_VAR: float = 0.0
 
 
+def derive_dt_years(bar_minutes: float, n_steps: int) -> float:
+    """D-13 (parity-r3 cycle 8 — 2026-05-08): single source of truth
+    for ``dt_years = (bar_minutes / 60 / 24 / 365.25) / n_steps``.
+
+    Pre-cycle-8 the formula was duplicated in:
+    - ``DRLHedgingConfig.__post_init__`` (cfg-construction time)
+    - ``LiveDRLHedger.step`` (intra-bar fallback when ``dt_years``
+      isn't passed)
+
+    The env reads from ``cfg.dt_years`` directly. The 3-way fanout
+    risked silent drift if any caller forgot to update one of the
+    sites. Centralising here so all three paths converge.
+    """
+    if bar_minutes <= 0:
+        raise ValueError(f"bar_minutes must be positive, got {bar_minutes}")
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be positive, got {n_steps}")
+    return (bar_minutes / 60.0 / 24.0 / 365.25) / n_steps
+
+
 @dataclass
 class DRLHedgingConfig:
     """All knobs for the DRL hedging env + SAC trainer.
@@ -177,9 +197,9 @@ class DRLHedgingConfig:
 
     def __post_init__(self) -> None:
         if self.dt_years < 0:
-            self.dt_years = (
-                self.bar_minutes / 60.0 / 24.0 / 365.25
-            ) / self.n_steps_per_episode
+            self.dt_years = derive_dt_years(
+                self.bar_minutes, self.n_steps_per_episode,
+            )
         # Resolve per-asset artifact paths. Import here to avoid a circular
         # dependency at module import time (vol_arb.paths → no heavy deps,
         # but keep it local for lazy cost).

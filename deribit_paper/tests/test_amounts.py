@@ -107,3 +107,54 @@ def test_side_from_signed_negative():
 def test_side_from_signed_zero_raises():
     with pytest.raises(ValueError, match="zero amount"):
         side_from_signed(0.0)
+
+
+# ─── O-7 (parity-r3 cycle 8 — 2026-05-08): bias characterisation ───
+# Round-3 audit O-7 flagged "perp $10-lot rounding accumulates one-
+# sided drift across hedge ticks". Empirically the rounding logic
+# (``round`` = banker's rounding) is unbiased on its own — the
+# drift comes from the ``min_usd=10`` floor: notionals < 10 USD
+# truncate to 0 (loss) but there's no symmetric gain because
+# negative notionals are stripped of sign. Tracked inventory_btc
+# in PerpHedger carries that residual to the next tick, so the
+# drift is bounded — these tests lock the bound.
+
+
+def test_perp_amount_increment_symmetric_around_midpoint():
+    """An exact half-increment (5 USD past a multiple of 10) should
+    round to the EVEN multiple per banker's rounding. Asserts ties
+    don't always round one direction."""
+    # 0.15 BTC × $100 = $15.0 → ties between 10 and 20; banker's → 20
+    # 0.25 BTC × $100 = $25.0 → ties between 20 and 30; banker's → 20
+    assert perp_amount_usd(0.15, 100.0) == pytest.approx(20.0)
+    assert perp_amount_usd(0.25, 100.0) == pytest.approx(20.0)
+    # The two values both round to 20 → no monotonic up/down bias
+    # at the tie midpoint.
+
+
+def test_perp_amount_rounding_bias_bounded_by_min_floor():
+    """Above the ``min_usd=10`` floor, rounding to the 10-USD
+    increment introduces sub-USD per-tick bias. The cumulative bias
+    over N ticks is bounded by ~min_usd × N / (input_range / min_usd)
+    in the worst case (uniform input on [10, 35]). This test locks
+    the bound at 5000 USD over 10k ticks (empirical: ~3700 USD).
+    Larger drifts indicate a regression in the rounding behaviour."""
+    import numpy as np
+    rng = np.random.default_rng(2026_05_08)
+    spot = 70_000.0
+    n_ticks = 10_000
+    bias_usd = 0.0
+    for _ in range(n_ticks):
+        btc_delta = rng.uniform(-0.0005, 0.0005)
+        exact_usd = abs(btc_delta) * spot
+        if exact_usd < 10.0:
+            continue
+        rounded_usd = perp_amount_usd(btc_delta, spot)
+        bias_usd += rounded_usd - exact_usd
+    # Lock the empirical bound at 5000 USD; PerpHedger.run carries
+    # the residual via tracked_inventory_btc (actual-fill-quantity
+    # accounting), so this drift does NOT compound across trades.
+    assert abs(bias_usd) < 5000.0, (
+        f"Per-tick rounding bias {bias_usd:.2f} USD over {n_ticks} "
+        f"ticks exceeds the documented bound (5000 USD) — regression."
+    )

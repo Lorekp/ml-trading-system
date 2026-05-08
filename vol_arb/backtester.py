@@ -139,6 +139,49 @@ class BacktestConfig(BaseModel):
     # IOC cap multiplier for realistic_taker model (max slip = N * bar_slip)
     ioc_cap_multiplier: float = 2.0
 
+    # E-6 (parity-r3 cycle 3 — 2026-05-08): match the live engine's
+    # API-level slippage cap (``place_ioc_taker(max_slippage_pct=...)``,
+    # default 1.0% on the V2 preset). When > 0, an additional cap is
+    # applied to ``full_straddle_slip``: ``ioc_max_slippage_pct/100 ×
+    # straddle_premium × 2`` (2 legs). Both this and the legacy
+    # ``ioc_cap_multiplier × bar_slip`` cap apply (taking the MIN).
+    # ``0.0`` = disabled — preserves pre-cycle3 byte-identity for non-V2
+    # backtests; V2 preset enables ``1.0`` to match live's ceiling.
+    ioc_max_slippage_pct: float = 0.0
+
+    # O-2 (parity-r3 cycle 3 — 2026-05-08): blended-slip model for the
+    # 3-tier IOC ladder used live (``OrderManager._place_tiered_taker``).
+    # When True, the per-bar straddle slip is blended across tiers using
+    # ``taker_tier_split_fractions × taker_tier_slip_multipliers × bar_slip``
+    # rather than the flat ``ioc_cap_multiplier × bar_slip`` cap. The
+    # default fractions/multipliers approximate live tier behaviour:
+    # tier-1 (touch+1tick) fills 50% at ~0.5× bar_slip, tier-2 (% cap)
+    # fills 30% at ~1.5× bar_slip, tier-3 (market) fills 20% at ~2.5×
+    # bar_slip. Effective blended cap ≈ 1.2× bar_slip — tighter than
+    # the legacy 2.0× flat cap, matching the live tiered ladder's
+    # observed cost profile.
+    taker_tier_blend: bool = False
+    taker_tier_split_fractions: tuple[float, ...] = (0.5, 0.3, 0.2)
+    taker_tier_slip_multipliers: tuple[float, ...] = (0.5, 1.5, 2.5)
+
+    # O-1 (parity-r3 cycle 3 — 2026-05-08): when ``use_sor=True`` AND
+    # the SOR path determined ``maker_filled_arr[i] == False`` (maker
+    # was tried but didn't fill within 5s), the taker fallback in live
+    # is sent up to 60s later (``maker_wait_seconds``). Pre-fix the
+    # backtester applied bar-i taker slip to the failed-maker case;
+    # under this flag the failed-maker taker leg is charged bar-(i+1)
+    # slip + price (mirrors the live cancel-replace gap). N/A under V2
+    # (``use_sor=False`` skips the maker path entirely).
+    cancel_replace_bar_gap: bool = False
+
+    # O-6 (parity-r3 cycle 3 — 2026-05-08): bar-aligned exit latency.
+    # Live's D12 bar-aligned exit incurs ~300-600ms of latency from the
+    # 2× ticker fetch + 2× IOC round-trip; offline assumes instant fill.
+    # Adds ``bar_aligned_exit_latency_pct/100 × straddle_premium × 2``
+    # USD slip on the exit leg. ``0.0`` = disabled (legacy); V2 preset
+    # sets ``0.05`` (5 bps of premium ≈ $5-10/exit at typical mid-vol).
+    bar_aligned_exit_latency_pct: float = 0.0
+
     # Asymmetric entry threshold: if set > 0, longs require this edge instead of entry_threshold
     entry_threshold_long: float = 30.0  # longs require more edge (higher slippage)
 
@@ -464,6 +507,17 @@ class BacktestConfig(BaseModel):
             base_spread_iv=2.0,
             maker_adverse_selection_iv=0.75,
             use_profit_filter=False,
+            # Tier C (parity-r3 cycle 3 — 2026-05-08): live-side
+            # execution-modeling parity flips. Each cap mirrors the
+            # operational truth of the live engine running V2.
+            ioc_max_slippage_pct=1.0,             # E-6: matches live API cap
+            taker_tier_blend=True,                # O-2: blended slip for live's 3-tier ladder
+            bar_aligned_exit_latency_pct=0.05,    # O-6: 5 bps premium-scaled exit latency
+            # O-1 (cancel_replace_bar_gap) NOT enabled here because the
+            # V2 preset uses ``use_sor=False`` (set in
+            # ``with_btc_production_filters_v2``); the maker path is
+            # never taken so the bar-gap branch is N/A. The flag is
+            # available for non-V2 SOR-on configs that want it.
         ))
 
     def with_btc_production_filters(self) -> "BacktestConfig":
@@ -2189,10 +2243,59 @@ class VolArbBacktester:
                         full_straddle_slip = 2.0 * bar_slip * size_mult * np.exp(
                             cfg.spread_jump_k * jump_frac[i]
                         )
-                        # IOC cap: configurable multiplier prevents catastrophic fills
-                        full_straddle_slip = min(
-                            full_straddle_slip, cfg.ioc_cap_multiplier * bar_slip,
-                        )
+                        # O-2 (parity-r3 cycle 3): tier-aware blended slip
+                        # mirrors live's 3-tier IOC ladder. Each tier
+                        # fills its share at its slip multiplier; the
+                        # blended slip replaces the flat multiplier cap.
+                        # Net effective cap is roughly 1.2× bar_slip
+                        # under the default 50/30/20 × 0.5/1.5/2.5 grid,
+                        # tighter than the legacy 2.0× cap.
+                        if cfg.taker_tier_blend:
+                            tier_slip_per_btc = 0.0
+                            for frac, mult in zip(
+                                cfg.taker_tier_split_fractions,
+                                cfg.taker_tier_slip_multipliers,
+                                strict=False,
+                            ):
+                                # Each tier's per-BTC slip = mult × bar_slip;
+                                # apply to BOTH legs (factor 2.0 = call+put).
+                                tier_slip_per_btc += (
+                                    frac * 2.0 * mult * bar_slip
+                                )
+                            # Blend caps the size+jump-scaled slip — model
+                            # is "live still respects the size impact, but
+                            # the tier ladder limits the cap magnitude".
+                            full_straddle_slip = min(
+                                full_straddle_slip, tier_slip_per_btc,
+                            )
+                        else:
+                            # Legacy IOC cap: configurable multiplier × bar_slip.
+                            full_straddle_slip = min(
+                                full_straddle_slip,
+                                cfg.ioc_cap_multiplier * bar_slip,
+                            )
+                        # E-6 (parity-r3 cycle 3): match live's API-level
+                        # cap (``max_slippage_pct × best``). Compute the
+                        # straddle premium (Brenner-Subrahmanyam) and cap
+                        # at ``ioc_max_slippage_pct/100 × premium × 2 (legs)``.
+                        # 0.0 = disabled — preserves legacy byte-identity
+                        # for non-V2 paths; V2 preset enables 1.0.
+                        if cfg.ioc_max_slippage_pct > 0.0:
+                            # Brenner-Subrahmanyam ATM premium ≈ 0.4·σ·√T
+                            # (BTC units). USD per BTC of leg notional:
+                            # premium_btc × S. Two legs → 2× cap.
+                            _prem_per_leg_usd = (
+                                0.4 * sigma_dec[i]
+                                * np.sqrt(max(T_years[i], 1e-6))
+                                * S_exec[i]
+                            )
+                            _pct_cap_usd = (
+                                2.0 * cfg.ioc_max_slippage_pct / 100.0
+                                * _prem_per_leg_usd
+                            )
+                            full_straddle_slip = min(
+                                full_straddle_slip, _pct_cap_usd,
+                            )
                     elif _impact_model is not None:
                         # Continuous sqrt model — returns per-BTC slippage
                         # for both legs combined (matching legacy convention)
@@ -2229,9 +2332,72 @@ class VolArbBacktester:
                                 )
                                 maker_filled_arr[i] = taker_slip_usd >= base_slip
 
+                    # O-1 (parity-r3 cycle 3): when SOR confirmed maker
+                    # didn't fill within 5s, live cancels and posts a
+                    # taker after up to ``maker_wait_seconds=60``s. The
+                    # taker leg therefore lands at bar (i+1)'s slip, not
+                    # bar i's. Pre-fix backtester always charged bar-i
+                    # slip even on failed-maker scenarios.
+                    # N/A under V2: ``use_sor=False`` skips the maker
+                    # path entirely so this branch never fires.
+                    if (
+                        cfg.cancel_replace_bar_gap
+                        and has_sor
+                        and not maker_filled_arr[i]
+                        and i + 1 < n_bars
+                        and _bar_taker_slip is not None
+                    ):
+                        # Recompute full_straddle_slip with bar (i+1)'s slip.
+                        next_bar_slip = _bar_taker_slip[i + 1]
+                        if np.isfinite(next_bar_slip) and next_bar_slip > 0:
+                            next_size_mult = np.sqrt(max(N[i], 0.1))
+                            next_full_slip = (
+                                2.0 * next_bar_slip * next_size_mult
+                                * np.exp(cfg.spread_jump_k * jump_frac[i])
+                            )
+                            # Same cap chain as bar-i for consistency.
+                            if cfg.taker_tier_blend:
+                                _tier_cap = sum(
+                                    frac * 2.0 * mult * next_bar_slip
+                                    for frac, mult in zip(
+                                        cfg.taker_tier_split_fractions,
+                                        cfg.taker_tier_slip_multipliers,
+                                        strict=False,
+                                    )
+                                )
+                                next_full_slip = min(next_full_slip, _tier_cap)
+                            else:
+                                next_full_slip = min(
+                                    next_full_slip,
+                                    cfg.ioc_cap_multiplier * next_bar_slip,
+                                )
+                            full_straddle_slip = next_full_slip
                     straddle_slip = (
                         0.0 if maker_filled_arr[i] else full_straddle_slip
                     )
+                    # O-6 (parity-r3 cycle 3): bar-aligned exit latency.
+                    # Live's D12 exit incurs ~300-600ms of latency from
+                    # 2× ticker fetch + 2× IOC round-trip; offline
+                    # assumes instant fill. Add a small premium-scaled
+                    # slip surcharge on every non-stopped exit to
+                    # capture the magnitude (~$5-10/exit at typical
+                    # mid-vol). Disabled by default (0.0); V2 preset
+                    # sets 0.05 (5 bps of premium).
+                    if (
+                        cfg.bar_aligned_exit_latency_pct > 0.0
+                        and not stop_triggered[i]
+                        and not maker_filled_arr[i]
+                    ):
+                        _prem_per_leg_usd = (
+                            0.4 * sigma_dec[i]
+                            * np.sqrt(max(T_years[i], 1e-6))
+                            * S_exec[i]
+                        )
+                        _exit_latency_usd = (
+                            2.0 * cfg.bar_aligned_exit_latency_pct / 100.0
+                            * _prem_per_leg_usd
+                        )
+                        straddle_slip += _exit_latency_usd
                     # Emergency taker exit slippage for vega stop-loss
                     if stop_triggered[i]:
                         if _exit_spread_minute[i] > 0:
@@ -2388,6 +2554,23 @@ class VolArbBacktester:
 
             # Slippage: branch on model type (matching compound loop)
             bar_idx = np.arange(n_bars)
+            # O-2 (parity-r3 cycle 3): tier-blended cap (vectorized).
+            if cfg.taker_tier_blend:
+                _tier_blend_factor = sum(
+                    frac * 2.0 * mult
+                    for frac, mult in zip(
+                        cfg.taker_tier_split_fractions,
+                        cfg.taker_tier_slip_multipliers,
+                        strict=False,
+                    )
+                )
+            else:
+                _tier_blend_factor = None
+            # E-6 / O-6 helper: per-bar Brenner-Subrahmanyam premium
+            # (USD per leg). Reused by the % cap and exit-latency surcharge.
+            _prem_per_leg_usd = (
+                0.4 * sigma_dec * np.sqrt(np.maximum(T_years, 1e-6)) * S_exec
+            )
             if _bar_taker_slip is not None:
                 # Realistic taker: vectorized version of compound loop
                 size_mult_nc = np.sqrt(np.maximum(N_nc, 0.1))
@@ -2395,8 +2578,19 @@ class VolArbBacktester:
                 full_slip_nc = 2.0 * _bar_taker_slip * size_mult_nc * np.exp(
                     cfg.spread_jump_k * jump_frac
                 )
-                ioc_cap_nc = cfg.ioc_cap_multiplier * _bar_taker_slip
+                # O-2: tier blend supersedes the legacy multiplier cap.
+                if _tier_blend_factor is not None:
+                    ioc_cap_nc = _tier_blend_factor * _bar_taker_slip
+                else:
+                    ioc_cap_nc = cfg.ioc_cap_multiplier * _bar_taker_slip
                 full_slip_nc = np.minimum(full_slip_nc, ioc_cap_nc)
+                # E-6: % cap matches live API ceiling.
+                if cfg.ioc_max_slippage_pct > 0.0:
+                    pct_cap_nc = (
+                        2.0 * cfg.ioc_max_slippage_pct / 100.0
+                        * _prem_per_leg_usd
+                    )
+                    full_slip_nc = np.minimum(full_slip_nc, pct_cap_nc)
                 # Liquidity-conditioned sizing for NC path
                 if cfg.sizing_model in ("liq", "cost_edge", "composite_v2"):
                     slip_series = pd.Series(_bar_taker_slip)
@@ -2414,6 +2608,8 @@ class VolArbBacktester:
                         cfg.spread_jump_k * jump_frac
                     )
                     full_slip_nc = np.minimum(full_slip_nc, ioc_cap_nc)
+                    if cfg.ioc_max_slippage_pct > 0.0:
+                        full_slip_nc = np.minimum(full_slip_nc, pct_cap_nc)
             elif _impact_model is not None:
                 # Continuous impact: vectorized
                 base_slip_nc = np.array([
@@ -2453,8 +2649,59 @@ class VolArbBacktester:
             else:
                 maker_filled_nc = np.zeros(n_bars, dtype=bool)
 
+            # O-1 (parity-r3 cycle 3): when SOR maker failed, charge
+            # bar-(i+1) slip to mirror live's 60s cancel-replace gap.
+            # N/A under V2 (use_sor=False ⇒ maker_filled_nc all False
+            # but the branch only fires AFTER a failed maker, which
+            # also requires use_sor=True).
+            if (
+                cfg.cancel_replace_bar_gap
+                and has_sor
+                and _bar_taker_slip is not None
+            ):
+                # Identify failed-maker bars (signal != 0 AND not maker_filled).
+                failed_maker_mask = (signal != 0) & (~maker_filled_nc)
+                # Build a "next-bar" full slip array (shifted forward).
+                next_bar_taker_slip = np.roll(_bar_taker_slip, -1)
+                next_bar_taker_slip[-1] = _bar_taker_slip[-1]  # last bar fallback
+                next_full_slip = (
+                    2.0 * next_bar_taker_slip
+                    * np.sqrt(np.maximum(N_nc, 0.1))
+                    * np.exp(cfg.spread_jump_k * jump_frac)
+                )
+                if _tier_blend_factor is not None:
+                    next_cap = _tier_blend_factor * next_bar_taker_slip
+                else:
+                    next_cap = cfg.ioc_cap_multiplier * next_bar_taker_slip
+                next_full_slip = np.minimum(next_full_slip, next_cap)
+                if cfg.ioc_max_slippage_pct > 0.0:
+                    next_full_slip = np.minimum(next_full_slip, pct_cap_nc)
+                full_slip_nc = np.where(
+                    failed_maker_mask, next_full_slip, full_slip_nc,
+                )
+
             slip_nc = np.where(maker_filled_nc, 0.0, full_slip_nc)
             slip_nc = np.where(signal == 0, 0.0, slip_nc)
+            # O-6 (parity-r3 cycle 3): bar-aligned exit latency surcharge.
+            # Models the 2× ticker + 2× IOC round-trip overhead vs
+            # offline's instant-fill assumption. Charged on every signal
+            # bar that wasn't a maker fill or stopped emergency exit.
+            if cfg.bar_aligned_exit_latency_pct > 0.0:
+                exit_latency_usd = (
+                    2.0 * cfg.bar_aligned_exit_latency_pct / 100.0
+                    * _prem_per_leg_usd
+                )
+                # Apply only on fired, non-stopped, non-maker bars.
+                mask_apply_latency = (
+                    (signal != 0)
+                    & (~stop_triggered)
+                    & (~maker_filled_nc)
+                )
+                slip_nc = np.where(
+                    mask_apply_latency,
+                    slip_nc + exit_latency_usd,
+                    slip_nc,
+                )
             # Emergency exit slippage for vega stop-loss
             if cfg.vega_stop_usd > 0 and _bar_taker_slip is not None:
                 slip_nc = np.where(

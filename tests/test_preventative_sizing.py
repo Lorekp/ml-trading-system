@@ -437,13 +437,21 @@ class TestNCPathMirror:
     # NOT trained on. Post-fix per-tick recompute matches the env path
     # (env.py:418) and the live inference path (drl_hedger_live.py:315-322)
     # byte-for-byte. NC PnL drifts -$394.67 (-0.039%) after Kelly K1
-    # sidecar regeneration; n_trades unchanged at 7,543. Drift is within
-    # noise floor — most ticks the policy action is sub-dust regardless
-    # of the obs perturbation, and the small per-trade differences fold
-    # back into the K1 multipliers in a converged loop (verified via
-    # 3-iteration ``scripts/parity_r3_cycle2_d7_rebaseline.py`` run).
-    # Rebaseline report: ``vol_arb/output/parity_r3_cycle2_d7_rebaseline.md``.
-    V2_NC_PNL_BASELINE = 1_024_054.5149
+    # sidecar regeneration; n_trades unchanged at 7,543. Cycle-2
+    # baseline was $1,024,054.5149 / 7,543 trades.
+    #
+    # Updated 2026-05-08 (parity-cycle round 3, Tier C) after E-6 / O-2 /
+    # O-6 backtester semantic flips bring V2 in line with live execution
+    # truth:
+    #   - E-6 (`ioc_max_slippage_pct=1.0`): match live API ceiling.
+    #   - O-2 (`taker_tier_blend=True`):    blended slip across live's
+    #     3-tier IOC ladder (effective cap ~2.4× bar_slip vs legacy 2.0×).
+    #   - O-6 (`bar_aligned_exit_latency_pct=0.05`): 5 bps premium-scaled
+    #     exit slip surcharge models live's 2× ticker + 2× IOC latency.
+    # NC PnL drifts -$13,163.02 (-1.285%) after Kelly K1 sidecar
+    # regeneration; n_trades unchanged at 7,543. Converged at iteration 2.
+    # Rebaseline report: ``vol_arb/output/parity_r3_cycle3_tierC_rebaseline.md``.
+    V2_NC_PNL_BASELINE = 1_010_891.4966
     V2_NC_TRADES_BASELINE = 7_543
 
     def test_preventative_sizing_actually_binds_on_NC(self):

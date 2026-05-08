@@ -67,6 +67,16 @@ class DollarBarFeatures:
         self._cached_df: pd.DataFrame | None = None
         self._cached_vpin: np.ndarray | None = None
         self._cached_parkinson_bar: np.ndarray | None = None
+        # F-2 fix (round-3 parity audit, 2026-05-08): rolling mean of the
+        # per-bar parkinson series — distinct from the raw per-bar series.
+        # The offline pipeline stores ``feats["parkinson_1d"]`` as a
+        # rolling mean (``parkinson_bar.rolling(w_park).mean()``); the
+        # subsequent ``parkinson_1d_ema50`` is then ``EMA(rolling_mean)``,
+        # NOT ``EMA(raw_bar_series)``. Pre-fix live EMA'd the raw series
+        # — same shape but wildly different reactivity. We cache by
+        # window so different callers (handler with window=250 today,
+        # F-3's bpd-driven future) don't recompute.
+        self._cached_parkinson_rolling: dict[int, np.ndarray] = {}
 
     # ── cache management ─────────────────────────────────────────────
 
@@ -79,6 +89,7 @@ class DollarBarFeatures:
         # Invalidate dependent caches when length changes
         self._cached_vpin = None
         self._cached_parkinson_bar = None
+        self._cached_parkinson_rolling.clear()
 
     def _df(self) -> pd.DataFrame:
         self._refresh()
@@ -121,6 +132,43 @@ class DollarBarFeatures:
             np.log(hl) ** 2 / (4.0 * np.log(2.0))
         ).to_numpy(dtype=np.float64)
         return self._cached_parkinson_bar
+
+    def _parkinson_1d_rolling_series(
+        self, window: int,
+    ) -> np.ndarray | None:
+        """Rolling mean of the per-bar parkinson values.
+
+        F-2 fix (round-3 parity audit, 2026-05-08): mirrors offline's
+        ``feats["parkinson_1d"] = parkinson_bar.rolling(w_park,
+        min_periods=max(w_park//4, 10)).mean()`` (``engineer.py:362``).
+        Pandas' rolling fills the head with NaN until ``min_periods``
+        bars are observed; we preserve that NaN prefix so downstream
+        EMA matches offline byte-for-byte (pandas EMA ignores leading
+        NaNs).
+
+        Cached per-window because F-3 (round-3 audit, P1) will plumb
+        the dynamic ``bpd`` width — different callers may want different
+        window sizes within one bar.
+        """
+        if window <= 0:
+            raise ValueError(f"window must be positive, got {window}")
+        # IMPORTANT: refresh BEFORE checking the cache so a buffer append
+        # since the last call invalidates this dict. ``_refresh`` clears
+        # ``_cached_parkinson_rolling`` when buffer length changes.
+        self._refresh()
+        cached = self._cached_parkinson_rolling.get(window)
+        if cached is not None:
+            return cached
+        bar_arr = self._parkinson_bar_series()
+        if bar_arr is None or len(bar_arr) == 0:
+            return None
+        min_periods = max(window // 4, 10)
+        # Use pandas rolling for byte-identity to offline (engineer.py:362-363).
+        rolling = pd.Series(bar_arr).rolling(
+            window=window, min_periods=min_periods,
+        ).mean().to_numpy(dtype=np.float64)
+        self._cached_parkinson_rolling[window] = rolling
+        return rolling
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -199,30 +247,46 @@ class DollarBarFeatures:
         return None if (v is None or not np.isfinite(v)) else float(v)
 
     def parkinson_1d(self, window: int = 250) -> float | None:
-        """Rolling mean of the parkinson per-bar series over the last ``window`` bars.
+        """Latest value of the rolling-mean parkinson series.
 
-        Mirror of offline ``parkinson_bar.rolling(w_park).mean().iloc[-1]``
-        with strict-window semantics: returns ``None`` if the buffer has
-        fewer than ``window`` bars (no early partial-window result).
+        Mirror of offline ``feats["parkinson_1d"]`` evaluated at the
+        last index. Returns ``None`` when the rolling-mean series
+        hasn't reached its ``min_periods`` warmup floor at the latest
+        bar (matches offline's NaN propagation through the warmup
+        head).
         """
-        arr = self._parkinson_bar_series()
-        if arr is None or len(arr) < window:
+        arr = self._parkinson_1d_rolling_series(window)
+        if arr is None or len(arr) == 0:
             return None
-        return float(np.mean(arr[-window:]))
+        v = arr[-1]
+        return None if not np.isfinite(v) else float(v)
 
-    def parkinson_1d_ema(self, span: int = 50) -> float | None:
-        """EWM(span) over the parkinson per-bar series, evaluated at the latest bar.
+    def parkinson_1d_ema(
+        self, span: int = 50, *, rolling_window: int = 250,
+    ) -> float | None:
+        """EWM(span) over the parkinson_1d ROLLING-MEAN series.
 
-        Note: this EMAs the PER-BAR parkinson values directly (the
-        un-rolled series), matching offline's ``feats["parkinson_1d_ema50"]
-        = pd.Series(parkinson_bar).ewm(...).mean()`` shape. Distinct from
-        :meth:`parkinson_1d` which is the 250-bar rolling mean.
+        F-2 fix (round-3 parity audit, 2026-05-08): pre-fix this EMAed
+        the raw per-bar parkinson series, which is wildly more reactive
+        than offline. Offline `_window_and_aggregate` (engineer.py:460)
+        computes `series.ewm(span=span).mean()` over the column
+        `feats["parkinson_1d"]` — which is itself the rolling-mean of
+        the per-bar parkinson (engineer.py:362-363). Live now matches
+        that two-stage transformation byte-for-byte.
+
+        ``rolling_window`` is the inner rolling-mean window before
+        EMAing. Default 250 mirrors the production handler binding
+        (``_LIVE_HANDLERS["parkinson_1d_ema50"]`` in
+        ``feature_assembler.py``); F-3 (round-3 P1) will plumb the
+        dynamic ``bpd`` value here.
         """
         if span <= 0:
             raise ValueError(f"span must be positive, got {span}")
-        arr = self._parkinson_bar_series()
+        arr = self._parkinson_1d_rolling_series(rolling_window)
         if arr is None or len(arr) == 0:
             return None
+        # pandas ewm with adjust=True + min_periods=1 ignores leading
+        # NaNs (the rolling-mean head before min_periods is satisfied).
         ema_val = pd.Series(arr).ewm(
             span=span, adjust=True, min_periods=1,
         ).mean().iloc[-1]

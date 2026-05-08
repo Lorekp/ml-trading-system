@@ -31,20 +31,46 @@ def test_initial_state_not_halted():
 
 
 def test_trips_on_daily_drawdown():
+    """R-1 (round-3 parity audit, 2026-05-08): the trip condition is
+    daily PnL (since 00:00 UTC), NOT lifetime-peak drawdown. Pre-fix
+    this test set up peak=105k / current=101k (a +1% DAILY gain after
+    a +5% then −4% sequence) and expected a trip — that codified the
+    bug where peak-DD was being read as if it were daily DD.
+
+    Post-fix: a single −3% intra-day loss DOES trip; the prior fake
+    "peak then partial recovery" sequence does NOT (today is +1% on
+    net). Both directions now match the config name + docstring +
+    runbook.
+    """
     ks, equity, alerts = _make_switch(max_daily_drawdown_pct=2.0)
-    equity.on_trade_closed(5_000.0)   # peak 105k
-    equity.on_trade_closed(-4_000.0)  # 101k, dd = -3.81%
+    # Single −3% intra-day loss → daily PnL = −3% < −2% threshold → trip.
+    equity.on_trade_closed(-3_000.0)
     halted = ks.check_before_signal()
     assert halted is True
     assert ks.is_halted() is True
-    assert "drawdown" in (ks.state.reason or "")
+    # Reason references daily PnL, not lifetime peak.
+    assert "daily" in (ks.state.reason or "").lower()
+    assert "-3.00%" in (ks.state.reason or "")
     assert len(alerts) == 1
+
+
+def test_does_not_trip_on_peak_dd_with_positive_daily_pnl():
+    """R-1 contract verification: a +5K then −4K sequence leaves the
+    account at +1% DAILY but with a 3.8% DRAWDOWN-FROM-PEAK. The
+    kill-switch must NOT trip on this (pre-fix it did, conflating the
+    two metrics). Daily PnL is the contract.
+    """
+    ks, equity, _ = _make_switch(max_daily_drawdown_pct=2.0)
+    equity.on_trade_closed(5_000.0)   # peak 105k
+    equity.on_trade_closed(-4_000.0)  # 101k → daily PnL +1%
+    assert ks.check_before_signal() is False
+    assert ks.is_halted() is False
 
 
 def test_does_not_trip_on_small_drawdown():
     ks, equity, _ = _make_switch(max_daily_drawdown_pct=5.0)
     equity.on_trade_closed(5_000.0)
-    equity.on_trade_closed(-1_000.0)  # dd ~ -0.9%
+    equity.on_trade_closed(-1_000.0)  # daily PnL = +4% (well within 5% threshold either way)
     assert ks.check_before_signal() is False
     assert ks.is_halted() is False
 

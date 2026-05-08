@@ -68,7 +68,12 @@ class _StubSVICalibrator:
         self._atm_1d = atm_1d
         self.calls: list[float] = []
 
-    def atm_vol_at_dte(self, dte_days: float) -> float:
+    def atm_vol_at_dte(
+        self,
+        dte_days: float,
+        *,
+        now: pd.Timestamp | None = None,  # F-4 round-3 (2026-05-08)
+    ) -> float:
         self.calls.append(dte_days)
         return self._atm_1d
 
@@ -261,7 +266,12 @@ def test_build_row_falls_back_when_calibrator_returns_nan(minimal_parquets):
     bundle = _StubBundle(lgbm_features=["svi_atm_1d"])
 
     class _NaNCalibrator:
-        def atm_vol_at_dte(self, dte_days: float) -> float:
+        def atm_vol_at_dte(
+            self,
+            dte_days: float,
+            *,
+            now: pd.Timestamp | None = None,  # F-4 round-3
+        ) -> float:
             return float("nan")
 
     assembler = FeatureAssembler(

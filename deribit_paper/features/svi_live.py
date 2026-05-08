@@ -221,7 +221,12 @@ class LiveSVICalibrator:
         except (KeyError, TypeError, ValueError):
             return None
 
-    def atm_vol_at_dte(self, dte_days: float) -> float:
+    def atm_vol_at_dte(
+        self,
+        dte_days: float,
+        *,
+        now: pd.Timestamp | None = None,
+    ) -> float:
         """Return the constant-maturity ATM implied vol at ``dte_days`` DTE.
 
         Matches the offline ``_constant_maturity_features`` output in
@@ -245,13 +250,48 @@ class LiveSVICalibrator:
         windows when only 1 expiry has enough strikes to calibrate).
         Return ``NaN`` instead so the F9 baseline-fallback path takes
         over rather than emitting a misleading value.
+
+        F-4 (parity-cycle round 3 — 2026-05-08): ``params_df["timestamp"]``
+        is the bucket START. The offline pipeline shifts each
+        ``bucket_ts`` forward by ``svi_config.bucket_freq`` (default 1h)
+        before reindex onto the 15-min decision grid (see
+        ``vol_arb/rebuild_svi_features_with_spot.py:117``) so a bar at
+        wall-clock T uses the most recent bucket whose
+        ``bucket_ts + bucket_freq <= T``. Pre-fix, live always picked
+        ``bucket_ts.max()`` regardless of decision-time T — making
+        live IV up to ~1 hour fresher than offline. When the caller
+        supplies ``now`` (typically ``ctx.bar.timestamp``), filter
+        ``params_df`` to buckets that respect the same shift contract.
+        ``now=None`` preserves the legacy behaviour for back-compat
+        with paths that don't have a decision-time anchor (e.g.,
+        tests, telemetry).
         """
         if self._params_df is None or self._params_df.empty:
             return float("nan")
+        # F-4: enforce offline's bucket_ts + bucket_freq <= now contract.
+        # ``params_df["timestamp"]`` is the bucket START; offline reindex
+        # treats a bucket as observable only after its FULL window has
+        # elapsed (bucket_freq later). Live must do the same.
+        params = self._params_df
+        if now is not None:
+            try:
+                bucket_freq_td = pd.Timedelta(self.svi_config.bucket_freq)
+            except (TypeError, ValueError) as exc:
+                # Unparseable bucket_freq is a config error, not a
+                # silent-bias path. Fail loudly so the operator catches
+                # it instead of degrading to the pre-fix behaviour.
+                raise ValueError(
+                    f"svi_config.bucket_freq={self.svi_config.bucket_freq!r} "
+                    f"could not be parsed as a Timedelta: {exc}"
+                ) from exc
+            ts_observable_at = params["timestamp"] + bucket_freq_td
+            params = params[ts_observable_at <= pd.Timestamp(now)]
+            if params.empty:
+                return float("nan")
         # Pick the most recent bucket timestamp — surface_from_params_group
         # expects rows for exactly one bucket.
-        latest_ts = self._params_df["timestamp"].max()
-        bucket = self._params_df[self._params_df["timestamp"] == latest_ts]
+        latest_ts = params["timestamp"].max()
+        bucket = params[params["timestamp"] == latest_ts]
         if bucket.empty:
             return float("nan")
         # F7: refuse to interpolate when only one expiry is present.

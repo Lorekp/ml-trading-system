@@ -224,7 +224,11 @@ class Predictor:
         # E.1.8: compute the 1w-2w term slope ONCE at predict time and
         # cache on the Signal so downstream code (harness, audits) sees
         # the slope at signal-fire time, NOT at trade-close time.
-        term_slope = self._compute_term_slope_1w_2w()
+        # F-4 fix (round-3 audit, 2026-05-08): pass bar.timestamp so the
+        # underlying ``atm_vol_at_dte`` filters params_df by the offline
+        # bucket_ts + bucket_freq <= now contract — pre-fix this slope
+        # used buckets up to ~1h fresher than offline.
+        term_slope = self._compute_term_slope_1w_2w(now=bar.timestamp)
 
         edge = rv_pred_pct - iv_used_pct
         direction = 0
@@ -318,7 +322,11 @@ class Predictor:
             reason=reason,
         )
 
-    def _compute_term_slope_1w_2w(self) -> float | None:
+    def _compute_term_slope_1w_2w(
+        self,
+        *,
+        now: pd.Timestamp | None = None,
+    ) -> float | None:
         """Per-bar IV term slope at 1w-2w (matches ``svi_term_slope_1w_2w``).
 
         Mirrors ``vol_arb/svi.py::_constant_maturity_features`` (line 1126):
@@ -331,12 +339,16 @@ class Predictor:
         spurious large-magnitude slope (e.g. zero 1w + 70 2w → +70vp
         slope incorrectly tripping the contango filter). Treat as
         warmup-equivalent and pass through.
+
+        F-4 (round-3, 2026-05-08): ``now`` plumbs the bar timestamp
+        into ``atm_vol_at_dte`` so it enforces the offline pipeline's
+        ``bucket_ts + bucket_freq <= now`` shift contract.
         """
         if not self._svi.has_params:
             return None
         try:
-            atm_1w = float(self._svi.atm_vol_at_dte(7.0))
-            atm_2w = float(self._svi.atm_vol_at_dte(14.0))
+            atm_1w = float(self._svi.atm_vol_at_dte(7.0, now=now))
+            atm_2w = float(self._svi.atm_vol_at_dte(14.0, now=now))
         except (TypeError, ValueError):
             return None
         if not (math.isfinite(atm_1w) and math.isfinite(atm_2w)):

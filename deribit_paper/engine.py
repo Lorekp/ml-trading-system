@@ -1727,16 +1727,15 @@ class TradingEngine:
             bar.tsrv_dataframe(),
             bar_seconds=float(self.config.bar_seconds),
         )
-
-        # F3 Tier 6: append this bar's TSRV to the history buffer so
-        # the 6 TSRV-grid handlers (tsrv_mean_*, tsrv_ffd, etc.) see
-        # the latest 15-min cadence value. Defensive — shouldn't raise
-        # but a bad ``bar_tsrv`` shouldn't break the bar loop.
-        try:
-            if self.tsrv_history_buffer is not None and bar_tsrv is not None:
-                self.tsrv_history_buffer.append_bar(bar.timestamp, bar_tsrv)
-        except Exception:  # noqa: BLE001
-            logger.exception("F3 Tier 6: tsrv_history_buffer append failed")
+        # NOTE: ``tsrv_history_buffer.append_bar`` for this bar's TSRV is
+        # deferred to AFTER ``predictor.predict`` below — see the F-1 fix
+        # comment near line ~1925. Pre-fix the append ran here, before
+        # the predictor read the buffer, so the 6 TSRV-grid features
+        # (tsrv_mean_*, tsrv_ffd, etc.) silently included vol_ann(T) in
+        # rolling means while the offline pipeline strict-shifts(1).
+        # Strict-past contract: at predict time, ``buf[-1]`` is the
+        # most recent COMPLETED bar; current bar is appended once the
+        # predictor has read what it needs.
 
         # 1b. Stale-data guard — refuse to signal on bars where we
         # couldn't trade. E.3.5 (2026-05-01): treat low-volume AND
@@ -1915,6 +1914,28 @@ class TradingEngine:
             bar=bar, bar_tsrv=bar_tsrv, straddle=straddle,
             transvol_embedding=None,  # fresh TransVol is Phase 4B follow-up
         )
+        # F-1 fix (round-3 audit, parity-r5 — 2026-05-08):
+        # Append this bar's TSRV to the history buffer ONLY AFTER the
+        # predictor has read it. Pre-fix this lived right after
+        # ``compute_bar_tsrv`` above, so at predict time ``buf[-1] ==
+        # current bar`` — the 6 TSRV-grid handlers
+        # (``tsrv_mean_1d``, ``tsrv_mean_1d_lag3``, ``tsrv_mean_1w``,
+        # ``tsrv_ffd``, ``up_jump_frac_ema50``, ``bpv_tsrv_ratio_ema50``)
+        # silently included vol_ann(T) in their rolling means while the
+        # offline pipeline strict-shifts(1) before the same rolling
+        # (``vol_model/features/engineer.py:251``). The model trained on
+        # shift(1) data was being fed shift(0) data live → systematic
+        # bias on every prediction. This relocation enforces the
+        # strict-past contract HAR-PD already follows
+        # (``feature_assembler.py:_har_pd_state.append`` at L815-820).
+        try:
+            if self.tsrv_history_buffer is not None and bar_tsrv is not None:
+                self.tsrv_history_buffer.append_bar(bar.timestamp, bar_tsrv)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "F-1 (round-3): tsrv_history_buffer append failed at %s",
+                bar.timestamp,
+            )
         self.stats.signals_generated += 1
         self.stats.last_signal_reason = signal.reason
         if signal.direction == 1:

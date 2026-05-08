@@ -130,10 +130,24 @@ class KillSwitch:
 
         now = now or pd.Timestamp.now(tz="UTC")
 
-        # 1. Daily drawdown
-        if self._equity.dropped_below_threshold(self.max_daily_dd_pct):
+        # 1. Daily drawdown.
+        # R-1 fix (round-3 parity audit, 2026-05-08): pre-fix this
+        # called ``self._equity.dropped_below_threshold`` which uses
+        # ``drawdown_pct`` — drawdown from LIFETIME PEAK, not daily PnL.
+        # The config name (``max_daily_dd_pct``), the kill-switch
+        # docstring, and ``RUNBOOK_PAPER_V2.md`` all describe a
+        # day-bounded threshold (e.g., "halt if daily DD > 2%"); the
+        # implementation was peak-relative. After a winning week
+        # followed by a 1.5% loss day, peak-DD would NOT trip even
+        # though the spec said it should; conversely after a 5% DD
+        # ANY 0.01% further dip from the unmoved peak tripped. Both
+        # directions diverge from operator mental model. ``daily_return_pct``
+        # was already implemented at ``equity.py:171-184`` for this
+        # purpose but never wired up.
+        daily_pct = self._equity.daily_return_pct(now=now)
+        if daily_pct <= -abs(self.max_daily_dd_pct):
             return self.trip(
-                f"daily drawdown {self._equity.drawdown_pct:.2f}% "
+                f"daily PnL {daily_pct:.2f}% (since 00:00 UTC) "
                 f"exceeds threshold -{self.max_daily_dd_pct:.2f}%",
                 now=now,
             )

@@ -281,10 +281,16 @@ def _h_svi_atm_1d(ctx: AssemblerContext) -> float:
     Falls back to the historical baseline value if the calibrator has
     no cached params yet. F9 (2026-05-07): NaN baseline propagates to
     line-519 guard rather than silently emitting 0% IV.
+
+    F-4 fix (round-3 audit, 2026-05-08): pass ``ctx.bar.timestamp`` to
+    ``atm_vol_at_dte`` so the calibrator only returns buckets whose
+    ``bucket_ts + bucket_freq <= bar.timestamp`` — matches offline's
+    `+ bucket_freq` reindex shift in ``rebuild_svi_features_with_spot.py``.
+    Pre-fix live IV was up to ~1h fresher than the model trained on.
     """
     if ctx.svi_calibrator is None:
         return _baseline_or_nan(ctx, "svi_atm_1d")
-    live = ctx.svi_calibrator.atm_vol_at_dte(1.0)
+    live = ctx.svi_calibrator.atm_vol_at_dte(1.0, now=ctx.bar.timestamp)
     if live is None or not np.isfinite(live):
         return _baseline_or_nan(ctx, "svi_atm_1d")
     return float(live)

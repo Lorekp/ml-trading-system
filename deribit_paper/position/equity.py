@@ -144,13 +144,47 @@ class EquityTracker:
         the realized PnL total — this path exists specifically for
         non-trade equity updates (deposits, withdrawals, restart
         reconciliation against the exchange's reported balance).
+
+        Peak-equity advancement contract (R-2 fix, round-3 parity audit
+        — 2026-05-08): peak advances only on REALIZED trade PnL
+        (``on_trade_closed``) or on confirmed CAPITAL ADDITIONS
+        (``reason="deposit"``). Restart reconciliation
+        (``reason="reconcile"``, the default) deliberately does NOT
+        advance the peak — otherwise a winning week followed by a
+        crash-and-restart would silently re-base the kill-switch
+        drawdown reference upward, defeating protection on the
+        highest-risk recovery path. New capital injections (deposits)
+        are real new highs and DO advance the peak. Withdrawals
+        (``reason="withdrawal"``) also do not advance peak (the
+        withdrawn cash never "made" a high).
+
+        Raises ``ValueError`` on unknown reasons so an operator-detected
+        typo in a calling code path doesn't silently get default-
+        reconcile semantics.
         """
         if new_equity_usd < 0:
             raise ValueError(f"new_equity must be non-negative, got {new_equity_usd}")
+
+        valid_reasons = {"reconcile", "deposit", "withdrawal", "test"}
+        if reason not in valid_reasons:
+            raise ValueError(
+                f"set_equity reason {reason!r} not recognised; "
+                f"allowed: {sorted(valid_reasons)}. "
+                f"Add a new reason here if you have a legitimate use case."
+            )
+
         delta = new_equity_usd - self._current
         self._current = float(new_equity_usd)
-        if self._current > self._peak:
+
+        # Only advance peak on confirmed CAPITAL ADDITIONS — never on
+        # plain reconcile or withdrawals. See contract above. ``test``
+        # is treated like reconcile (no advance) so unit tests don't
+        # accidentally couple to the deposit-path semantics.
+        peak_advanced = False
+        if reason == "deposit" and self._current > self._peak:
             self._peak = self._current
+            peak_advanced = True
+
         self._snapshots.append(EquitySnapshot(
             timestamp=pd.Timestamp.now(tz="UTC"),
             equity_usd=self._current,
@@ -160,8 +194,9 @@ class EquityTracker:
             n_trades_closed=self._n_trades,
         ))
         logger.info(
-            "EquityTracker equity set to %.2f (delta %+.2f, reason: %s)",
-            self._current, delta, reason,
+            "EquityTracker equity set to %.2f (delta %+.2f, reason: %s, "
+            "peak_advanced=%s)",
+            self._current, delta, reason, peak_advanced,
         )
 
     def snapshots(self) -> Iterable[EquitySnapshot]:

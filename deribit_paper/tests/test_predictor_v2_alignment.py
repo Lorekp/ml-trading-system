@@ -106,7 +106,9 @@ def _make_predictor(
     svi.has_params = True
     svi.evaluate.return_value = pd.Series([iv_used_pct])
 
-    def _atm_vol_at_dte(dte: float) -> float:
+    def _atm_vol_at_dte(dte: float, *, now: pd.Timestamp | None = None) -> float:
+        # F-4 round-3 (2026-05-08): predictor passes ``now=bar.timestamp``;
+        # stub ignores it and returns the fixed test value.
         if dte <= 7.5:
             return atm_1w_pct
         return atm_2w_pct

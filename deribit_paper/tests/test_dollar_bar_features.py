@@ -181,6 +181,16 @@ def test_parkinson_1d_matches_offline_formula_on_synthetic():
 
 
 def test_parkinson_1d_ema_matches_offline_on_synthetic():
+    """F-2 fix (round-3 audit, 2026-05-08): pre-fix ``parkinson_1d_ema``
+    EMAed the per-bar raw parkinson series. Post-fix it EMAs the
+    ROLLING-MEAN of the raw series (mirroring offline's two-stage
+    transform: ``feats["parkinson_1d"] = rolling.mean(); ema(...)``).
+
+    With buffer length 60 and the production handler's rolling_window=250,
+    the rolling-mean series is all-NaN at the latest bar (min_periods=62),
+    so live correctly returns None. Use a shorter rolling_window so the
+    test exercises the byte-identity path on a non-NaN sample.
+    """
     buf = DollarBarBuffer(max_size=300)
     _populate_buffer(60, buf)
     feats = DollarBarFeatures(buf)
@@ -189,10 +199,30 @@ def test_parkinson_1d_ema_matches_offline_on_synthetic():
     park = pd.Series(
         (np.log(hl) ** 2 / (4.0 * np.log(2.0))).to_numpy(dtype=np.float64)
     )
-    expected = park.ewm(span=50, adjust=True, min_periods=1).mean().iloc[-1]
-    assert feats.parkinson_1d_ema(span=50) == pytest.approx(
-        expected, rel=1e-12,
-    )
+
+    # Two-stage transform — matches offline engineer.py:362-363 + :460.
+    rolling_window = 30   # shorter so 60 bars satisfies min_periods (=10)
+    min_periods = max(rolling_window // 4, 10)
+    park_rolling = park.rolling(
+        window=rolling_window, min_periods=min_periods,
+    ).mean()
+    expected = park_rolling.ewm(
+        span=50, adjust=True, min_periods=1,
+    ).mean().iloc[-1]
+
+    live = feats.parkinson_1d_ema(span=50, rolling_window=rolling_window)
+    assert live == pytest.approx(expected, rel=1e-12)
+
+
+def test_parkinson_1d_ema_short_buffer_returns_none_at_default_window():
+    """At the default rolling_window=250, a buffer of 60 bars cannot
+    satisfy min_periods=62 → rolling mean is all-NaN at latest →
+    parkinson_1d_ema returns None (handler falls back to baseline).
+    """
+    buf = DollarBarBuffer(max_size=300)
+    _populate_buffer(60, buf)
+    feats = DollarBarFeatures(buf)
+    assert feats.parkinson_1d_ema(span=50) is None
 
 
 def test_vpin_underfull_returns_none():
@@ -357,6 +387,10 @@ def test_byte_identity_parkinson_1d():
 
 
 def test_byte_identity_parkinson_1d_ema50():
+    """F-2 fix (round-3 audit, 2026-05-08): live now matches the offline
+    TWO-STAGE transform — rolling-mean of per-bar parkinson, then EMA
+    over that rolling-mean. Pre-fix this test asserted the buggy
+    one-stage behaviour."""
     buf = _build_buffer_from_parquet()
     feats = DollarBarFeatures(buf)
     df = buf.as_dataframe()
@@ -364,5 +398,21 @@ def test_byte_identity_parkinson_1d_ema50():
     park = pd.Series(
         (np.log(hl) ** 2 / (4.0 * np.log(2.0))).to_numpy(dtype=np.float64)
     )
-    expected = park.ewm(span=50, adjust=True, min_periods=1).mean().iloc[-1]
-    assert feats.parkinson_1d_ema(span=50) == pytest.approx(expected, rel=1e-12)
+
+    # Offline two-stage: rolling mean (window=250, min_periods=62), THEN
+    # EMA(span=50). Mirrors engineer.py:362-363 + _window_and_aggregate:460.
+    rolling_window = 250
+    min_periods = max(rolling_window // 4, 10)
+    if len(park) < min_periods:
+        pytest.skip(
+            f"buffer has only {len(park)} bars; need >= {min_periods}"
+        )
+    park_rolling = park.rolling(
+        window=rolling_window, min_periods=min_periods,
+    ).mean()
+    expected = park_rolling.ewm(
+        span=50, adjust=True, min_periods=1,
+    ).mean().iloc[-1]
+
+    live = feats.parkinson_1d_ema(span=50, rolling_window=rolling_window)
+    assert live == pytest.approx(expected, rel=1e-12)

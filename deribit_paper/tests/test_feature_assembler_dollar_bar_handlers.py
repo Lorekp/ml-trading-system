@@ -191,9 +191,13 @@ def test_assembler_dispatches_dollar_bar_handlers_with_wired_buffer(stub_parquet
     assert row.as_dict["duration_s_lag3"] == pytest.approx(feats.lag("duration_s", 3))
     assert row.as_dict["n_trades_ema10"] == pytest.approx(feats.ema("n_trades", 10))
     assert row.as_dict["n_trades_ema50"] == pytest.approx(feats.ema("n_trades", 50))
-    # parkinson_1d needs 250 bars; with 60 bars the handler falls back
-    # to baseline (1.23e-5) per our stub parquet.
-    assert row.as_dict["parkinson_1d_ema50"] == pytest.approx(feats.parkinson_1d_ema(50))
+    # parkinson_1d_ema50 needs ≥62 bars (rolling_window=250's
+    # min_periods); with 60 bars in the buffer, the rolling-mean
+    # series is all-NaN at the latest sample so feats.parkinson_1d_ema
+    # returns None. Per the F-2 fix (round-3 audit, 2026-05-08) the
+    # handler falls back to baseline (10.0) per the stub parquet.
+    assert feats.parkinson_1d_ema(50) is None
+    assert row.as_dict["parkinson_1d_ema50"] == pytest.approx(10.0)
 
 
 def test_parkinson_1d_falls_back_to_baseline_when_underfull(stub_parquets):

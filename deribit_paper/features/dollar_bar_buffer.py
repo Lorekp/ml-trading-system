@@ -171,6 +171,51 @@ class DollarBarBuffer:
             return None
         return self._bars[-1]
 
+    def timestamp_at(self, idx: int) -> pd.Timestamp | None:
+        """S-1d (parity-r3 cycle 7 — 2026-05-08): timestamp of the bar
+        at position ``idx``.
+
+        Negative indices supported (``-1`` = latest, ``-2`` = previous,
+        etc.) — mirrors Python's list-indexing convention. Returns
+        ``None`` when ``idx`` is out of bounds; never raises.
+
+        Used by the live ``time_to_funding_lag*`` handlers to walk
+        back through actual sub-15-min dollar-bar timestamps (matches
+        offline ``series.shift(n).groupby(window_labels).last()``
+        which picks the n-th-previous dollar bar's timestamp within
+        the current 15-min window).
+        """
+        n = len(self._bars)
+        if n == 0:
+            return None
+        if idx < 0:
+            idx = n + idx
+        if idx < 0 or idx >= n:
+            return None
+        # deque doesn't support O(1) random access; convert once for
+        # callers that may iterate through history. The cache below
+        # makes repeat access free within a bar.
+        return pd.Timestamp(self._bars[idx].timestamp)
+
+    def as_index(self) -> pd.DatetimeIndex:
+        """S-1d (parity-r3 cycle 7 — 2026-05-08): the buffer's
+        timestamps as a UTC ``DatetimeIndex``.
+
+        Used by :class:`TSRVDollarBarFeatures` to ffill TSRV scalars
+        onto the dollar-bar grid without paying the full
+        :meth:`as_dataframe` cost. The index is recomputed per call —
+        callers are expected to cache for the bar's compute pass.
+        """
+        if not self._bars:
+            return pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        timestamps = [bar.timestamp for bar in self._bars]
+        idx = pd.DatetimeIndex(timestamps, name="timestamp")
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        return idx
+
     def tail(self, n: int) -> list[DollarBar]:
         """Return the last ``n`` bars as a list (newest at end).
 

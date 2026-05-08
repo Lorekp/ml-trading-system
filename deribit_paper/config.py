@@ -221,7 +221,13 @@ class PaperConfig:
     # legacy ``vpin_*`` futures knobs over to consume from the same
     # spot grid; until then the two streams run in parallel.
     dollar_bar_threshold_btc: float = 500_000.0
-    dollar_bar_history_bars: int = 300
+    # S-1d (parity-r3 cycle 7 — 2026-05-08): default history flips
+    # 300 -> 60000 to support the offline 1w rolling window
+    # (capped at 50k bars in offline ``_window_and_aggregate``). Live
+    # buffer must hold >= 50k bars for the Tier-B byte-equal closure.
+    # Regenerate the on-disk cache via:
+    #   python scripts/generate_dollar_bar_cache.py --n 60000
+    dollar_bar_history_bars: int = 60000
     spot_poll_seconds: float = 3.0
     binance_spot_url: str = "https://api.binance.com"
     # F3 Tier 4 (parity-cycle round 3 — 2026-05-07): warm-start sidecar

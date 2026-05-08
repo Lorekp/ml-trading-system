@@ -133,8 +133,11 @@ def test_shipped_sidecar_has_expected_schema():
     assert set(df.columns) == expected_cols
     assert df.index.tz is not None
     assert df["n_trades"].dtype == np.int64
-    # Should be ~300 bars; allow a small range for regen variance
-    assert 100 <= len(df) <= 1000
+    # S-1d (parity-r3 cycle 7 — 2026-05-08): cache extended from
+    # ~300 bars (~1.6h) to 60000 bars (~5.5 days) to support the
+    # offline 1w rolling window byte-equal closure (capped at 50k
+    # bars in offline `_window_and_aggregate`).
+    assert 50_000 <= len(df) <= 100_000
 
 
 def test_shipped_sidecar_loads_into_buffer():

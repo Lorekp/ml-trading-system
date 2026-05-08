@@ -775,6 +775,79 @@ Critical correction to original audit framing: "no h15m TransVol checkpoint, no 
 - **C1 (round-2 carryover) closed strictly** — all 30 affected columns byte-equal at `rtol=1e-5, atol=1e-7`
 - Round-3 audit ladder transitions from "P0+P1 closure-complete" to "**all DOCUMENTED-DEVIATIONS closure-complete on the signal-stream side**"
 
+### Round-3 cycle 8 closure summary (2026-05-08) — P2/P3 + C2 + C3
+
+| Status | Count | Items |
+|---|---:|---|
+| P2/P3 closed | 11 | F-5, F-8, R-7, R-8, E-9, S-7, S-9, D-13, O-3, O-7, O-8 |
+| Doc-only | 1 | S-5 (max_open_positions absent in backtester — accepted-by-design at h=15m; lethal at h=5m per audit) |
+| C3 (HAR-PD pre-fix drift) | DONE | quantified via `scripts/audit_har_pd_pre_fix_drift.py`; sidecar at `vol_arb/output/har_pd_pre_fix_drift_audit.json` |
+| C2 (overnight retrain trigger) | DONE | `--force` flag added to `scripts/round4_recertify_walkforward.py`; overnight job operator-triggerable |
+| OPEN — P2/P3 hygiene | ~5 | F-9 (info-only "no finding"), E-10 (info-only TTL), E-11 (strangle routing, conditional accept), E-12 (structural — accepted), D-12 (no issue), R-10 (semantic agreement) — all explicit no-action items |
+
+**Cycle 8 totals**: ~250 LOC source + ~100 LOC tests across 4 sequenced commits:
+
+- `43acd5e` — Batch A (5 fixes): R-7, E-9, S-7, D-13, O-7
+- `971b54a` — Batch B (5 fixes): F-5, F-8, R-8, O-3, O-8
+- *(this commit)* — C3 audit script + C2 `--force` flag + audit ledger flip
+
+**The 11 closed P2/P3 fixes**:
+
+- **R-7**: V2 preset disables `min_single_trade_btc` symmetric to D10's max-side disable.
+- **E-9**: bar-aligned exit anchors to `signal.timestamp` (signal's bar boundary), not `started_at` (post-fill wall-clock). Drifts under broker latency eliminated.
+- **S-7**: defence-in-depth `PaperConfig.validate_preset_invariants()` + engine-startup WARN logs catch silent V2-config mutation that the V2-parity test can't see.
+- **D-13**: `derive_dt_years` shared helper; eliminates the 3-way duplicated-formula drift risk between cfg.__post_init__ / env / live.
+- **O-7**: perp $10-lot rounding bias characterisation. Implementation correct (banker's + tracked-inventory residual carry); regression test locks the bound.
+- **F-5**: `_h_n_bars_in_window` computes the live count from the dollar-bar buffer (was baseline-frozen).
+- **F-8**: handler-exception fallbacks now ERROR-level + counted on the assembler.
+- **R-8**: dedicated `_consecutive_latency_breaches` counter; latency and execution-error tracks are independent.
+- **O-3**: `IdempotencyGuard` TTL bumped 60s → 180s so the guard window strictly exceeds maker_wait + IOC ladder.
+- **O-8**: straddle position-opened records EFFECTIVE filled n_contracts = min(call_filled, put_filled), not requested.
+- **S-9**: term-slope degenerate-slice handling already correct in cycle 5; locked by existing tests.
+
+**C3 (HAR-PD historical replay audit)**: a focused replay script
+(`scripts/audit_har_pd_pre_fix_drift.py`) replays a recent 3000-bar
+TSRV slice through both the pre-`fd3e04b` (silent-failure, frozen
+prewarm) and post-fix (live-advancing) paths and quantifies per-bar
+drift. Output (2026-03-30 → 2026-04-30 window):
+
+- `har_pd_R1_a005`/`a01`/`a03`: mean |Δ| ≤ 5.5e-5 (negligible)
+- `har_pd_R2_b005`: mean |Δ| 0.385, peak 0.515
+- `har_pd_R2_b01`: mean |Δ| 0.541, peak 0.675
+- `har_pd_R2_b03`: mean |Δ| 0.699, peak 0.914
+
+The `R2_b*` features (which weight `rv_ann` exponentially over the
+trailing 24h) drifted materially — the pre-fix pipeline read an
+~30-day-stale prewarm baseline forever. The fix is correct going
+forward (cycle 4 `BarTSRV.rv_ann` derived property); historical live
+sessions in the affected window had a systematically biased HAR-PD
+input row.
+
+**C2 (overnight retrain trigger)**: added `--force` flag to
+`scripts/round4_recertify_walkforward.py`. Pre-cycle-8 the
+orchestrator silently skipped already-trained months
+(`_missing_months`); `--force` retrains all requested months
+in-place. Operator workflow:
+
+```bash
+python scripts/round4_recertify_walkforward.py --asset BTCUSDT \
+    --months 2025-11 2025-12 2026-01 2026-02 2026-03 2026-04 \
+    --force \
+    --report vol_model/output/round4_recertification_cycle8_full.md
+```
+
+The actual overnight retrain (~8-12h compute) is reserved for
+operator-initiated execution; cycle 8 ships only the trigger
+capability + a sanity `--skip-train` validation against the existing
+`expanding_pruned_svi_har_pd_v1/2026-04` checkpoint.
+
+**Cumulative round-3 progress (cycles 1-8)**:
+- **10 P0s closed**, 1 rejected (S-4), 0 deferred — all P0s resolved
+- **15 P1s closed**, 3 rejected — all P1s resolved
+- **15 P2s closed** (4 prior cycles + 11 cycle 8); 6 informational/no-action
+- **C1 + C2 + C3 round-2 carryovers all closed**
+- Round-3 audit ladder is now **substantively closure-complete**: all P0/P1/P2 and round-2-carryover items resolved on the signal-stream + execution surfaces. Remaining open items (~6) are explicit information-only or accepted-by-design entries.
+
 **Cycle 5 totals**: ~590 LOC source (3 new feature methods + 22 handler registrations + verification script + Unicode-bug ride-along) + ~360 LOC tests across 1 new file (`test_live_features_s1b.py`). 4 commits:
 - `f69aa66` — S-1b Phase 1a: hurst_100 + ffd_rv + rv_zscore live equivalents (16 byte-equal tests)
 - `60e7d7f` — S-1b Phase 1b: register 22 live handlers across 8 base groups

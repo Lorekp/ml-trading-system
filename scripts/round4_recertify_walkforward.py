@@ -7,19 +7,19 @@ report against pre-registered acceptance gates.
 
 The model itself was already trained on Binance Spot dollar-bar features
 (the same venue F3 + round-4 F6 now feed live), so this run is a
-*recertification* — verifying the model is stable on the post-F3 live
-distribution and absorbing newer market data — not a retrain to fix a
+*recertification*  --  verifying the model is stable on the post-F3 live
+distribution and absorbing newer market data  --  not a retrain to fix a
 distribution mismatch.
 
 Pre-registered gates:
 
 * **Pass**: every retrained month has QLIKE within trailing-3mo
-  median ±10%; SHAP top-5 features stable (Spearman ≥ 0.7 vs prior
+  median +/-10%; SHAP top-5 features stable (Spearman >= 0.7 vs prior
   month); F3-feature parity within 1% rel.
-* **Conditional pass**: 1-2 months marginal but trend stable → ship
+* **Conditional pass**: 1-2 months marginal but trend stable -> ship
   with note.
 * **Fail**: any month QLIKE > +15% vs trailing baseline OR any F3
-  feature > 5% live-vs-offline drift → halt, investigate, file as
+  feature > 5% live-vs-offline drift -> halt, investigate, file as
   round-5 finding.
 
 This script does NOT deploy a new model. It generates the new month-keyed
@@ -30,7 +30,7 @@ metrics + decision-gate verdict.
 
 Usage::
 
-    # Smoke test (1 month, ~15-20 min) — verifies pipeline before
+    # Smoke test (1 month, ~15-20 min)  --  verifies pipeline before
     # committing to the overnight 6-month run.
     PYTHONPATH=. python scripts/round4_recertify_walkforward.py \\
         --asset BTCUSDT --months 2026-04 \\
@@ -49,7 +49,7 @@ Usage::
 
 Note on month selection:
     Each YYYY-MM month requires forward-realised RV labels for the WHOLE
-    month — at horizon=15min that's ~the first 15 minutes of the next
+    month  --  at horizon=15min that's ~the first 15 minutes of the next
     month. As of 2026-05-08, full-label coverage extends through 2026-04.
     Months later than 2026-04 will train on partial-coverage label data.
 """
@@ -72,16 +72,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger = logging.getLogger(__name__)
 
-# Pre-registered gates — empirically calibrated against the production
+# Pre-registered gates  --  empirically calibrated against the production
 # walk-forward's natural QLIKE noise. Initial draft (10% / 15%) was too
-# tight: the existing 50-month walk-forward shows ±30% drift between
+# tight: the existing 50-month walk-forward shows +/-30% drift between
 # adjacent months simply from realised-vol regime swings (2025-12 vs
 # 2025-11 = +33%, 2026-02 vs 2026-01 = -28%). Those are HEALTHY months
 # the production model was certified on. Real degradation looks like
 # >50% sustained drift over several months, NOT a single 30% spike.
-PASS_QLIKE_MAX_REL_DRIFT = 0.30           # ≤30% vs trailing-3mo median
+PASS_QLIKE_MAX_REL_DRIFT = 0.30           # <=30% vs trailing-3mo median
 FAIL_QLIKE_MAX_REL_DRIFT = 0.50           # >50% triggers a HARD FAIL
-PASS_SHAP_TOP5_SPEARMAN_MIN = 0.70        # Spearman ≥0.7 vs prior month
+PASS_SHAP_TOP5_SPEARMAN_MIN = 0.70        # Spearman >=0.7 vs prior month
 PASS_F3_FEATURE_DRIFT_MAX = 0.01          # 1% rel
 FAIL_F3_FEATURE_DRIFT_MAX = 0.05          # 5% rel
 
@@ -111,7 +111,7 @@ def _run_walkforward_subprocess(
 
     The walk-forward script is the production training cadence
     (``vol_model/run_walkforward_pruned_svi_har_pd.py``). We delegate to
-    it via subprocess so the orchestration stays decoupled — any script
+    it via subprocess so the orchestration stays decoupled  --  any script
     changes (Optuna config, feature pipeline, callbacks) come along
     automatically.
 
@@ -121,7 +121,7 @@ def _run_walkforward_subprocess(
     trained months internally that's a no-op, otherwise it overwrites.
     """
     if not months:
-        logger.warning("no months to train — skipping subprocess")
+        logger.warning("no months to train  --  skipping subprocess")
         return 0
     start = min(months)
     end = max(months)
@@ -150,7 +150,7 @@ def _per_month_qlike(predictions_dir: Path, months: list[str]) -> dict:
     pred_path = predictions_dir / "BTCUSDT_pruned_svi_har_pd_predictions.parquet"
     if not pred_path.exists():
         logger.warning(
-            "predictions parquet not found at %s — skipping QLIKE eval", pred_path,
+            "predictions parquet not found at %s  --  skipping QLIKE eval", pred_path,
         )
         return {}
     df = pd.read_parquet(pred_path)
@@ -246,7 +246,7 @@ def _write_report(
         verdict = "PASS"
 
     lines = [
-        f"# Round-4 recertification report — {asset}",
+        f"# Round-4 recertification report  --  {asset}",
         "",
         f"**Verdict**: **{verdict}** ({n_pass} pass / {n_cond} cond / {n_fail} fail)",
         "",
@@ -259,7 +259,7 @@ def _write_report(
         "",
         "## Pre-registered gates",
         "",
-        f"* PASS: per-month QLIKE drift ≤ {PASS_QLIKE_MAX_REL_DRIFT:.0%} vs trailing-3mo median.",
+        f"* PASS: per-month QLIKE drift <= {PASS_QLIKE_MAX_REL_DRIFT:.0%} vs trailing-3mo median.",
         f"* CONDITIONAL_PASS: drift ∈ ({PASS_QLIKE_MAX_REL_DRIFT:.0%}, {FAIL_QLIKE_MAX_REL_DRIFT:.0%}].",
         f"* FAIL: drift > {FAIL_QLIKE_MAX_REL_DRIFT:.0%}.",
         "",
@@ -270,8 +270,8 @@ def _write_report(
     ]
     for m in sorted(gates.keys()):
         v = gates[m]
-        b = "—" if v["baseline"] is None else f"{v['baseline']:.4f}"
-        d = "—" if v["drift_rel"] is None else f"{v['drift_rel']:+.2%}"
+        b = " -- " if v["baseline"] is None else f"{v['baseline']:.4f}"
+        d = " -- " if v["drift_rel"] is None else f"{v['drift_rel']:+.2%}"
         lines.append(
             f"| {m} | {v['qlike']:.4f} | {b} | {d} | {v['status']} |"
         )
@@ -319,7 +319,7 @@ def _write_report(
     lines.append("")
     lines.append(
         "This report measures the production model's QLIKE drift across "
-        "calendar months. F3+F6 change LIVE feature computation only — "
+        "calendar months. F3+F6 change LIVE feature computation only  --  "
         "they do not modify the offline training pipeline. So the QLIKE "
         "drift here reflects natural market regime variation, NOT any "
         "F3/F6 effect. The real F3/F6 certification is a live-vs-offline "
@@ -329,7 +329,7 @@ def _write_report(
     )
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Explicit UTF-8 — the report uses ≤/×/% chars and we run on Windows
+    # Explicit UTF-8  --  the report uses <=/×/% chars and we run on Windows
     # where the default cp1252 codec barfs.
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger.info("Wrote recertification report to %s", out)
@@ -362,6 +362,17 @@ def main() -> int:
         help="Skip the walk-forward subprocess; only re-evaluate metrics.",
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help=(
+            "C2 (parity-r3 cycle 8  --  2026-05-08): retrain ALL requested "
+            "months, including those with existing checkpoints. Pre-cycle-8 "
+            "the orchestrator silently skipped already-trained months "
+            "(``_missing_months``); this flag overrides that for the "
+            "operational overnight retrain workflow. Use with care: "
+            "overwrites existing checkpoints in-place."
+        ),
+    )
+    parser.add_argument(
         "--extra-arg", action="append", default=[],
         help="Extra arg to pass to run_walkforward_pruned_svi_har_pd.py.",
     )
@@ -375,8 +386,20 @@ def main() -> int:
     )
 
     requested = list(args.months)
-    skipped = [m for m in requested if m in _existing_checkpoints(args.model_dir)]
-    to_train = _missing_months(args.model_dir, requested)
+    if args.force:
+        # C2 (cycle 8): retrain everything regardless of existing
+        # checkpoints. ``skipped`` becomes empty, ``to_train`` is the
+        # full requested list.
+        skipped: list[str] = []
+        to_train = list(requested)
+        logger.warning(
+            "Recertification: --force in effect; OVERWRITING %d "
+            "existing checkpoints under %s",
+            len(_existing_checkpoints(args.model_dir)), args.model_dir,
+        )
+    else:
+        skipped = [m for m in requested if m in _existing_checkpoints(args.model_dir)]
+        to_train = _missing_months(args.model_dir, requested)
     logger.info(
         "Recertification: requested=%d, already trained=%d, to train=%d",
         len(requested), len(skipped), len(to_train),

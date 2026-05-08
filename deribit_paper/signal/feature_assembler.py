@@ -367,6 +367,53 @@ def _make_dollar_bar_handler(
     return _handler
 
 
+def _h_parkinson_1d(ctx: "AssemblerContext") -> float:
+    """F-3 (parity-r3 cycle 2 — 2026-05-08): parkinson_1d with dynamic bpd.
+
+    Pre-fix the window was hardcoded to 250. Offline derives ``bpd``
+    per training run via ``avg_bars_per_day(bars.index, trailing_days=30)``
+    in ``vol_model/features/engineer.py:485``; the rolling window then
+    matches per-asset / per-regime activity. Live now reads bpd from
+    the dollar-bar buffer at handler-call time so the rolling window
+    matches the offline pipeline byte-for-byte (within the cold-start
+    fallback at bpd=250).
+    """
+    feats = ctx.dollar_bar_features
+    if feats is None:
+        return _baseline_or_nan(ctx, "parkinson_1d")
+    try:
+        bpd = feats.bars_per_day()
+        v = feats.parkinson_1d(bpd)
+    except (KeyError, ValueError, TypeError):
+        return _baseline_or_nan(ctx, "parkinson_1d")
+    if v is None or not np.isfinite(v):
+        return _baseline_or_nan(ctx, "parkinson_1d")
+    return float(v)
+
+
+def _h_parkinson_1d_ema50(ctx: "AssemblerContext") -> float:
+    """F-3 (parity-r3 cycle 2 — 2026-05-08): parkinson_1d_ema50 with
+    dynamic ``rolling_window=bpd``.
+
+    Pairs with :func:`_h_parkinson_1d` — both feed the same rolling-mean
+    series internally (``DollarBarFeatures._parkinson_1d_rolling_series``
+    caches per window), so calling both with the same ``bpd`` keeps the
+    cache hit-rate high. The ``span`` stays 50 — that's the EMA span
+    over the rolling-mean column, not a window count.
+    """
+    feats = ctx.dollar_bar_features
+    if feats is None:
+        return _baseline_or_nan(ctx, "parkinson_1d_ema50")
+    try:
+        bpd = feats.bars_per_day()
+        v = feats.parkinson_1d_ema(50, rolling_window=bpd)
+    except (KeyError, ValueError, TypeError):
+        return _baseline_or_nan(ctx, "parkinson_1d_ema50")
+    if v is None or not np.isfinite(v):
+        return _baseline_or_nan(ctx, "parkinson_1d_ema50")
+    return float(v)
+
+
 # ── F3 Tier 5 (parity-cycle round 3 — 2026-05-07): 6 TSRV-grid handlers ──
 # Each reads from ``ctx.tsrv_features`` (cached wrapper around the live
 # ``TSRVHistoryBuffer``). Falls back to ``_baseline_or_nan`` when the
@@ -438,8 +485,9 @@ _LIVE_HANDLERS: dict[str, Callable[[AssemblerContext], float]] = {
     "duration_s_lag3":     _make_dollar_bar_handler("duration_s_lag3", "lag", "duration_s", 3),
     "n_trades_ema10":      _make_dollar_bar_handler("n_trades_ema10", "ema", "n_trades", 10),
     "n_trades_ema50":      _make_dollar_bar_handler("n_trades_ema50", "ema", "n_trades", 50),
-    "parkinson_1d":        _make_dollar_bar_handler("parkinson_1d", "parkinson_1d", 250),
-    "parkinson_1d_ema50":  _make_dollar_bar_handler("parkinson_1d_ema50", "parkinson_1d_ema", 50),
+    # F-3 (parity-r3 cycle 2 — 2026-05-08): dynamic bpd-driven window.
+    "parkinson_1d":        _h_parkinson_1d,
+    "parkinson_1d_ema50":  _h_parkinson_1d_ema50,
     # F3 Tier 5 — TSRV-grid handlers. Live values when the
     # TSRVHistoryBuffer is wired (Tier 6); baseline-fallback otherwise.
     # tsrv_mean_1d already overridden above (was baseline-fallback only).

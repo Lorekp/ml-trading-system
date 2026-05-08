@@ -514,6 +514,17 @@ class PaperConfig:
         cfg.kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
         cfg.bar_exec_quality_path = "vol_arb/output/bar_execution_quality.parquet"
         cfg.use_tiered_taker = True   # E.1.6: 3-tier ladder at all 4 IOC sites
+        # S-8 (parity-r3 cycle 2 — 2026-05-08): the canonical V2 trade log
+        # was generated via ``BacktestConfig.with_btc_production_filters_v2().with_realistic_costs()``,
+        # and ``with_realistic_costs()`` flips ``base_spread_iv 1.5 → 2.0``
+        # (vol_arb/backtester.py:464). Pre-fix the live ``with_v2_preset``
+        # missed this — bare ``PaperConfig.with_v2_preset()`` left
+        # ``base_spread_iv = 1.5`` (the default), producing a tighter
+        # half-spread than V2 canon. Live now matches the canonical V2
+        # trade-log generator. The 0.5-vol-pt difference flows through
+        # ``Predictor._dynamic_half_spread`` (predictor.py:233) to entry
+        # threshold gating.
+        cfg.base_spread_iv = 2.0
         return cfg
 
     def ensure_dirs(self) -> None:

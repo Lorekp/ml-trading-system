@@ -61,6 +61,17 @@ class Signal:
     # at the trade's strike on every intra-bar hedge tick. ``None`` when
     # the calibrator is uncalibrated (warmup) or no slice matches.
     svi_slice: dict[str, float] | None = None
+    # S-3 (parity-r3 cycle 2 — 2026-05-08): tags the source of
+    # ``iv_used_pct``. ``"svi"`` when the SVI surface returned a finite
+    # value; ``"tsrv_proxy"`` when the predictor fell through to the
+    # bar's ``vol_ann_continuous*100`` (DVOL substitute during SVI
+    # warmup or per-expiry slice gaps); ``""`` for flat signals where
+    # iv_used was never resolved. Mirrors the backtester's 3-tier
+    # ``svi_iv_matched → iv → dvol_close`` fallback in
+    # ``vol_arb/backtester.py:905-911`` — minus the option-chain ``iv``
+    # tier (live has no aggregated option-chain IV reader yet; that's
+    # a separate cycle if/when DVOLStream is wired).
+    iv_source: str = ""
     reason: str = ""                   # human-readable explanation
 
     @property
@@ -202,16 +213,19 @@ class Predictor:
         rv_pred_decimal = math.exp(pred_ln)
         rv_pred_pct = rv_pred_decimal * 100.0
 
-        # 3) SVI IV at the ATM strike — this is the 'iv_used' the
-        #    backtester feeds into the signal computation.  If the
-        #    straddle picker returned None or SVI isn't calibrated yet,
-        #    fall back to the bar's ``vol_ann_continuous`` (same unit).
-        iv_used_pct = self._lookup_iv(bar, straddle)
-        if iv_used_pct is None:
+        # 3) Resolve iv_used via the 2-tier fallback chain (S-3, parity-r3
+        #    cycle 2 — 2026-05-08). Primary: SVI at the ATM strike (the
+        #    backtester's ``svi_iv_matched`` column). Fallback: TSRV
+        #    realised-vol proxy (substitute for ``dvol_close`` until a
+        #    DVOLStream is wired). Both tiers stamp ``iv_source`` on the
+        #    emitted signal so the harness can audit which was used.
+        iv_lookup = self._lookup_iv(bar, straddle, bar_tsrv=bar_tsrv)
+        if iv_lookup is None:
             return self._flat_signal(
                 bar, bar_tsrv, rv_pred_pct,
-                reason="iv_used unavailable (no SVI slice or no straddle)",
+                reason="iv_used unavailable (no SVI slice, no straddle, no TSRV)",
             )
+        iv_used_pct, iv_source = iv_lookup
 
         # 4) Edge + signal direction — mirrors backtester's generate_signals() exactly:
         #    dynamic half-spread widens the effective threshold during stress
@@ -319,6 +333,7 @@ class Predictor:
             term_slope_1w_2w=term_slope,
             straddle=straddle if direction != 0 else None,
             svi_slice=svi_slice_params,
+            iv_source=iv_source,  # S-3 (2026-05-08): "svi" or "tsrv_proxy"
             reason=reason,
         )
 
@@ -362,33 +377,61 @@ class Predictor:
         return float(atm_2w - atm_1w)
 
     def _lookup_iv(
-        self, bar: Bar, straddle: StraddleSelection | None,
-    ) -> float | None:
-        """Look up the SVI IV at the ATM strike for this bar.
+        self,
+        bar: Bar,
+        straddle: StraddleSelection | None,
+        bar_tsrv: BarTSRV | None = None,
+    ) -> tuple[float, str] | None:
+        """Look up the IV used for edge computation, with fallback chain.
 
-        Uses the frozen SVI params from :class:`LiveSVICalibrator` via
-        ``evaluate_surface_batch``.  Returns None if:
-        - No straddle was picked for this bar, OR
-        - SVI has no params cached yet (before the first successful calibration), OR
-        - The SVI slice for the straddle's expiry has no entries.
+        S-3 (parity-r3 cycle 2 — 2026-05-08): mirrors the backtester's
+        2-tier fallback (``vol_arb/backtester.py:905-911``):
+
+        1. **SVI** at the ATM strike (primary). Returns ``(iv, "svi")``.
+        2. **TSRV proxy**: ``vol_ann_continuous × 100`` from ``bar_tsrv``
+           — a realised-vol stand-in for ``dvol_close`` so the predictor
+           can still emit edge during SVI warmup / per-expiry slice gaps.
+           Returns ``(proxy, "tsrv_proxy")``.
+
+        The backtester's middle tier (option-chain ``iv``) is omitted —
+        live has no aggregated option-chain IV reader (option_trades
+        comes through raw; aggregating to a stable per-bar IV would be
+        its own cycle). When DVOLStream is wired in a future cycle the
+        proxy can be replaced with the true DVOL value at no API change.
+
+        Returns ``None`` only when ``straddle`` is ``None`` (no candidate
+        to evaluate against) OR all fallbacks are unavailable. The caller
+        reads the second tuple element and stamps ``signal.iv_source``.
         """
         if straddle is None:
             return None
-        if not self._svi.has_params:
-            return None
-        query = pd.DataFrame({
-            "timestamp": [bar.timestamp],
-            "strike": [float(straddle.strike)],
-            "expiry_dt": [pd.Timestamp(straddle.expiry_dt)],
-            "index_price": [float(bar.index_price) if bar.index_price is not None else float(straddle.index_price)],
-        })
-        result = self._svi.evaluate(query)
-        if result is None or result.empty:
-            return None
-        iv = float(result.iloc[0])
-        if not math.isfinite(iv) or iv <= 0.0:
-            return None
-        return iv
+        # ── Tier 1: SVI ──
+        if self._svi.has_params:
+            query = pd.DataFrame({
+                "timestamp": [bar.timestamp],
+                "strike": [float(straddle.strike)],
+                "expiry_dt": [pd.Timestamp(straddle.expiry_dt)],
+                "index_price": [
+                    float(bar.index_price) if bar.index_price is not None
+                    else float(straddle.index_price)
+                ],
+            })
+            result = self._svi.evaluate(query)
+            if result is not None and not result.empty:
+                iv = float(result.iloc[0])
+                if math.isfinite(iv) and iv > 0.0:
+                    return (iv, "svi")
+        # ── Tier 2: TSRV proxy ──
+        if bar_tsrv is not None:
+            tsrv_iv = float(bar_tsrv.vol_ann_continuous) * 100.0
+            if math.isfinite(tsrv_iv) and tsrv_iv > 0.0:
+                logger.info(
+                    "S-3: SVI uncalibrated / no slice for %s; "
+                    "falling back to TSRV proxy iv=%.2f%%",
+                    straddle.expiry_dt, tsrv_iv,
+                )
+                return (tsrv_iv, "tsrv_proxy")
+        return None
 
     def _flat_signal(
         self,

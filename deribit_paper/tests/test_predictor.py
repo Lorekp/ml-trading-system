@@ -197,11 +197,45 @@ def test_flat_when_no_straddle():
     assert not sig.is_actionable
 
 
-def test_flat_when_svi_not_yet_calibrated():
-    """If SVI has no params yet, fall back to FLAT (iv_used unavailable)."""
+def test_predictor_falls_back_to_tsrv_proxy_when_svi_uncalibrated():
+    """S-3 (parity-r3 cycle 2 — 2026-05-08): when SVI has no params yet,
+    the predictor falls back to ``bar_tsrv.vol_ann_continuous × 100`` as
+    a DVOL proxy and emits a signal with ``iv_source='tsrv_proxy'``.
+
+    Pre-fix the predictor returned flat — silent emit/skip asymmetry vs
+    the backtester's ``svi_iv_matched.fillna(iv).fillna(dvol_close)``
+    chain (vol_arb/backtester.py:905-911).
+    """
     predictor = _make_predictor(rv_pred_pct=125.0, iv_used_pct=75.0)
     predictor._svi.has_params = False  # simulate cold start
     bar = _make_bar()
-    sig = predictor.predict(bar, _make_tsrv(), straddle=_make_straddle())
+    tsrv = _make_tsrv()
+    sig = predictor.predict(bar, tsrv, straddle=_make_straddle())
+    # S-3: signal NOT flat (fallback fired)
+    assert sig.direction != 0, (
+        "S-3 regression: predictor should fall back to TSRV proxy on "
+        "SVI cold-start, not return flat"
+    )
+    assert sig.iv_source == "tsrv_proxy"
+    # iv_used_pct should equal vol_ann_continuous × 100
+    expected_iv = float(tsrv.vol_ann_continuous) * 100.0
+    assert sig.iv_used_pct == pytest.approx(expected_iv, rel=1e-6)
+
+
+def test_predictor_returns_flat_when_both_iv_tiers_unavailable():
+    """When BOTH SVI is uncalibrated AND vol_ann_continuous is invalid,
+    both fallback tiers fail and the predictor correctly returns flat
+    with the iv-unavailable reason."""
+    predictor = _make_predictor(rv_pred_pct=125.0, iv_used_pct=75.0)
+    predictor._svi.has_params = False
+    bar = _make_bar()
+    bad_tsrv = BarTSRV(
+        tsrv=0.0, rv_fast=0.0, rv_slow=0.0, bpv=0.0, medrv=0.0,
+        continuous_var=0.0, jump_var=0.0, jump_fraction=0.0,
+        rs_down=0.0, rs_up=0.0, down_jump_fraction=0.0, up_jump_fraction=0.0,
+        n_ticks=0, n_sub_bars=0, n_dash=0.0,
+        vol_ann=0.0, vol_ann_continuous=0.0,  # invalid → tier-2 fails
+    )
+    sig = predictor.predict(bar, bad_tsrv, straddle=_make_straddle())
     assert sig.direction == 0
     assert "unavailable" in sig.reason.lower()

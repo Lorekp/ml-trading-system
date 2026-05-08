@@ -172,6 +172,31 @@ class DollarBarFeatures:
 
     # ── public API ──────────────────────────────────────────────────
 
+    def bars_per_day(self, *, trailing_days: int = 30) -> int:
+        """Estimate the dollar-bar density (bars per UTC day).
+
+        F-3 (parity-r3 cycle 2 — 2026-05-08): mirrors offline's
+        ``vol_model/features/engineer.py::avg_bars_per_day`` byte-for-byte.
+        Replaces the hardcoded ``window=250`` that the parkinson_1d /
+        parkinson_1d_ema50 handlers used pre-fix — offline derives ``bpd``
+        from the trailing 30 days of bar timestamps per training run, so
+        the rolling-mean window matches per-asset / per-regime activity.
+
+        Floor at 10 (matches offline) so a near-empty buffer can't push
+        the rolling window below the offline ``min_periods`` floor.
+        """
+        self._refresh()
+        df = self._cached_df
+        if df is None or len(df) < 2:
+            return 250  # F-3 cold-start fallback (matches pre-fix behaviour)
+        idx = df.index
+        cutoff = idx[-1] - pd.Timedelta(days=trailing_days)
+        recent = idx[idx >= cutoff]
+        if len(recent) < 2:
+            return 250
+        n_days = max((recent[-1] - recent[0]).days, 1)
+        return max(int(len(recent) / n_days), 10)
+
     def latest_raw(self, name: str) -> float | None:
         """Return the most-recent dollar bar's raw value for ``name``.
 

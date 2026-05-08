@@ -191,17 +191,26 @@ def test_assembler_dispatches_dollar_bar_handlers_with_wired_buffer(stub_parquet
     assert row.as_dict["duration_s_lag3"] == pytest.approx(feats.lag("duration_s", 3))
     assert row.as_dict["n_trades_ema10"] == pytest.approx(feats.ema("n_trades", 10))
     assert row.as_dict["n_trades_ema50"] == pytest.approx(feats.ema("n_trades", 50))
-    # parkinson_1d_ema50 needs ≥62 bars (rolling_window=250's
-    # min_periods); with 60 bars in the buffer, the rolling-mean
-    # series is all-NaN at the latest sample so feats.parkinson_1d_ema
-    # returns None. Per the F-2 fix (round-3 audit, 2026-05-08) the
-    # handler falls back to baseline (10.0) per the stub parquet.
-    assert feats.parkinson_1d_ema(50) is None
-    assert row.as_dict["parkinson_1d_ema50"] == pytest.approx(10.0)
+    # F-3 (parity-r3 cycle 2 — 2026-05-08): handler now uses
+    # ``feats.bars_per_day()`` instead of hardcoded window=250. With
+    # 60 synthetic bars over a 15-hour span, ``bars_per_day`` returns
+    # 60 (max(60/1, 10)), so the rolling window matches the buffer size
+    # and ``parkinson_1d_ema(50, rolling_window=60)`` returns a real
+    # value. The handler matches the helper's output byte-for-byte.
+    bpd = feats.bars_per_day()
+    expected = feats.parkinson_1d_ema(50, rolling_window=bpd)
+    assert expected is not None and np.isfinite(expected)
+    assert row.as_dict["parkinson_1d_ema50"] == pytest.approx(expected)
 
 
-def test_parkinson_1d_falls_back_to_baseline_when_underfull(stub_parquets):
-    """parkinson_1d needs 250 dollar bars; buffer with 60 should fall back."""
+def test_parkinson_1d_dynamic_bpd_returns_value_when_buffer_has_30_days(stub_parquets):
+    """F-3 (parity-r3 cycle 2 — 2026-05-08): with 60 bars over a 15-hr
+    span, ``bars_per_day`` returns 60 (the buffer length / 1 day floor),
+    so the rolling window adapts to the buffer's density and the
+    parkinson value is computable instead of underfull-fallback. Pre-fix
+    the handler used hardcoded window=250 which always under-fulled at
+    60 bars and fell back to baseline.
+    """
     base_path, _ = stub_parquets
     buf = _populate_buffer(60)
     bundle = _StubBundle(lgbm_features=["parkinson_1d"])
@@ -214,7 +223,36 @@ def test_parkinson_1d_falls_back_to_baseline_when_underfull(stub_parquets):
     bar = _StubBar(timestamp=pd.Timestamp("2026-05-07 12:15", tz="UTC"))
     row = assembler.build_row(bar, _StubTSRV())
     assert row is not None
-    # Falls back to baseline value 1.23e-5
+    # Real value (NOT baseline 1.23e-5) — the dynamic bpd matches the
+    # buffer density so parkinson_1d resolves.
+    feats = DollarBarFeatures(buf)
+    bpd = feats.bars_per_day()
+    expected = feats.parkinson_1d(bpd)
+    assert expected is not None and np.isfinite(expected)
+    assert row.as_dict["parkinson_1d"] == pytest.approx(expected)
+    # Sanity: NOT the baseline-frozen value
+    assert row.as_dict["parkinson_1d"] != pytest.approx(1.23e-5)
+
+
+def test_parkinson_1d_falls_back_to_baseline_on_empty_buffer(stub_parquets):
+    """F-3: empty buffer → bars_per_day returns its 250 cold-start
+    fallback, the handler tries window=250 against an empty buffer
+    (zero-length parkinson_bar series), which returns None → baseline
+    fallback fires."""
+    base_path, _ = stub_parquets
+    buf = _populate_buffer(0)
+    bundle = _StubBundle(lgbm_features=["parkinson_1d"])
+    assembler = FeatureAssembler(
+        features_parquet=base_path,
+        svi_features_parquet=None,
+        bundle=bundle,
+        dollar_bar_buffer=buf,
+    )
+    bar = _StubBar(timestamp=pd.Timestamp("2026-05-07 12:15", tz="UTC"))
+    row = assembler.build_row(bar, _StubTSRV())
+    assert row is not None
+    # Baseline value 1.23e-5 because the empty buffer can't satisfy
+    # the rolling window.
     assert row.as_dict["parkinson_1d"] == pytest.approx(1.23e-5)
 
 

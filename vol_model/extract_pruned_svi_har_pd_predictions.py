@@ -65,7 +65,7 @@ def main() -> None:
                              "model dir, SVI features, pruned feature list, "
                              "TransVol checkpoints, and output path per asset.")
     parser.add_argument("--start", default="2022-02")
-    parser.add_argument("--end", default="2026-03")
+    parser.add_argument("--end", default="2026-04")
     parser.add_argument("--model-dir", type=str, default="",
                         help="Override model dir (else per-asset resolver)")
     parser.add_argument("--output", type=str, default="",

@@ -275,6 +275,16 @@ class BacktestConfig(BaseModel):
     # None disables (default — reproduces legacy behavior).
     skip_long_if_term_slope_gt: float | None = None
 
+    # skip_short_if_skew_1w_gt: mute SHORT signals when 1w 25-delta skew
+    # (``svi_25d_skew_1w``, positive = call-bid relative to put-bid)
+    # exceeds this threshold. Cycle-10 sweep 2026-05-10: extreme call-skew
+    # shorts cluster in the 2022 LUNA/3AC/FTX trending-down regime
+    # (78 trades at skew>20 averaging -$43/trade, mean PnL flips negative
+    # at skew>10). Filter targets the regime where loosening thr_S admits
+    # bad shorts. Cuts 2022 hit by ~50%. Mirror of skip_long_if_term_slope_gt.
+    # None disables (default — reproduces legacy behavior).
+    skip_short_if_skew_1w_gt: float | None = None
+
     # ── DFL (Decision-Focused Learning) head filter ─────────────
     # When ``dfl_scores_path`` is set, load walk-forward P(win) scores
     # (per trade-fired bar) and MUTE bars whose P(win) falls below
@@ -639,8 +649,19 @@ class BacktestConfig(BaseModel):
             # accepted on 2026-04-20. See
             # vol_arb/output/KELLY_SHRINKAGE_PHASE2_REPORT.md and
             # memory/project_kelly_sizing_2026_04_21.md.
+            #
+            # Cycle-11 (2026-05-10): K1 extended with walk-forward
+            # term_slope_1w_2w amplifier — multiply by 1.25x on long
+            # bars where slope < per-month 20th-pctile of trailing-24m
+            # long-bar slopes. +$33K NC PnL (+3.2%), Sharpe -0.031
+            # (essentially unchanged), MDD UNCHANGED, 5/5 per-year
+            # strict pass. $/Sharpe-pt $1.07M (vs K1 adoption's $121K).
+            # Pre-committed before OOS, bootstrap p<0.0005 vs random
+            # null, K1-orthogonality verified. Phase-2 report:
+            # vol_arb/output/PHASE2_LONG_SIZING.md and memory:
+            # project_phase2_long_sizing_2026_05_10.md.
             kelly_mult_path=(
-                "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+                "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
             ),
         ))
 
@@ -658,6 +679,12 @@ class BacktestConfig(BaseModel):
         """
         return dict(
             entry_threshold_long=12.0,
+            # Cycle-10 (2026-05-10): short threshold loosened 22 -> 20
+            # to admit more profitable shorts, paired with new skew gate.
+            # Sweep showed 4/5 years gain (2022 essentially flat at -$582);
+            # +$43K NC PnL vs cycle-9, Sharpe -0.02 (neutral), MDD neutral.
+            # Real implementation matched post-hoc estimate within $1.4K.
+            entry_threshold=20.0,
             use_drl_hedging=True,
             use_profit_scaling=True,
             profit_scaling_floor=0.3,
@@ -669,6 +696,13 @@ class BacktestConfig(BaseModel):
             # (>=1.0) applied AFTER profit_scaling and BEFORE
             # dynamic_btc_cap clip. Walk-forward, leakage-tested.
             skip_long_if_term_slope_gt=0.0,
+            # Cycle-10 (2026-05-10): mirror-symmetric short filter to
+            # contango-long-skip. Drops shorts in extreme call-skew regime
+            # (svi_25d_skew_1w > 25, ~1% of fired shorts, almost entirely
+            # 2022 LUNA/3AC/FTX trending-down crisis era). Cuts 2022 hit
+            # nearly in half when paired with thr_S=20 loosening, making
+            # the cycle-10 ship strict-stability-passing.
+            skip_short_if_skew_1w_gt=25.0,
         )
 
     @classmethod
@@ -1126,6 +1160,27 @@ class VolArbBacktester:
                     "skip_long_if_term_slope_gt=%.2f set but "
                     "'svi_term_slope_1w_2w' column absent — skipping",
                     float(self.cfg.skip_long_if_term_slope_gt),
+                )
+
+        if self.cfg.skip_short_if_skew_1w_gt is not None:
+            if "svi_25d_skew_1w" in df.columns:
+                skew = df["svi_25d_skew_1w"].values
+                thr = float(self.cfg.skip_short_if_skew_1w_gt)
+                skew_mask = np.where(np.isnan(skew), False, skew > thr)
+                short_at_extreme_skew = skew_mask & (signal == -1)
+                n_muted = int(short_at_extreme_skew.sum())
+                if n_muted > 0:
+                    signal = np.where(short_at_extreme_skew, np.int8(0), signal).astype(np.int8)
+                    logger.info(
+                        "Entry filter (skew_1w): muted %d shorts "
+                        "(svi_25d_skew_1w > %.2f)",
+                        n_muted, thr,
+                    )
+            else:
+                logger.warning(
+                    "skip_short_if_skew_1w_gt=%.2f set but "
+                    "'svi_25d_skew_1w' column absent — skipping",
+                    float(self.cfg.skip_short_if_skew_1w_gt),
                 )
 
         # DFL head filter — walk-forward per-year quantile threshold.

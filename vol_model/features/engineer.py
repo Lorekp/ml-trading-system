@@ -181,11 +181,19 @@ def _hurst_subsampled(returns: np.ndarray, window: int = 100, step: int = 50) ->
             hurst_vals[idx] = np.clip(np.polyfit(log_n, log_rs, 1)[0], 0.0, 1.0)
 
     valid_mask = ~np.isnan(hurst_vals)
-    if valid_mask.sum() >= 2:
+    if valid_mask.sum() >= 1:
         vp = positions[valid_mask]
         vv = hurst_vals[valid_mask]
-        result = np.interp(np.arange(n), vp, vv)
-        result[:vp[0]] = np.nan
+        # Backward step-fill: bar i takes the most recent past anchor.
+        # NOT np.interp (two-sided) — that blends in the next FUTURE
+        # anchor whose source returns extend up to step=50 dollar bars
+        # past i, which after 15-min aggregation can pull data from the
+        # next label window. Step-fill is causal: result[i] = vv[k]
+        # where vp[k] is the largest anchor <= i. Pre-first-anchor
+        # bars stay NaN (no past anchor available).
+        for k in range(len(vp)):
+            end = vp[k + 1] if k + 1 < len(vp) else n
+            result[vp[k]:end] = vv[k]
 
     return result
 

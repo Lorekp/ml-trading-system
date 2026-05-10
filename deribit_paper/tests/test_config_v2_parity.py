@@ -50,15 +50,36 @@ def test_entry_threshold_long_is_12(v2_paper):
     assert v2_paper.entry_threshold_long == 12.0
 
 
-def test_entry_threshold_short_is_22(v2_paper):
-    """Mirrors V2 ``entry_threshold=22`` for short straddles (set in V1
-    production filters and inherited by V2)."""
-    assert v2_paper.entry_threshold == 22.0
+def test_entry_threshold_short_is_20(v2_paper):
+    """Cycle-10 (2026-05-10): short threshold loosened 22 -> 20.
+
+    Sweep showed +$43K NC PnL (+4.3%) vs cycle-9 baseline, Sharpe -0.02
+    (neutral), MDD neutral, 5/5 strict per-year stable. Paired with the
+    new ``skip_short_if_skew_1w_gt=25`` skew filter."""
+    assert v2_paper.entry_threshold == 20.0
 
 
 def test_skip_long_if_term_slope_gt_is_zero(v2_paper):
     """V2 contango filter — drop longs in IV contango (positive 1w-2w slope)."""
     assert v2_paper.skip_long_if_term_slope_gt == 0.0
+
+
+def test_skip_short_if_skew_1w_gt_is_25(v2_paper):
+    """Cycle-10 (2026-05-10): drop shorts when 1w 25-delta skew > 25.
+
+    Mirror-symmetric to ``skip_long_if_term_slope_gt`` contango filter.
+    Targets the 2022 LUNA/3AC/FTX trending-down regime where extreme
+    put-skew (downside-priced) shorts get crushed by left-tail vol."""
+    assert v2_paper.skip_short_if_skew_1w_gt == 25.0
+
+
+def test_max_gross_notional_usd_is_200k(v2_paper):
+    """Cycle-10 (2026-05-10): $30k default was sized for earlier BTC spot
+    regime; at BTC=$80k a single ATM straddle is $40-97k notional and
+    the $30k cap blocked 100% of fired signals (homeserver audit).
+    Bumped to $200k (~2x equity) as defence-in-depth that allows
+    legitimate trades. Backtester has no equivalent cap."""
+    assert v2_paper.max_gross_notional_usd == 200_000.0
 
 
 def test_target_margin_utilization_is_15pct(v2_paper):
@@ -72,9 +93,15 @@ def test_use_profit_scaling_enabled(v2_paper):
     assert v2_paper.profit_scaling_floor == 0.3
 
 
-def test_kelly_mult_path_is_k1(v2_paper):
-    """Kelly K1 sidecar adopted 2026-04-21."""
-    assert v2_paper.kelly_mult_path == "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+def test_kelly_mult_path_is_k1_slope(v2_paper):
+    """Cycle-11 (2026-05-10): K1 extended with walk-forward term_slope
+    amplifier (×1.25 on long bars where term_slope_1w_2w < per-month
+    20th-pctile of trailing-24m long-bar slopes). Replaces vanilla K1.
+    +$33K NC PnL (+3.2%), Sharpe -0.031, MDD unchanged, 5/5 per-year
+    strict pass. $/Sharpe-pt $1.07M (vs K1's $121K)."""
+    assert v2_paper.kelly_mult_path == (
+        "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
+    )
 
 
 def test_aligned_predictions_parquet_set(v2_paper):
@@ -178,6 +205,7 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
         ("use_profit_scaling",           "use_profit_scaling"),
         ("profit_scaling_floor",         "profit_scaling_floor"),
         ("skip_long_if_term_slope_gt",   "skip_long_if_term_slope_gt"),
+        ("skip_short_if_skew_1w_gt",     "skip_short_if_skew_1w_gt"),
         ("entry_threshold",              "entry_threshold"),
         ("holding_minutes",              "holding_minutes"),
         ("kelly_mult_path",              "kelly_mult_path"),

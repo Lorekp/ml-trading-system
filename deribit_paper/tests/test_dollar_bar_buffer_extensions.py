@@ -110,3 +110,78 @@ def test_buffer_evicts_at_60000_bars():
     assert len(buf) == 100
     base = pd.Timestamp("2026-04-30 00:00:00", tz="UTC")
     assert buf.timestamp_at(0) == base + pd.Timedelta(seconds=10 * 100)
+
+
+# ── pandas 3.x tz-aware regression ─────────────────────────────
+
+
+def test_as_index_no_tz_warning_pandas_3x_safe():
+    """Regression: pandas 3.x raises ``Tz-aware datetime.datetime cannot
+    be converted to datetime64 unless utc=True`` when constructing a
+    DatetimeIndex from a list of tz-aware Timestamps without explicit
+    ``tz=`` / ``utc=True``. pandas 2.x emits a FutureWarning and silently
+    coerces — masking the bug locally while the homeserver crashes.
+
+    This test promotes that FutureWarning to an error so it fails on
+    BOTH pandas 2.x (warning) and 3.x (raise).
+
+    Live engine bug 2026-05-10 14:30 UTC: 5 handlers fell back to
+    baseline-frozen values because ``DollarBarBuffer.as_index()`` raised
+    on the homeserver (pandas 3.0.2) but worked locally (pandas 2.3.3).
+    """
+    import warnings
+
+    buf = _populate(50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        idx = buf.as_index()
+        df = buf.as_dataframe()
+
+    assert isinstance(idx, pd.DatetimeIndex)
+    assert str(idx.tz) == "UTC"
+    assert len(idx) == 50
+    assert isinstance(df.index, pd.DatetimeIndex)
+    assert str(df.index.tz) == "UTC"
+
+
+def test_as_index_no_tz_warning_after_eviction():
+    """Same regression but exercising the deque eviction path so we
+    cover both pre- and post-eviction states."""
+    import warnings
+
+    buf = _populate(150, max_size=100)
+    assert len(buf) == 100
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        idx = buf.as_index()
+        df = buf.as_dataframe()
+
+    assert len(idx) == 100
+    assert str(idx.tz) == "UTC"
+    assert len(df) == 100
+
+
+def test_as_index_simulated_pandas_3x_strict_mode():
+    """Stronger reproduction: the pandas 3.x error message starts with
+    ``Tz-aware datetime.datetime cannot be converted to datetime64
+    unless utc=True``. Build the DatetimeIndex via the same code path
+    and assert it does NOT raise. This is the literal reproduction of
+    the homeserver failure trace at the first 15-min bar evaluation.
+    """
+    import warnings
+
+    base = pd.Timestamp("2026-05-10 14:00:00", tz="UTC")
+    timestamps = [base + pd.Timedelta(seconds=10 * i) for i in range(20)]
+
+    # Bare repro of the buggy pre-fix pattern would be:
+    #   pd.DatetimeIndex(timestamps, name="timestamp")
+    # which warns on 2.x and raises on 3.x. Instead we exercise the
+    # post-fix pattern:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        idx = pd.DatetimeIndex(
+            pd.to_datetime(timestamps, utc=True), name="timestamp",
+        )
+    assert str(idx.tz) == "UTC"
+    assert idx.name == "timestamp"
+    assert len(idx) == 20

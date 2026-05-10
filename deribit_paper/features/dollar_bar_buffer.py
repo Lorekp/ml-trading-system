@@ -209,11 +209,14 @@ class DollarBarBuffer:
         if not self._bars:
             return pd.DatetimeIndex([], tz="UTC", name="timestamp")
         timestamps = [bar.timestamp for bar in self._bars]
-        idx = pd.DatetimeIndex(timestamps, name="timestamp")
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        else:
-            idx = idx.tz_convert("UTC")
+        # pandas 3.x raises "Tz-aware datetime.datetime cannot be converted
+        # to datetime64 unless utc=True" when constructing DatetimeIndex from
+        # a list of tz-aware Timestamps without explicit tz. Route through
+        # pd.to_datetime(utc=True) — handles tz-aware (convert) and naive
+        # (localize) inputs uniformly under both pandas 2.x and 3.x.
+        idx = pd.DatetimeIndex(
+            pd.to_datetime(timestamps, utc=True), name="timestamp",
+        )
         return idx
 
     def tail(self, n: int) -> list[DollarBar]:
@@ -266,11 +269,11 @@ class DollarBarBuffer:
             data["log_return"].append(bar.log_return)
             data["rv_bar"].append(bar.rv_bar)
 
-        idx = pd.DatetimeIndex(timestamps, name="timestamp")
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        else:
-            idx = idx.tz_convert("UTC")
+        # See as_index() — pandas 3.x requires explicit utc handling when
+        # building a DatetimeIndex from tz-aware Timestamps.
+        idx = pd.DatetimeIndex(
+            pd.to_datetime(timestamps, utc=True), name="timestamp",
+        )
         df = pd.DataFrame(data, index=idx)
         # n_trades is integer in the dataclass; pandas infers int64.
         # Force the offline schema's float64 for OHLC etc. in case

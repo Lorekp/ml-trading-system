@@ -309,6 +309,72 @@ class LiveSVICalibrator:
             logger.warning("atm_vol_at_dte(%s) failed: %s", dte_days, exc)
             return float("nan")
 
+    def skew_25d_at_dte(
+        self,
+        dte_days: float,
+        *,
+        now: pd.Timestamp | None = None,
+    ) -> float:
+        """Return the constant-maturity 25-delta skew at ``dte_days`` DTE.
+
+        Matches the offline ``svi_25d_skew_1w`` computation in
+        ``vol_arb/svi.py::_constant_maturity_features`` line 1112-1123 byte-equally:
+
+            k_25d  = atm_iv_dec * sqrt(T) * 0.6745
+            iv_put = sqrt(total_variance(-k_25d, T) / T) * 100
+            iv_call = sqrt(total_variance(+k_25d, T) / T) * 100
+            skew_25d = iv_put - iv_call
+
+        Positive output = put-bid relative to call-bid (downside-priced regime).
+        Cycle-10 (2026-05-10): used as a short-side filter — drop SHORT
+        signals when this exceeds the V2 preset's
+        ``skip_short_if_skew_1w_gt`` threshold (default 25.0).
+
+        Returns ``NaN`` during warmup / single-expiry buckets, mirroring
+        ``atm_vol_at_dte`` so the live predictor can pass through (don't
+        suppress signals during warmup).
+        """
+        import numpy as np
+        if self._params_df is None or self._params_df.empty:
+            return float("nan")
+        params = self._params_df
+        if now is not None:
+            try:
+                bucket_freq_td = pd.Timedelta(self.svi_config.bucket_freq)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"svi_config.bucket_freq={self.svi_config.bucket_freq!r} "
+                    f"could not be parsed as a Timedelta: {exc}"
+                ) from exc
+            ts_observable_at = params["timestamp"] + bucket_freq_td
+            params = params[ts_observable_at <= pd.Timestamp(now)]
+            if params.empty:
+                return float("nan")
+        latest_ts = params["timestamp"].max()
+        bucket = params[params["timestamp"] == latest_ts]
+        if bucket.empty:
+            return float("nan")
+        if "expiry_dt" in bucket.columns:
+            n_expiries = bucket["expiry_dt"].nunique()
+            if n_expiries < 2:
+                return float("nan")
+        try:
+            surface = surface_from_params_group(bucket)
+            T = float(dte_days) / 365.25
+            atm_pct = float(surface.atm_vol_pct(T=T))
+            atm_dec = atm_pct / 100.0
+            if atm_dec <= 0 or T <= 0:
+                return float("nan")
+            k_25d = atm_dec * np.sqrt(T) * 0.6745
+            tv_put = float(surface.total_variance(np.array([-k_25d]), T)[0])
+            tv_call = float(surface.total_variance(np.array([k_25d]), T)[0])
+            iv_put = float(np.sqrt(max(tv_put, 0.0) / T) * 100.0)
+            iv_call = float(np.sqrt(max(tv_call, 0.0) / T) * 100.0)
+            return iv_put - iv_call
+        except Exception as exc:  # noqa: BLE001 - defensive
+            logger.warning("skew_25d_at_dte(%s) failed: %s", dte_days, exc)
+            return float("nan")
+
     def load_cache(self) -> bool:
         """Attempt to load params from disk.  Returns True on success."""
         if not self.cache_path.exists():

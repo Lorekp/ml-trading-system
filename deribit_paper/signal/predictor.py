@@ -103,6 +103,7 @@ class Predictor:
         spread_jump_k: float = 3.0,
         max_jump_fraction_for_shorts: float = 0.15,
         skip_long_if_term_slope_gt: float | None = None,
+        skip_short_if_skew_1w_gt: float | None = None,
         skip_long_hours_utc: tuple[int, ...] | frozenset[int] = (),
         aligner_betas: dict[str, float] | None = None,
         require_aligner: bool = False,
@@ -117,6 +118,9 @@ class Predictor:
         self._spread_jump_k = spread_jump_k
         self._max_jump_fraction_for_shorts = max_jump_fraction_for_shorts
         self._skip_long_if_term_slope_gt = skip_long_if_term_slope_gt
+        # Cycle-10 (2026-05-10): drop SHORT signals when 1w 25-delta
+        # skew exceeds threshold. Mirror-symmetric to skip_long_if_term_slope_gt.
+        self._skip_short_if_skew_1w_gt = skip_short_if_skew_1w_gt
         # D2 (parity 2026-05-07): UTC hours where LONG signals are muted.
         # Mirrors V2 backtester ``_apply_entry_filters`` (long-only filter,
         # shorts at the same hours actually outperform historically).
@@ -295,6 +299,20 @@ class Predictor:
                     f"FLAT (circuit breaker) — jump_fraction {jf:.3f} > "
                     f"{self._max_jump_fraction_for_shorts} (edge={edge:+.3f}vp)"
                 )
+            # V2 cycle-10 skew filter (2026-05-10): drop SHORT signals
+            # in extreme put-skew regime (downside-priced, ~1% of fired
+            # shorts; almost entirely 2022 LUNA/3AC/FTX trending-down era).
+            # Mirror-symmetric to the V2 contango long filter. Suppression
+            # uses ``svi_25d_skew_1w`` per offline definition (iv_put - iv_call).
+            if direction == -1 and self._skip_short_if_skew_1w_gt is not None:
+                skew_1w = self._compute_skew_25d_1w(now=bar.timestamp)
+                if skew_1w is not None and skew_1w > self._skip_short_if_skew_1w_gt:
+                    direction = 0
+                    reason = (
+                        f"FLAT (V2 skew filter) — svi_25d_skew_1w "
+                        f"{skew_1w:+.3f} > {self._skip_short_if_skew_1w_gt:.2f}; "
+                        f"SHORT candidate edge={edge:+.3f}vp suppressed"
+                    )
         else:
             direction = 0
             reason = (
@@ -336,6 +354,32 @@ class Predictor:
             iv_source=iv_source,  # S-3 (2026-05-08): "svi" or "tsrv_proxy"
             reason=reason,
         )
+
+    def _compute_skew_25d_1w(
+        self,
+        *,
+        now: pd.Timestamp | None = None,
+    ) -> float | None:
+        """Per-bar 25-delta skew at 1w (matches ``svi_25d_skew_1w``).
+
+        Cycle-10 (2026-05-10): added to support the V2 short-side filter
+        ``skip_short_if_skew_1w_gt``. Mirrors the offline computation in
+        ``vol_arb/svi.py::_constant_maturity_features`` (line 1112-1123)
+        byte-equally — see ``LiveSVICalibrator.skew_25d_at_dte`` docstring.
+
+        Returns ``None`` during warmup (no SVI params yet) or single-expiry
+        buckets so the predictor's caller can pass through (don't suppress
+        signals during warmup). Mirrors ``_compute_term_slope_1w_2w``.
+        """
+        if not self._svi.has_params:
+            return None
+        try:
+            skew = float(self._svi.skew_25d_at_dte(7.0, now=now))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(skew):
+            return None
+        return skew
 
     def _compute_term_slope_1w_2w(
         self,

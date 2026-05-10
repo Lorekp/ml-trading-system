@@ -511,6 +511,27 @@ class TradingEngine:
             drl_policy_path=cfg.drl_policy_path,
             drl_vecnormalize_path=cfg.drl_vecnormalize_path,
         )
+        # Cycle-10 parity-r4 (2026-05-09): close the silent stale-month
+        # gap surfaced by the model-loading parity audit. ``_find_latest_month``
+        # picks the lex-max month with a complete artifact set, but does
+        # NOT verify that month is recent. A long-running engine will
+        # happily run with a 2-month-old checkpoint after a missed retrain.
+        # 45 days = 1.5 months gives slack for an in-flight monthly retrain.
+        _bundle_month = self.model_bundle.month_key
+        _lgbm_dir = Path(cfg.lgbm_models_dir)
+        _tv_dir = Path(cfg.transvol_models_dir) if cfg.transvol_models_dir else _lgbm_dir
+        _assert_sidecar_fresh(
+            _lgbm_dir / f"{_bundle_month}.txt",
+            name="lgbm-checkpoint",
+            max_age_days=45,
+            allow_stale=getattr(cfg, "allow_stale_checkpoints", False),
+        )
+        _assert_sidecar_fresh(
+            _tv_dir / f"{_bundle_month}_transvol.pt",
+            name="transvol-checkpoint",
+            max_age_days=45,
+            allow_stale=getattr(cfg, "allow_stale_checkpoints", False),
+        )
         # Historical baseline: merged base-features + SVI-features
         # parquets, loaded once at startup. Manifest-driven dispatch
         # (W3.1) validates every feature is producible from either the
@@ -778,6 +799,8 @@ class TradingEngine:
             spread_jump_k=cfg.spread_jump_k,
             max_jump_fraction_for_shorts=cfg.max_jump_fraction_for_shorts,
             skip_long_if_term_slope_gt=cfg.skip_long_if_term_slope_gt,
+            # Cycle-10 (2026-05-10): V2 short-side skew filter.
+            skip_short_if_skew_1w_gt=cfg.skip_short_if_skew_1w_gt,
             # D2 (parity 2026-05-07): mirror V2 backtester long-hour filter.
             skip_long_hours_utc=cfg.skip_long_hours_utc,
             aligner_betas=aligner_betas,

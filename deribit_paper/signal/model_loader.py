@@ -21,6 +21,7 @@ it needs to do a forward pass.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -29,6 +30,16 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _short_sha256(path: Path) -> str:
+    """First 12 hex chars of SHA256(path) — checkpoint provenance fingerprint.
+
+    Cycle-10 in-place overwrite of ``{month}.txt`` / ``{month}_transvol.pt``
+    leaves ``month_key`` unchanged; without a content hash the operator
+    cannot tell from logs whether the new bytes loaded after a retrain.
+    """
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 
 _WALK_FORWARD_MONTH_RE = re.compile(r"^(\d{4}-\d{2})\.txt$")
@@ -92,7 +103,7 @@ def _find_latest_month(
 
 def load_model_bundle(
     *,
-    lgbm_models_dir: str | Path = "vol_model/output/models/expanding_pruned_svi_v1",
+    lgbm_models_dir: str | Path = "vol_model/output/models/expanding_pruned_svi_har_pd_v1",
     transvol_models_dir: str | Path | None = "vol_model/output/models/expanding_hybrid",
     drl_policy_path: str | Path = "vol_arb/drl_hedging/models/production_sac_v4_final.zip",
     drl_vecnormalize_path: str | Path = "vol_arb/drl_hedging/models/production_sac_v4_final_vecnormalize.pkl",
@@ -104,8 +115,11 @@ def load_model_bundle(
     ----------
     lgbm_models_dir : str | Path
         Directory holding ``{YYYY-MM}.txt`` + ``{YYYY-MM}_features.json``
-        for each walk-forward month.  The T2.1 pruned+SVI variant lives
-        at ``vol_model/output/models/expanding_pruned_svi_v1``.
+        for each walk-forward month.  Default points at the current
+        production HAR-PD variant ``expanding_pruned_svi_har_pd_v1``
+        (cycle-10 audit, 2026-05-09 — pre-fix this defaulted to the
+        Stage-18 pre-HAR-PD ``expanding_pruned_svi_v1`` and was masked
+        in production by the engine's explicit override).
     transvol_models_dir : str | Path or None
         Directory holding ``{YYYY-MM}_transvol.pt`` TransVol encoder
         checkpoints.  Defaults to the hybrid run (``expanding_hybrid``)
@@ -156,7 +170,10 @@ def load_model_bundle(
             f"Feature count mismatch: JSON has {len(lgbm_features)}, "
             f"LightGBM expects {lgbm_model.num_feature()}",
         )
-    logger.info("  LightGBM loaded: %d features", len(lgbm_features))
+    logger.info(
+        "  LightGBM loaded: %d features, sha256=%s",
+        len(lgbm_features), _short_sha256(lgbm_txt),
+    )
 
     # ── TransVol ────────────────────────────────────────────────────
     from vol_model.transvol.config import TransVolConfig
@@ -199,9 +216,10 @@ def load_model_bundle(
     encoder.load_state_dict(ckpt["model_state_dict"])
     encoder.eval()
     logger.info(
-        "  TransVol loaded: n_features=%d, seq_len=%d",
+        "  TransVol loaded: n_features=%d, seq_len=%d, sha256=%s",
         getattr(config, "n_features", 0),
         getattr(config, "seq_len", 0),
+        _short_sha256(transvol_path),
     )
 
     # ── DRL policy ──────────────────────────────────────────────────

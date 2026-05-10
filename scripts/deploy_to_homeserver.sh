@@ -58,6 +58,15 @@ SOURCE_FILES=(
     "vol_arb/backtester.py"
     "vol_arb/sizing.py"
     "vol_arb/sidecars.py"
+    # Cycle-10 parity audit (2026-05-10): silently imported by live
+    # engine paths (svi_live -> svi.py, drl_hedger_live -> drl_hedging/config,
+    # tsrv_live -> tsrv_series, dollar_bar* -> microstructure).
+    "vol_arb/svi.py"
+    "vol_arb/drl_hedging/config.py"
+    "vol_model/features/microstructure.py"
+    "vol_model/transvol/model.py"
+    "vol_model/transvol/config.py"
+    "TSRV/tsrv_series.py"
 
     # DRL training module — referenced by SAC v4 pickle's _schedule
     # callable; needs to be importable on the homeserver even though
@@ -100,6 +109,12 @@ SOURCE_FILES=(
     "deribit_paper/features/dollar_bar_features.py"     # F3 Tier 3 (2026-05-07)
     "deribit_paper/features/tsrv_history.py"            # F3 Tier 5 (2026-05-07)
     "deribit_paper/features/tsrv_features.py"           # F3 Tier 5 (2026-05-07)
+    # Cycle-10 parity audit (2026-05-10): these were imported but NOT
+    # in the manifest — engine restart would crash with ModuleNotFoundError.
+    "deribit_paper/features/transvol_history.py"        # imported by engine.py
+    "deribit_paper/features/tsrv_dollar_bar_grid.py"    # imported by engine.py + feature_assembler.py
+    "deribit_paper/market_data/funding.py"              # imported by engine.py
+    "deribit_paper/signal/transvol_inference.py"        # imported by engine.py
 
     # Live engine — Deribit client (REST + WS + auth)
     "deribit_paper/client/__init__.py"
@@ -160,11 +175,18 @@ MODEL_FILES=(
     # parity-cycle C (2026-05-07): HAR-PD LightGBM models (50 features).
     # Engine flips to ``expanding_pruned_svi_har_pd_v1`` as the production
     # variant — the model the V2 backtest's aligner β* was calibrated for.
-    # The TransVol .pt checkpoints are reused from ``expanding_hybrid/``.
     "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-04.txt"
     "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-04_features.json"
     "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-03.txt"
     "vol_model/output/models/expanding_pruned_svi_har_pd_v1/2026-03_features.json"
+    # Cycle-10 (2026-05-09): TransVol retrained at Optuna-best params
+    # (lr=7.5e-5, dropout=0.198, wd=0.0012). _find_latest_month picks the
+    # lex-max month with a complete artifact set, so only the latest 2
+    # TransVol checkpoints need to ship — older months on the homeserver
+    # stay whatever weights were there before. New SHA256 fingerprints
+    # surface in the boot log via the cycle-10 provenance fix.
+    "vol_model/output/models/expanding_hybrid/2026-04_transvol.pt"
+    "vol_model/output/models/expanding_hybrid/2026-03_transvol.pt"
 )
 
 # Heavy data + sidecars (large; toggleable via --skip-data when only
@@ -172,8 +194,17 @@ MODEL_FILES=(
 # doesn't force a 6-MB resync of bar_execution_quality.
 DATA_FILES=(
     "vol_model/output/aligner_betas_by_month.json"     # ~2KB
-    "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"      # ~1.3MB
+    "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"      # ~1.3MB (kept as fallback)
+    # Cycle-11 (2026-05-10): K1 + walk-forward term_slope amplifier;
+    # shipped as V2 preset default. +$33K NC PnL, Sharpe -0.031, MDD
+    # unchanged. See vol_arb/output/PHASE2_LONG_SIZING.md.
+    "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet" # ~1.3MB (cycle-11)
     "vol_arb/output/bar_execution_quality.parquet"     # ~5.5MB
+    # Cycle-10 parity audit (2026-05-10): both gated by 45-day staleness
+    # check; previously NOT in manifest so silent drift accumulated.
+    # Engine refusal would have triggered ~2 weeks out without this.
+    "vol_arb/output/svi_features_15m.parquet"          # ~17MB (45d gate)
+    "vol_model/output/BTCUSDT_features_15m.parquet"    # ~158MB (45d gate)
     "vol_arb/output/svi_surface_params_1h.parquet"     # ~22MB
     "vol_model/output/aligner_betas_by_month.json"      # dup is fine; idempotent
     "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"   # ~5.6MB
@@ -276,7 +307,7 @@ sac_size = os.path.getsize(sac_zip)
 assert sac_size > 1_000_000, \"SAC zip suspiciously small\"
 print(\"SAC v4 zip: OK (\" + str(sac_size) + \" bytes; load-test deferred)\")
 
-# V2 preset wires all E.1+E.2 invariants
+# V2 preset wires all E.1+E.2 invariants + cycle-10
 from deribit_paper.config import PaperConfig
 v2 = PaperConfig.with_v2_preset()
 assert v2.use_profit_scaling is True              # E.1.1
@@ -284,11 +315,47 @@ assert v2.use_tiered_taker is True                # E.1.6
 assert v2.entry_threshold_long == 12.0
 assert v2.skip_long_if_term_slope_gt == 0.0
 assert v2.target_margin_utilization == 0.15
-print(\"V2 preset: OK\")
+assert v2.entry_threshold == 20.0                  # cycle-10 (2026-05-10)
+assert v2.skip_short_if_skew_1w_gt == 25.0         # cycle-10 (2026-05-10)
+print(\"V2 preset: OK (incl. cycle-10 thr=20 + skew>25)\")
 
 # CLI imports (incl --allow-stale-aligner flag)
 from deribit_paper.cli import _parse_args, main as _cli_main
 print(\"CLI: OK\")
+
+# Cycle-10 parity audit (2026-05-10): exercise the FULL engine import
+# graph so missing module dependencies fail HERE rather than after tmux
+# restart (where the operator only sees the crash via post-restart log
+# tail). Pre-fix: 4 unconditional imports (transvol_history,
+# tsrv_dollar_bar_grid, funding, transvol_inference) would have crashed
+# the engine on the cycle-10 first restart.
+import importlib
+for mod_name in [
+    \"deribit_paper.engine\",
+    \"deribit_paper.signal.feature_assembler\",
+    \"deribit_paper.signal.predictor\",
+    \"deribit_paper.signal.model_loader\",
+    \"deribit_paper.signal.transvol_inference\",
+    \"deribit_paper.signal.drl_hedger_live\",
+    \"deribit_paper.features.transvol_history\",
+    \"deribit_paper.features.tsrv_dollar_bar_grid\",
+    \"deribit_paper.features.dollar_bar_buffer\",
+    \"deribit_paper.features.dollar_bar_features\",
+    \"deribit_paper.features.tsrv_history\",
+    \"deribit_paper.features.tsrv_features\",
+    \"deribit_paper.features.svi_live\",
+    \"deribit_paper.features.har_pd_live\",
+    \"deribit_paper.market_data.funding\",
+    \"deribit_paper.execution.straddle_flow\",
+    \"deribit_paper.execution.order_manager\",
+    \"deribit_paper.risk.kill_switch\",
+    \"deribit_paper.risk.limits\",
+    \"deribit_paper.risk.rnd_monitor\",
+    \"deribit_paper.position.tracker\",
+    \"deribit_paper.utils.sidecar_staleness\",
+]:
+    importlib.import_module(mod_name)
+print(\"Engine import graph: OK (\" + str(22) + \" modules)\")
 
 print(\"All remote validations passed.\")
 '"

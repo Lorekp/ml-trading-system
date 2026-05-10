@@ -368,7 +368,10 @@ def main() -> None:
         logger.info("Timeframe override: freq_s = %d (%dm bars)", args.tf, args.tf // 60)
     if args.predict_excess_logvol:
         logger.info("Target reparameterization ACTIVE: y = log(RV) - log(IV_at_T)")
-    X, y, t1 = build_dataset(vol_config)
+    # clip=False: opt out of the global label clip in load_labels
+    # (data-snoopy — full-series quantiles). Walk-forward applies
+    # leakage-safe per-fold clipping inside the training loop instead.
+    X, y, t1 = build_dataset(vol_config, clip=False)
 
     # Per-asset SHAP-tail DROP list: bottom-N of the top-N pruned (Stage
     # 15.9 methodology applied per asset). For BTC this reproduces the
@@ -551,6 +554,19 @@ def main() -> None:
         X_tr, y_tr = X_month[train_mask], y_month[train_mask]
         X_val, y_val = X_month[val_mask], y_month[val_mask]
         X_test, y_test = X_month[test_mask], y_month[test_mask]
+
+        # Cycle 9 leakage fix (2026-05-08): per-fold label clip using
+        # quantiles from the TRAIN slice only. Replaces the global
+        # clip in load_labels (which fitted bounds on the full series,
+        # mildly leaking test-set tails into training labels). Magnitude
+        # was small (0.1% tails at default label_clip_quantile=0.999)
+        # but structurally a train-test contamination.
+        clip_q = vol_config.label_clip_quantile
+        y_lo = float(y_tr.quantile(1.0 - clip_q))
+        y_hi = float(y_tr.quantile(clip_q))
+        y_tr = y_tr.clip(y_lo, y_hi)
+        y_val = y_val.clip(y_lo, y_hi)
+        y_test = y_test.clip(y_lo, y_hi)
 
         # Winsorize on train only
         lo, hi = X_tr.quantile(0.01), X_tr.quantile(0.99)

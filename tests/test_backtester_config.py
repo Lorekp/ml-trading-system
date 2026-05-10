@@ -109,8 +109,8 @@ def test_kelly_mult_bare_default_is_off():
     assert cfg.kelly_mult_path is None
 
 
-def test_production_v2_kelly_default_is_K1():
-    """V2 preset MUST default to the K1 Kelly-shrinkage sidecar.
+def test_production_v2_kelly_default_is_K1_slope():
+    """V2 preset MUST default to the K1+slope Kelly sidecar (cycle-11).
 
     Adopted 2026-04-21 as a deliberate Sharpe-for-PnL tradeoff:
     +$114K NC PnL (+13.5%) and +$2.84M compound PnL (+17.9%) in
@@ -126,12 +126,14 @@ def test_production_v2_kelly_default_is_K1():
     ``C:/Users/laure/.claude/plans/starry-rolling-rabin.md``.
     """
     cfg = BacktestConfig().with_btc_production_filters_v2()
-    expected = "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+    expected = "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
     assert cfg.kelly_mult_path == expected, (
-        f"V2 preset must auto-load the K1 Kelly-shrinkage sidecar "
+        f"V2 preset must auto-load the cycle-11 K1+slope Kelly sidecar "
         f"at {expected!r}; got {cfg.kelly_mult_path!r}. Reverting "
-        f"to None re-introduces the +$114K PnL gap (long-side "
-        f"high-|edge| boost) — see KELLY_SHRINKAGE_PHASE2_REPORT.md."
+        f"to vanilla K1 forfeits the +$33K NC PnL / 5/5 per-year "
+        f"strict / Sharpe-essentially-unchanged improvement — see "
+        f"vol_arb/output/PHASE2_LONG_SIZING.md and "
+        f"memory/project_phase2_long_sizing_2026_05_10.md."
     )
 
 
@@ -180,9 +182,16 @@ def test_v2_preset_horizon_matches_holding_minutes(horizon_minutes):
         f"{expected_predictions!r}. Mismatch means the backtester would "
         f"open a wrong-horizon predictions file silently."
     )
-    expected_kelly = kelly_sidecar_path(
-        "BTC", horizon_minutes, variant="K1",
-    ).as_posix()
+    if horizon_minutes == 15:
+        # Cycle-11 (2026-05-10): production V2 at h=15 uses the K1+slope
+        # sidecar (walk-forward K1 × 1.25 on long bars at extreme
+        # backwardation). Other horizons keep vanilla K1 because the
+        # slope-amp sidecar has not been regenerated for those.
+        expected_kelly = "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
+    else:
+        expected_kelly = kelly_sidecar_path(
+            "BTC", horizon_minutes, variant="K1",
+        ).as_posix()
     assert cfg.kelly_mult_path == expected_kelly, (
         f"V2 preset at h={horizon_minutes}m has "
         f"kelly_mult_path={cfg.kelly_mult_path!r}; expected "

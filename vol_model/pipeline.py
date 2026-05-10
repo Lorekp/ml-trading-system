@@ -78,16 +78,26 @@ def assemble_features(config: VolModelConfig) -> pd.DataFrame:
     return windowed
 
 
-def build_dataset(config: VolModelConfig) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+def build_dataset(
+    config: VolModelConfig, *, clip: bool = True,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """Build the full training dataset.
 
     Returns:
         X: feature matrix (windowed, NaN-free)
         y: ln(vol_ann) labels (one-step-ahead)
         t1: label end times for PurgedKFold
+
+    Parameters
+    ----------
+    clip : bool, default True
+        Forwarded to :func:`load_labels`. When False, the returned labels
+        are unclipped — walk-forward callers should set this and apply
+        :func:`vol_model.labels.clip_label_quantiles` on their per-fold
+        training slice for leakage-safe label clipping.
     """
     features = assemble_features(config)
-    labels = load_labels(config)
+    labels = load_labels(config, clip=clip)
 
     X, y, t1 = align_features_labels(features, labels)
 

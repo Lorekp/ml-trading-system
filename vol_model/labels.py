@@ -57,7 +57,9 @@ def _load_iv_at_decision_time(asset: str, index: pd.Index, freq_s: int) -> pd.Se
     return iv_used.reindex(index)
 
 
-def load_labels(config: VolModelConfig) -> pd.DataFrame:
+def load_labels(
+    config: VolModelConfig, *, clip: bool = True,
+) -> pd.DataFrame:
     """Load TSRV output and construct prediction labels.
 
     Returns DataFrame indexed by timestamp with columns:
@@ -67,6 +69,18 @@ def load_labels(config: VolModelConfig) -> pd.DataFrame:
 
     When ``config.predict_excess_logvol`` is True, ``ln_vol`` is reparam'd to
     ``ln(vol_ann) - ln(iv_used_at_decision_time)``, i.e., excess log-vol.
+
+    Parameters
+    ----------
+    clip : bool, default True
+        If True, clip ln_vol / continuous_var / jump_var at the
+        ``config.label_clip_quantile`` quantiles fitted on the FULL series.
+        This is structurally a mild leak (test-set tails influence the
+        clip bounds applied to training labels) — kept on by default for
+        backward compatibility with non-walk-forward callers. Walk-forward
+        callers should pass ``clip=False`` and apply
+        :func:`clip_label_quantiles` on their per-fold training slice
+        instead. Cycle 9 fix (2026-05-08).
     """
     tsrv = pd.read_parquet(config.get_tsrv_path())
 
@@ -111,20 +125,30 @@ def load_labels(config: VolModelConfig) -> pd.DataFrame:
         valid = valid[mask]
         ln_vol = ln_vol[mask]
 
-    # Clip extremes to prevent QLIKE loss explosion
-    lo = ln_vol.quantile(1 - config.label_clip_quantile)
-    hi = ln_vol.quantile(config.label_clip_quantile)
-    ln_vol = ln_vol.clip(lo, hi)
-
-    # Raw variance components for TransVol ratio-form QLIKE (MTL targets)
-    # Clipped at 99.9th percentile to prevent extreme outliers
+    # Variance components for TransVol ratio-form QLIKE (MTL targets).
+    # Lower clips at 1e-20 / 0.0 are not data-snooping (constants).
     continuous_var = valid["continuous_var"].clip(lower=1e-20)
-    hi_c = continuous_var.quantile(config.label_clip_quantile)
-    continuous_var = continuous_var.clip(upper=hi_c)
-
     jump_var = valid["jump_var"].clip(lower=0.0)
-    hi_j = jump_var.quantile(config.label_clip_quantile)
-    jump_var = jump_var.clip(upper=hi_j)
+
+    if clip:
+        # Global clip — fitted on the FULL series. STRUCTURALLY DATA-
+        # SNOOPING (test-set tails leak into the clip bounds applied to
+        # training labels), but kept on by default for backward compat.
+        # Magnitude is small (only worst 0.1% of bars hit the clip at
+        # the default label_clip_quantile=0.999). Cycle 9 (2026-05-08):
+        # walk-forward callers should opt out via ``clip=False`` and
+        # apply ``clip_label_quantiles`` on their per-fold training
+        # slice instead. See ``run_walkforward_pruned_svi_har_pd.py``
+        # for the canonical leak-safe pattern.
+        lo = ln_vol.quantile(1 - config.label_clip_quantile)
+        hi = ln_vol.quantile(config.label_clip_quantile)
+        ln_vol = ln_vol.clip(lo, hi)
+
+        hi_c = continuous_var.quantile(config.label_clip_quantile)
+        continuous_var = continuous_var.clip(upper=hi_c)
+
+        hi_j = jump_var.quantile(config.label_clip_quantile)
+        jump_var = jump_var.clip(upper=hi_j)
 
     freq = pd.Timedelta(seconds=config.freq_s)
 
@@ -137,6 +161,68 @@ def load_labels(config: VolModelConfig) -> pd.DataFrame:
     }, index=valid.index)
 
     return result
+
+
+def clip_label_quantiles(
+    labels: pd.DataFrame,
+    *,
+    train_idx: pd.Index,
+    quantile: float,
+) -> pd.DataFrame:
+    """Clip ln_vol / continuous_var / jump_var using quantiles fitted on
+    ``train_idx`` ONLY, then applied to the full label DataFrame.
+
+    Leakage-safe replacement for the inline clip in :func:`load_labels`
+    (which fits quantiles on the full series, mildly leaking test-set
+    tails into the training clip bounds). Use this in walk-forward
+    training: compute clip bounds on the training fold's quantiles,
+    apply to both train AND test (test clipping is fine — only the
+    bound estimation must be train-only).
+
+    Parameters
+    ----------
+    labels : DataFrame
+        From ``load_labels(config, clip=False)``. Must contain ln_vol;
+        continuous_var / jump_var clipped if present.
+    train_idx : Index
+        Timestamps in the training fold. Quantiles fit on
+        ``labels.loc[labels.index.intersection(train_idx)]``.
+    quantile : float
+        Upper quantile (e.g. 0.999). Lower bound for ln_vol uses
+        ``1 - quantile`` symmetrically.
+
+    Returns
+    -------
+    DataFrame
+        Copy of ``labels`` with ln_vol / continuous_var / jump_var
+        clipped at train-fold quantiles.
+    """
+    out = labels.copy()
+    train_overlap = labels.index.intersection(train_idx)
+    if len(train_overlap) == 0:
+        raise ValueError(
+            "clip_label_quantiles: train_idx has no overlap with labels.index"
+        )
+    train_slice = labels.loc[train_overlap]
+
+    train_ln_vol = train_slice["ln_vol"]
+    lo = float(train_ln_vol.quantile(1.0 - quantile))
+    hi = float(train_ln_vol.quantile(quantile))
+    out["ln_vol"] = labels["ln_vol"].clip(lo, hi)
+
+    if "continuous_var" in labels.columns:
+        hi_c = float(train_slice["continuous_var"].quantile(quantile))
+        out["continuous_var"] = labels["continuous_var"].clip(
+            lower=1e-20, upper=hi_c,
+        )
+
+    if "jump_var" in labels.columns:
+        hi_j = float(train_slice["jump_var"].quantile(quantile))
+        out["jump_var"] = labels["jump_var"].clip(
+            lower=0.0, upper=hi_j,
+        )
+
+    return out
 
 
 def align_features_labels(

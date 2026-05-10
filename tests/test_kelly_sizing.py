@@ -50,9 +50,17 @@ def test_bare_default_is_none():
 
 
 def test_v2_preset_loads_k1_sidecar_path():
-    """V2 preset must point at the production K1 sidecar."""
+    """V2 preset must point at the production K1 sidecar.
+
+    Cycle-11 (2026-05-10): K1 extended with walk-forward term_slope
+    amplifier. Path swapped from `BTC_v2_kelly_mult_K1.parquet` to
+    `BTC_v2_kelly_mult_K1_slope.parquet`. See Phase 2 long sizing
+    report and memory project_phase2_long_sizing_2026_05_10.md.
+    """
     cfg = BacktestConfig().with_btc_production_filters_v2()
-    assert cfg.kelly_mult_path == "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+    assert cfg.kelly_mult_path == (
+        "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
+    )
 
 
 # ---------- Test 2: monotonic on edge ----------

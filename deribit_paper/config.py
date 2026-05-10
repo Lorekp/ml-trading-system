@@ -83,6 +83,12 @@ class PaperConfig:
     # ``None`` disables the filter (legacy live default). The V2 preset
     # sets this to 0.0 to match the backtest contract.
     skip_long_if_term_slope_gt: float | None = None
+    # V2 cycle-10 (2026-05-10): drop SHORT signals when 1w 25-delta skew
+    # exceeds this threshold (positive = call-bid). Mirror-symmetric to
+    # ``skip_long_if_term_slope_gt``. The V2 preset sets this to 25.0;
+    # ``None`` disables (legacy / non-V2 default). See
+    # ``BacktestConfig.skip_short_if_skew_1w_gt`` for mechanism.
+    skip_short_if_skew_1w_gt: float | None = None
     # D2 (parity 2026-05-07): mute LONG (+1) signals at these UTC hours.
     # Mirrors ``BacktestConfig.skip_long_hours_utc``. The V2 production
     # backtest uses ``(14, 15, 16)`` to drop US-cash-open longs that fade
@@ -372,6 +378,10 @@ class PaperConfig:
     allow_stale_slip: bool = False
     allow_stale_features: bool = False
     allow_stale_svi_features: bool = False
+    # Cycle-10 parity-r4 (2026-05-09): same pattern for the LightGBM
+    # and TransVol checkpoints themselves. Closes the silent
+    # stale-month load surfaced by the model-loading parity audit.
+    allow_stale_checkpoints: bool = False
 
     # H15 caps (Tier 2 hardening, 2026-05-06). Defence-in-depth on top
     # of the existing per-trade and position-count caps.
@@ -503,9 +513,18 @@ class PaperConfig:
         """
         cfg = base if base is not None else cls()
         cfg.config_preset = "v2"
-        cfg.entry_threshold = 22.0  # V1 production stack short threshold
+        # V2 cycle-10 (2026-05-10): short threshold loosened 22 -> 20
+        # to admit more profitable shorts, paired with new skew gate.
+        # Sweep showed +$43K NC PnL (+4.3%) vs cycle-9 baseline,
+        # Sharpe -0.02 (neutral), MDD neutral, 5/5 strict per-year stable.
+        cfg.entry_threshold = 20.0
         cfg.entry_threshold_long = 12.0
         cfg.skip_long_if_term_slope_gt = 0.0
+        # V2 cycle-10 (2026-05-10): mirror-symmetric short filter to
+        # contango-long-skip. Drops shorts in extreme call-skew regime
+        # (svi_25d_skew_1w > 25, ~1% of fired shorts, almost entirely
+        # 2022 LUNA/3AC/FTX trending-down crisis era).
+        cfg.skip_short_if_skew_1w_gt = 25.0
         # D2 (parity 2026-05-07): mute longs at US cash-open hours. The V2
         # backtest applies this in ``_apply_entry_filters``; the live
         # predictor mirrors the same shape after the contango filter.
@@ -541,9 +560,22 @@ class PaperConfig:
         cfg.aligner_betas_json = (
             "vol_model/output/aligner_betas_by_month.json"
         )
-        cfg.kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+        # Cycle-11 (2026-05-10): K1 + walk-forward term_slope amplifier.
+        # +$33K NC PnL (+3.2%), Sharpe -0.031 (essentially unchanged),
+        # MDD UNCHANGED, 5/5 per-year strict pass. $/Sharpe-pt $1.07M.
+        # Phase 2 report: vol_arb/output/PHASE2_LONG_SIZING.md.
+        cfg.kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
         cfg.bar_exec_quality_path = "vol_arb/output/bar_execution_quality.parquet"
         cfg.use_tiered_taker = True   # E.1.6: 3-tier ladder at all 4 IOC sites
+        # Cycle-10 parity audit (2026-05-10): the default $30k cap was
+        # sized for an earlier BTC spot regime. At BTC=$80k a single ATM
+        # straddle is $40-97k notional; the $30k cap blocks 100% of fired
+        # signals. Bump to $200k (~2x equity) as defence-in-depth that
+        # actually allows legitimate trades. Backtester has no equivalent
+        # cap (margin-utilization is the binding constraint). Discovered
+        # via 24h homeserver behavior audit: 4 SHORT signals fired
+        # 2026-05-09 → 0 reached the exchange because of this cap.
+        cfg.max_gross_notional_usd = 200_000.0
         # S-8 (parity-r3 cycle 2 — 2026-05-08): the canonical V2 trade log
         # was generated via ``BacktestConfig.with_btc_production_filters_v2().with_realistic_costs()``,
         # and ``with_realistic_costs()`` flips ``base_spread_iv 1.5 → 2.0``
@@ -583,9 +615,12 @@ class PaperConfig:
             return []
         mismatches: list[str] = []
         v2_invariants: list[tuple[str, object]] = [
-            ("entry_threshold", 22.0),
+            # Cycle-10 (2026-05-10): short threshold loosened 22 -> 20
+            # paired with skew>25 short filter (+$43K NC PnL).
+            ("entry_threshold", 20.0),
             ("entry_threshold_long", 12.0),
             ("skip_long_if_term_slope_gt", 0.0),
+            ("skip_short_if_skew_1w_gt", 25.0),  # cycle-10 short skew filter
             ("skip_long_hours_utc", (14, 15, 16)),
             ("dte_min_days", 5),
             ("target_margin_utilization", 0.15),
@@ -593,6 +628,7 @@ class PaperConfig:
             ("max_single_trade_btc", 0.0),
             ("min_single_trade_btc", 0.0),
             ("base_spread_iv", 2.0),
+            ("max_gross_notional_usd", 200_000.0),  # cycle-10 (2026-05-10)
         ]
         for name, expected in v2_invariants:
             actual = getattr(self, name, None)

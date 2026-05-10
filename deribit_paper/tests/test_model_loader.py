@@ -77,14 +77,15 @@ def test_find_latest_month_same_directory_still_works(tmp_path):
 def test_load_model_bundle_with_real_artifacts():
     """Smoke test: load the real production artifacts on disk.
 
-    After W3.1, production default is the T2.1 pruned+SVI LightGBM
-    variant (44 features) with TransVol weights reused from the hybrid
-    run (16-dim embeddings, unchanged).  Skipped if the production
-    models don't exist (e.g., fresh clone).
+    Cycle-9 production default is the pruned+SVI+HAR-PD LightGBM
+    variant (85 features = 16 TransVol embeddings + pruned base + SVI
+    + HAR-PD decomposition) with TransVol weights from the hybrid run
+    (16-dim embeddings).  Skipped if the production models don't exist
+    (e.g., fresh clone).
     """
-    lgbm_dir = Path("vol_model/output/models/expanding_pruned_svi_v1")
+    lgbm_dir = Path("vol_model/output/models/expanding_pruned_svi_har_pd_v1")
     tv_dir = Path("vol_model/output/models/expanding_hybrid")
-    drl_path = Path("vol_arb/drl_hedging/models/production_sac_v3_final.zip")
+    drl_path = Path("vol_arb/drl_hedging/models/production_sac_v4_final.zip")
     if (
         not lgbm_dir.exists()
         or not tv_dir.exists()
@@ -101,11 +102,16 @@ def test_load_model_bundle_with_real_artifacts():
     )
     # Walk-forward lex-max month depends on what's on disk; don't hardcode.
     assert bundle.month_key
-    # T2.1 pruned+SVI has 44 features (16 TransVol + 27 pruned base + 1 SVI).
-    assert len(bundle.lgbm_features) == 44
+    # Pruned+SVI+HAR-PD has 70-90 features depending on the SHAP-tail
+    # drop list active at training time (cycle-9 = 85, cycle-10 = 77,
+    # cycle-9 dropped 8 noise_level* / ffd_rv_lag3* tail features).
+    # Check structural invariants instead of an exact count.
+    n_feat = len(bundle.lgbm_features)
+    assert 60 <= n_feat <= 100, f"unexpected n_features={n_feat}"
     assert bundle.lgbm_features[:16] == [f"tv_{i}" for i in range(16)]
     assert "svi_atm_1d" in bundle.lgbm_features
-    assert bundle.lgbm_model.num_feature() == 44
+    assert any(f.startswith("har_pd_") for f in bundle.lgbm_features)
+    assert bundle.lgbm_model.num_feature() == n_feat
     # TransVol should be in eval mode
     assert not bundle.transvol_model.training
     # DRL policy should have a policy attribute (from stable_baselines3)

@@ -115,7 +115,19 @@ def _load_oi_15m(
                 # Resample 1-min to bar frequency (last value per window).
                 # tf_str comes from config.tf_str (horizon SSOT) — at h=15
                 # this is "15min", at h=60 it's "60min" etc.
-                oi = oi_usd.resample(tf_str).last().dropna()
+                #
+                # CAUSALITY: use label="right", closed="right" so the bar
+                # stamped at T=12:15 covers (12:00, 12:15] — past data only
+                # at decision time T=12:15. Default label="left" stamps the
+                # same bucket at T=12:00, which when ffill'd against an
+                # END-stamped TSRV target (also at T=12:00) would pull data
+                # from (12:00, 12:15] into the row decision-stamped at 12:00
+                # — i.e., 0–15 min of FUTURE data. Cycle 9 fix (2026-05-08).
+                oi = (
+                    oi_usd.resample(tf_str, label="right", closed="right")
+                    .last()
+                    .dropna()
+                )
                 logger.info("  OI source: HL asset_ctxs (%d rows after %s resample)", len(oi), tf_str)
 
     if oi is None:

@@ -2372,6 +2372,29 @@ class TradingEngine:
             observed_spread_usd=None,                     # spread unavailable here; override happens at order site
             fallback_pct=self.config.max_slippage_pct,
         )
+        # Cycle-24-H2 (2026-05-11, audit A3 H2): pass an approximate
+        # liq_scale to the first-pass size_position so n_pre_ps matches
+        # the post-liq N the actual trade will use. Pre-fix this
+        # defaulted to liq_scale=1.0, making n_pre_ps ~2.5x larger
+        # than the actual N (because real liq_scale ≈ 0.4 at typical
+        # conditions post-cycle-24-C2). The estimator's sqrt(N) impact
+        # cost was then mis-scaled, and the risk-check inspected a
+        # pre-liq N up to 2.5x the actual fill size.
+        #
+        # The liq_scale here is computed from the SIDECAR (same source
+        # the backtester uses): clip(exec_cost_ema / bar_slip_usd,
+        # 0.25, sizing_liq_cap). This won't match the live-spread
+        # liq_scale used INSIDE straddle_flow.execute() exactly (which
+        # pulls a real-time REST ticker), but it's a close approximation
+        # and adds no async-roundtrip overhead at the bar-decision layer.
+        # When the sidecar slip is unavailable, fall back to 1.0 (the
+        # pre-fix default).
+        liq_scale_approx = 1.0
+        if math.isfinite(slip_usd) and slip_usd > 0:
+            liq_scale_approx = float(
+                max(0.25, min(self._exec_cost_ema / slip_usd, self.config.sizing_liq_cap))
+            )
+
         # First pass: get base notional with profit_scale=1.0 so the
         # estimator can size its slippage estimate on the pre-scale N.
         # Mirrors backtester.py:1854-1872 which calls compute_position_size
@@ -2381,6 +2404,7 @@ class TradingEngine:
             signal_direction=signal.direction,
             spot=index_price,
             trailing_1h_volume_btc=trailing_vol,
+            liq_scale=liq_scale_approx,           # Cycle-24-H2: was 1.0 (default)
             dvol_pct=dvol_pct,
             edge_vp=signal.edge_vol_pts,
             rolling_median_edge=rolling_median_edge,
@@ -2421,11 +2445,19 @@ class TradingEngine:
                 n_btc=n_pre_ps,
             )
 
+        # Cycle-24-H2 (2026-05-11): second-pass also uses the sidecar-
+        # based liq_scale_approx so the risk-check at L2402-2410 below
+        # inspects a post-liq N matching what the actual fill will use.
+        # straddle_flow.execute() will then refine liq_scale with the
+        # live-REST ticker (still possible — that's the final ground
+        # truth), but at engine level we keep risk-check + profit-scale
+        # estimator + n_contracts on the same basis.
         n_contracts = self.straddle_flow.size_position(
             equity=self.equity_tracker.current_equity,
             signal_direction=signal.direction,
             spot=index_price,
             trailing_1h_volume_btc=trailing_vol,
+            liq_scale=liq_scale_approx,
             dvol_pct=dvol_pct,
             edge_vp=signal.edge_vol_pts,
             rolling_median_edge=rolling_median_edge,

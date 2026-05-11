@@ -185,7 +185,32 @@ class ProfitScaleEstimator:
             if self._hedge_per_btc_ema_usd > 0.0
             else 2.0 * self._perp_taker_fee * spot
         )
-        option_fee = 2.0 * self._option_maker_fee * spot       # both legs
+        # Cycle-24-H3 (2026-05-11, audit A3 H3): use the 4-leg model
+        # with per-leg 12.5%-of-premium cap, mirroring the backtester
+        # at ``vol_arb/backtester.py:33-45`` (the 2026-05-07 fee fix).
+        # Pre-fix this used ``2.0 * option_maker_fee * spot`` — only
+        # the two entry legs, no exit, no premium cap. Backtester uses
+        # 4 fills (2 entry + 2 exit) each with min(flat_fee, 0.125 ×
+        # premium_per_leg). When the cap doesn't bind (typical V2 at
+        # σ ≈ 0.7, DTE ≥ 5d), the per-leg fee = flat ``option_maker_fee``
+        # × spot in USD/BTC, so the difference is just 4 legs vs 2.
+        # This inflated live's profit_scale ratio numerator (smaller
+        # est_costs → higher ratio → less aggressive shrinkage), making
+        # live size larger than backtester.
+        #
+        # Inline scalar version of ``deribit_option_fees_btc``
+        # (backtester.py:23-45). Per-leg fee = min(flat_fee, 0.125 ×
+        # premium_per_leg). Round-trip straddle = 4 fills (2 entry +
+        # 2 exit). At V2 typical regime (σ ≈ 0.7, T ≥ 5d), premium ≈
+        # 0.4·σ·√T ≈ 0.033 BTC → 0.125·premium ≈ 0.0041 BTC >> flat
+        # 0.0003, so flat binds and total = 4 × 0.0003 = 0.0012 BTC
+        # per BTC of notional. Multiply by spot for USD.
+        sigma_default = 0.7
+        T_default = 5.0 / 365.0  # 5 DTE
+        prem_per_leg_btc = 0.4 * sigma_default * math.sqrt(T_default)
+        fee_per_leg_btc = min(self._option_maker_fee, 0.125 * prem_per_leg_btc)
+        # 4 fills: 2 entry + 2 exit
+        option_fee = 4.0 * fee_per_leg_btc * spot
 
         est_costs = full_slip + hedge + option_fee
 

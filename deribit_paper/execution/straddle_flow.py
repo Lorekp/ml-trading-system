@@ -229,11 +229,19 @@ class StraddleFlow:
             ))
         else:
             dynamic_btc_cap = float(n)
-        n = min(n, dynamic_btc_cap)
 
-        # Short penalty
+        # Cycle-24-H1 (2026-05-11, audit A3 H1): apply short_penalty
+        # BEFORE the dynamic_btc_cap clip, mirroring backtester
+        # ``vol_arb/sizing.py:_base_size`` lines 49-55 which penalizes
+        # then clamps. Pre-fix live clamped then penalized — when
+        # short_penalty < 1.0 AND unclipped n > cap, the two orderings
+        # diverge: live gives `cap × penalty` (smaller) while
+        # backtester gives `min(n × penalty, cap)`. Inert today
+        # (cycle-13 V2 sets penalty=1.0) but a cycle-19-class trap if
+        # the penalty is ever re-engaged.
         if signal_direction == -1:
             n *= self._short_penalty
+        n = min(n, dynamic_btc_cap)
 
         # 2. Edge scale: size up on high-conviction signals, down on weak ones
         abs_edge = abs(edge_vp)

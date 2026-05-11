@@ -273,20 +273,34 @@ async def test_process_bar_rnd_halt_short_circuits(mock_config):
 
 
 def test_trailing_1h_volume_with_trades(mock_config):
-    """_trailing_1h_volume_btc returns sum of recent trade amounts."""
+    """_trailing_1h_volume_btc returns the trailing 1h trade volume
+    converted from Deribit perp USD-notional to BTC.
+
+    Cycle-24-C1 (2026-05-11, audit A3 C1): Deribit BTC-PERPETUAL
+    ``amount`` is reported in USD-equivalent (contracts × $10), so
+    the engine divides the sum by current spot to land in BTC. The
+    test fixture now feeds USD-notional values to match production
+    semantics (pre-fix the test fed BTC values and got summed BTC
+    back — that interpretation didn't match Deribit's actual API).
+    """
     from deribit_paper.market_data.buffer import Trade, TradeBuffer
 
     engine = TradingEngine(mock_config)
     engine.perp_buffer = TradeBuffer(name="perp", window_seconds=86400.0)
+    # Stub the index_buffer to return the canonical spot used below.
+    class _StubIdx:
+        def latest(self): return 60_000.0
+    engine.index_buffer = _StubIdx()
 
     now = pd.Timestamp.now(tz="UTC")
+    # 10 trades of $30K USD-notional each (= 0.5 BTC at $60K spot)
     for i in range(10):
         engine.perp_buffer.append(Trade(
             trade_id=f"t{i}",
             timestamp=now - pd.Timedelta(minutes=30 - i),
             instrument_name="BTC-PERPETUAL",
             price=60_000.0,
-            amount=0.5,
+            amount=30_000.0,  # USD-notional per Deribit convention
             direction=1 if i % 2 == 0 else -1,
             index_price=60_000.0,
             mark_price=60_000.0,
@@ -294,7 +308,8 @@ def test_trailing_1h_volume_with_trades(mock_config):
 
     vol = engine._trailing_1h_volume_btc()
     assert vol is not None
-    assert vol == pytest.approx(5.0)  # 10 trades * 0.5 BTC each
+    # 10 trades × $30K = $300K USD → $300K / $60K spot = 5 BTC
+    assert vol == pytest.approx(5.0)
 
 
 def test_trailing_1h_volume_empty(mock_config):

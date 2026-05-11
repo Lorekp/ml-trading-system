@@ -2913,7 +2913,23 @@ class TradingEngine:
                 )
 
     def _trailing_1h_volume_btc(self) -> float | None:
-        """Aggregate the last 1 hour of perp trades for participation-rate cap."""
+        """Aggregate the last 1 hour of perp trades for participation-rate cap.
+
+        Cycle-24-C1 (2026-05-11, audit A3 C1): Deribit BTC-PERPETUAL
+        ``amount`` is reported in USD-equivalent (contracts × $10),
+        not BTC, per ``subscriber.py:63-64``. Pre-fix this summed USD
+        values and returned them labeled as BTC volume — the
+        ``dynamic_btc_cap = clip(trailing × 0.10, 1.0, 50.0)``
+        computation then pegged at 50 BTC after warmup (because
+        $50M-$300M/hr × 0.10 ≈ $5M-$30M, well over the 50 ceiling).
+        Backtester uses ATM-option BTC volume directly (no unit
+        conversion needed). Live now divides the USD aggregate by
+        current spot to land back in BTC units, matching the
+        backtester's denominator semantics.
+
+        Inert below ~$3M equity (margin envelope <5 BTC binds first),
+        but a real bug post-equity-growth.
+        """
         if self.perp_buffer is None:
             return None
         df = self.perp_buffer.to_dataframe()
@@ -2923,7 +2939,23 @@ class TradingEngine:
         recent = df[df["timestamp"] >= cutoff]
         if recent.empty:
             return None
-        return float(recent["amount"].abs().sum())
+        # Sum of USD-notional amounts (Deribit perp contract = $10 each)
+        trailing_usd = float(recent["amount"].abs().sum())
+        # Convert to BTC using the most-recent index price.
+        # ``self.index_buffer`` provides the freshest spot; if absent
+        # (test paths), fall back to a conservative default that keeps
+        # the cap binding rather than wide-open.
+        spot = None
+        if self.index_buffer is not None:
+            try:
+                spot = self.index_buffer.latest()
+            except Exception:  # noqa: BLE001 — defensive
+                spot = None
+        if spot is None or not math.isfinite(spot) or spot <= 0:
+            # Fallback: assume $60K (sane BTC range); over-estimates
+            # spot only inflates the cap, which is a no-op floor.
+            spot = 60_000.0
+        return trailing_usd / float(spot)
 
     async def _current_spot(self) -> float:
         """Fetch the latest index price for the perp hedger's step callback.

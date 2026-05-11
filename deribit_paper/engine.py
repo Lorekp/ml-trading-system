@@ -248,9 +248,21 @@ class TradingEngine:
         # Deribit but no record locally — the dropped task path.
         self._trade_tasks: list[asyncio.Task] = []
 
-        # Execution cost EMA for liquidity-conditioned sizing
+        # Execution cost EMA for liquidity-conditioned sizing.
+        # Cycle-24-C2 (2026-05-11): the EMA tracks per-bar TAKER SLIP
+        # in USD/BTC from the bar_execution_quality sidecar, NOT the
+        # straddle premium. The seed value $12 mirrors the backtester's
+        # median over the first 96 bars (vol_arb/backtester.py:2211).
+        # The update is deferred via ``_pending_slip_update`` to
+        # preserve strict past-only ordering — bar T's trade sees the
+        # EMA through bar T-1, and bar T's slip enters the EMA at the
+        # START of bar T+1. Mirrors backtester L2686 (update AFTER
+        # trade dispatch in bar i).
         self._exec_cost_ema: float = 12.0  # empirical median from backtester data
         self._exec_cost_alpha: float = 2.0 / (config.execution_cost_ema_bars + 1)
+        # Cycle-24-C2: per-bar slip captured at end of process_bar(T),
+        # applied to the EMA at start of process_bar(T+1).
+        self._pending_slip_update: float | None = None
 
         # Kelly K1 sidecar (loaded once at initialize). None disables Kelly
         # boost — every per-bar lookup returns 1.0 via lookup_kelly_mult_at.
@@ -1959,6 +1971,27 @@ class TradingEngine:
         Exposed as a public method so tests can drive the engine with
         synthetic bars without spinning up the WebSocket.
         """
+        # Cycle-24-C2 (2026-05-11): apply the PRIOR bar's slip to the
+        # EMA before sizing decisions for the current bar, then
+        # capture this bar's slip into ``_pending_slip_update`` for
+        # the next process_bar call. Mirrors the backtester's strict-
+        # past-only ordering at L2686 (slip[i] enters the EMA only
+        # after trade[i] has been processed; bar i+1's sizing uses
+        # EMA-through-i). Same logic, with a one-bar deferral to
+        # preserve the past-only contract in the async-dispatch flow.
+        if self._pending_slip_update is not None and math.isfinite(self._pending_slip_update):
+            self._exec_cost_ema += self._exec_cost_alpha * (
+                self._pending_slip_update - self._exec_cost_ema
+            )
+            self._pending_slip_update = None
+        if self._bar_slip_series is not None:
+            from vol_arb.sidecars import lookup_slip_usd_at as _lookup_slip
+            this_bar_slip = _lookup_slip(
+                self._bar_slip_series, bar.timestamp,
+            )
+            if math.isfinite(this_bar_slip):
+                self._pending_slip_update = float(this_bar_slip)
+
         # 1. Compute fresh TSRV for the bar.
         # Round-4 F6/F8 (parity-cycle 2026-05-07): switched from
         # ``perp_dataframe()`` (Deribit perp trades) to
@@ -2770,21 +2803,18 @@ class TradingEngine:
                             getattr(outcome, "trade_id", "?"),
                         )
 
-            # Update execution cost EMA from actual fill slippage
-            if (outcome.entry_call and outcome.entry_call.average_price > 0
-                    and outcome.entry_put and outcome.entry_put.average_price > 0
-                    and outcome.signal.straddle is not None
-                    and outcome.signal.straddle.index_price > 0):
-                spot_for_ema = float(outcome.signal.straddle.index_price)
-                # Approximate fill cost: total premium paid × spot
-                total_premium = (
-                    outcome.entry_call.average_price
-                    + outcome.entry_put.average_price
-                )
-                fill_cost = total_premium * spot_for_ema   # $/BTC proxy
-                self._exec_cost_ema += self._exec_cost_alpha * (
-                    fill_cost - self._exec_cost_ema
-                )
+            # Cycle-24-C2 (2026-05-11): the previous update at this site
+            # was buggy. It used ``total_premium × spot`` as ``fill_cost``,
+            # which is the gross straddle premium in USD (~$4-6k), not
+            # the per-BTC slip the EMA was supposed to track (~$10-50).
+            # The EMA converged toward straddle premium → ``liq_scale =
+            # max(0.25, min(exec_cost_ema / spread_usd, 1.5))`` pegged
+            # at the ``sizing_liq_cap=1.5`` ceiling → live N inflated
+            # ~50% above backtester. The update has been MOVED out of
+            # this per-trade block into ``process_bar`` (per-bar, sidecar-
+            # driven), mirroring the backtester's ``_slip_ema +=
+            # _slip_alpha * (_bar_taker_slip[i] - _slip_ema)`` at
+            # vol_arb/backtester.py:2686. Caught by A3 C2 (7-agent audit).
 
             # S1+S3+S5+S8 (parity-cycle round 2 — 2026-05-07): persist engine
             # state so a restart resumes equity / edge_ema / exec_cost_ema /

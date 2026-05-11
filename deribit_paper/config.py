@@ -630,6 +630,16 @@ class PaperConfig:
         # term drops out of half_spread entirely. See
         # STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
         cfg.spread_jump_k = 0.0
+        # Cycle-17 (2026-05-11, stale-defense L6): deactivate the two
+        # composite_v2 caps that don't do measurable work, keep liq_cap.
+        # sizing_edge_cap: NC-flat across [1, 100], compound saturates ~5;
+        # raised to 100 for marginal +$120K OOS Cp PnL and one fewer
+        # effective parameter. sizing_dd_floor: dd_scale never binds under
+        # current compound profile — set to 1.0 to collapse the rule entirely.
+        # sizing_liq_cap KEPT at 1.5 — only cap doing real signal-quality
+        # work (removing it drops NC Sharpe 0.30).
+        cfg.sizing_edge_cap = 100.0
+        cfg.sizing_dd_floor = 1.0
         return cfg
 
     def ensure_dirs(self) -> None:

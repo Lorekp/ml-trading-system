@@ -802,6 +802,33 @@ class BacktestConfig(BaseModel):
             # parameter). See STALE_DEFENSE_CAMPAIGN_2026_05_11.md
             # and project_cycle15_spread_jump_k_2026_05_11.md.
             spread_jump_k=0.0,
+            # Cycle-17 (2026-05-11, stale-defense L6): deactivate the two
+            # composite_v2 caps that don't do measurable work, keep the
+            # one that does.
+            #
+            # `sizing_edge_cap` (3.0 -> 100.0): edge_scale cap. NC view
+            # was perfectly flat across [1.0, 100.0] (cap never binds at
+            # NC scale). Compound saturates around 5-10; raising to 100
+            # gains ~$120K OOS Cp PnL with no MDD impact. Effectively
+            # unbinds the edge boost ceiling.
+            #
+            # `sizing_dd_floor` (0.25 -> 1.0): drawdown-conditioned floor.
+            # Full sweep [0.0, 1.0] showed pixel-identical results — the
+            # rule never binds under the current compound profile (peak-
+            # equity drawdown doesn't trigger the floor often enough to
+            # matter). At dd_floor=1.0 the dd_scale collapses to 1.0
+            # (no DD conditioning). Pure parameter-count reduction with
+            # zero PnL/risk impact.
+            #
+            # `sizing_liq_cap` is KEPT at 1.5: this is the only cap
+            # doing measurable signal-quality work. Removing it drops
+            # NC Sharpe 0.30 because it lets noisy low-slip bars
+            # trigger unbounded liquidity-conditioned upscaling. The
+            # cap is a legitimate noise-bound, not a stale defense.
+            #
+            # See STALE_DEFENSE_CAMPAIGN_2026_05_11.md L6.
+            sizing_edge_cap=100.0,
+            sizing_dd_floor=1.0,
         )
 
     @classmethod

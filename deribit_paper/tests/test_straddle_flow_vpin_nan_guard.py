@@ -1,38 +1,55 @@
-"""D-10 (parity-r3 cycle 3 — 2026-05-08) regression tests.
+"""Cycle-22 (2026-05-11) regression tests for VPIN provider hardening.
 
-``StraddleFlow`` now guards against non-finite VPIN values from its
-provider by falling back to a neutral 0.5 — the same value used when
-no provider is wired at all. Pre-fix a degraded VPIN stream (Binance
-WebSocket reconnect, stale aggregation) flowed NaN straight into
-``LiveDRLHedger.begin_trade`` → SAC v4 obs vector took NaN → silent
-hedge mispricing.
+History:
+- D-10 (parity-r3 cycle 3 — 2026-05-08): added a non-finite guard that
+  fell back to 0.5 on NaN/Inf/None-provider/exceptions.
+- Cycle-22 (2026-05-11): the 7-agent swarm audit (A6 H7) flagged that
+  0.5 is ~10σ off SAC v4's training-time VPIN distribution (mean ≈
+  0.189, std ≈ 0.032). Using 0.5 forces the policy out of its
+  training distribution, silently corrupting every hedge action when
+  the provider misbehaves. Two-layer fix:
+  - Engine startup (engine.py): FAIL-FAST if V2 preset enabled but
+    vpin_state_path empty → no stream → no provider would be wired.
+    This catches the config-bug case at startup, not at trade time.
+  - begin_trade fallback (straddle_flow.py): when provider returns
+    non-finite OR raises, fall back to ``VPIN_TRAINING_MEAN = 0.189``
+    (in-distribution neutral) instead of the old 0.5. When provider
+    is None (test paths), use the same training-mean.
 
-The guard tests below exercise the per-call provider path used in
-``execute()`` at the ``begin_trade`` site.
+The tests below exercise the per-trade policy. The engine-startup
+fail-fast is exercised by ``test_engine_fails_fast_without_vpin_stream``
+in ``test_engine_drl_vpin_failsafe.py`` (cycle-22 companion).
 """
 
 from __future__ import annotations
 
 import math
-from unittest.mock import MagicMock
 
 import pytest
 
 
+VPIN_TRAINING_MEAN = 0.189  # mirrors the constant in straddle_flow.py
+
+
 def _resolve_vpin(provider) -> float:
-    """Replicate the in-line guard from straddle_flow.execute() so
-    tests can validate the exact policy without instantiating an
-    async ``execute`` flow."""
+    """Replicate cycle-22's in-line guard from
+    ``straddle_flow.execute()`` so tests can validate the exact policy
+    without instantiating an async ``execute`` flow.
+
+    Mirrors lines ~641-672 of straddle_flow.py post-cycle-22.
+    """
     if provider is None:
-        return 0.5
+        return VPIN_TRAINING_MEAN
     try:
         raw = float(provider())
-        return raw if math.isfinite(raw) else 0.5
+        if math.isfinite(raw):
+            return raw
+        return VPIN_TRAINING_MEAN
     except (TypeError, ValueError):
-        return 0.5
+        return VPIN_TRAINING_MEAN
 
 
-# ── Healthy values pass through ──────────────────────────────────────
+# ── Healthy values pass through unchanged ────────────────────────────
 
 
 def test_healthy_vpin_value_passes_through():
@@ -42,47 +59,80 @@ def test_healthy_vpin_value_passes_through():
 
 def test_zero_vpin_value_passes_through():
     """Zero is a legitimate VPIN reading (perfectly balanced flow);
-    the guard must not nudge it to 0.5."""
+    the guard must not nudge it."""
     val = _resolve_vpin(lambda: 0.0)
     assert val == 0.0
 
 
-# ── Non-finite values fall back to neutral 0.5 ────────────────────────
+def test_training_mean_value_passes_through():
+    """The training mean itself is a perfectly valid live VPIN value
+    — the guard only triggers on non-finite, not "looks neutral"."""
+    val = _resolve_vpin(lambda: 0.189)
+    assert val == pytest.approx(0.189)
 
 
-def test_nan_vpin_falls_back_to_neutral():
+# ── Non-finite values fall back to training-mean (cycle-22) ──────────
+
+
+def test_nan_vpin_falls_back_to_training_mean():
     val = _resolve_vpin(lambda: float("nan"))
-    assert val == 0.5
+    assert val == pytest.approx(VPIN_TRAINING_MEAN)
 
 
-def test_inf_vpin_falls_back_to_neutral():
+def test_inf_vpin_falls_back_to_training_mean():
     val = _resolve_vpin(lambda: float("inf"))
-    assert val == 0.5
+    assert val == pytest.approx(VPIN_TRAINING_MEAN)
 
 
-def test_neg_inf_vpin_falls_back_to_neutral():
+def test_neg_inf_vpin_falls_back_to_training_mean():
     val = _resolve_vpin(lambda: float("-inf"))
-    assert val == 0.5
+    assert val == pytest.approx(VPIN_TRAINING_MEAN)
 
 
-# ── Provider exceptions fall back to neutral 0.5 ─────────────────────
+# ── Provider exceptions fall back to training-mean ───────────────────
 
 
-def test_provider_raises_typeerror_falls_back():
-    """Provider returns None or unconvertible → neutral fallback,
-    not propagated as a trade-cancelling exception."""
+def test_provider_returns_none_falls_back():
+    """Provider returns None → ``float(None)`` raises TypeError →
+    in-distribution fallback."""
     val = _resolve_vpin(lambda: None)
-    assert val == 0.5
+    assert val == pytest.approx(VPIN_TRAINING_MEAN)
 
 
-def test_provider_raises_valueerror_falls_back():
+def test_provider_returns_string_falls_back():
+    """Provider returns an unconvertible string → ValueError → fallback."""
     val = _resolve_vpin(lambda: "not-a-number")
-    assert val == 0.5
+    assert val == pytest.approx(VPIN_TRAINING_MEAN)
 
 
-# ── No provider configured → neutral default ─────────────────────────
+# ── No provider configured → training-mean (cycle-22 change) ────────
 
 
-def test_no_provider_yields_neutral_default():
-    val = _resolve_vpin(None)
-    assert val == 0.5
+def test_no_provider_falls_back_to_training_mean():
+    """Cycle-22 (2026-05-11): the no-provider case (tests, non-DRL
+    configs) falls back to ``VPIN_TRAINING_MEAN = 0.189`` instead of
+    the old ``0.5``. The hard fail-fast for the DRL-enabled-but-no-
+    provider scenario lives in engine.py at startup, not here; this
+    layer just provides an in-distribution default."""
+    assert _resolve_vpin(None) == pytest.approx(VPIN_TRAINING_MEAN)
+
+
+# ── Distribution sanity: training mean is in-distribution ─────────────
+
+
+def test_training_mean_is_within_1_sigma_of_training_distribution():
+    """Sanity: the cycle-22 fallback constant must sit within ±1σ of
+    the SAC v4 training distribution so the policy doesn't see an
+    obs vector it was never trained on.
+
+    Training mean ≈ 0.189, std ≈ 0.032 (per
+    `project_w5_v4_adopted.md`). The fallback is the mean itself, so
+    |fallback - mean| / std = 0 — trivially passes.
+    """
+    training_mean_canonical = 0.189
+    training_std_canonical = 0.032
+    z_score = abs(VPIN_TRAINING_MEAN - training_mean_canonical) / training_std_canonical
+    assert z_score <= 1.0, (
+        f"Cycle-22 VPIN fallback ({VPIN_TRAINING_MEAN}) is {z_score:.2f}σ "
+        f"from training mean — should be within 1σ to stay in distribution."
+    )

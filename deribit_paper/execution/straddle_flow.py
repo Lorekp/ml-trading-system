@@ -634,10 +634,23 @@ class StraddleFlow:
         # return non-finite values (degenerate aggregation). Pre-fix the
         # raw provider value flowed straight into ``begin_trade`` →
         # downstream the SAC v4 obs vector took NaN, silently mispricing
-        # the hedge ratio. Fall back to neutral 0.5 (matching the
-        # ``vpin_provider is None`` path) when non-finite, with a
-        # rate-limited warning so the operator sees stream degradation.
-        vpin_value = 0.5
+        # the hedge ratio.
+        #
+        # Cycle-22 (2026-05-11): the previous fallback ``0.5`` was a
+        # 10σ outlier vs SAC v4's training-time VPIN distribution
+        # (mean ≈ 0.189, std ≈ 0.032 on the production parquet). Using
+        # 0.5 forces the policy into a regime it was never trained on.
+        # The 7-agent audit (A6 H7) flagged this as a silent corruption
+        # of every hedge action when the provider misbehaves.
+        # Replaced the fallback with ``VPIN_TRAINING_MEAN = 0.189`` —
+        # in-distribution neutral. The hard fail-fast (raise on
+        # provider=None when DRL is enabled) is enforced at engine
+        # startup time (engine.py LiveVPINStream wiring), so by the
+        # time control reaches here, ``self._vpin_provider`` is wired
+        # in any prod V2 config. Tests can still pass ``None`` to
+        # bypass the wiring.
+        VPIN_TRAINING_MEAN = 0.189  # SAC v4 training distribution mean
+        vpin_value: float = VPIN_TRAINING_MEAN
         if self._vpin_provider is not None:
             try:
                 vpin_raw = float(self._vpin_provider())
@@ -645,14 +658,15 @@ class StraddleFlow:
                     vpin_value = vpin_raw
                 else:
                     logger.warning(
-                        "D-10: VPIN provider returned non-finite (%s); "
-                        "falling back to 0.5 for begin_trade",
-                        vpin_raw,
+                        "Cycle-22: VPIN provider returned non-finite "
+                        "(%s); falling back to training-mean %.3f",
+                        vpin_raw, VPIN_TRAINING_MEAN,
                     )
             except (TypeError, ValueError) as exc:
                 logger.warning(
-                    "D-10: VPIN provider raised %s; falling back to 0.5",
-                    exc,
+                    "Cycle-22: VPIN provider raised %s; falling back "
+                    "to training-mean %.3f",
+                    exc, VPIN_TRAINING_MEAN,
                 )
         trade_id = self._drl.begin_trade(
             signal=signal.direction,

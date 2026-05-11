@@ -892,6 +892,37 @@ class TradingEngine:
                 cfg.vpin_poll_seconds,
             )
         else:
+            # Cycle-22 (2026-05-11, audit A6 H7): hard-refuse to start
+            # the engine if DRL hedging is enabled but no VPIN stream is
+            # wired. Pre-cycle-22 the downstream StraddleFlow would have
+            # silently fallen back to ``vpin=0.5`` per trade — 10σ off
+            # SAC v4's training distribution (mean ≈ 0.189, std ≈ 0.032)
+            # and a silent corruption of every hedge action. Under V2
+            # ``use_drl_hedging`` is always True, so the only way to
+            # reach this branch in prod is a config bug
+            # (``vpin_state_path`` accidentally empty / unset). Fail
+            # LOUDLY at startup so the operator notices, instead of
+            # quietly mishedging from the first bar.
+            #
+            # Tests / non-DRL configs can still pass by setting
+            # ``vpin_state_path=""`` AND a non-V2 ``config_preset``
+            # (this path will get the "disabled" log only when DRL is
+            # demonstrably off).
+            drl_enabled = (
+                getattr(cfg, "use_drl_hedging", True) is not False
+                and cfg.config_preset == "v2"
+            )
+            if drl_enabled:
+                raise RuntimeError(
+                    "Live engine refused to start: V2 preset enables DRL "
+                    "hedging but vpin_state_path is empty. The SAC v4 "
+                    "policy requires a wired VPIN stream to stay in its "
+                    "training distribution; pre-cycle-22 the missing "
+                    "stream silently corrupted every hedge action with a "
+                    "10σ fallback. Set cfg.vpin_state_path to the warm-"
+                    "start parquet or run with a non-V2 preset. See "
+                    "memory/project_cycle22_vpin_drl_provenance_2026_05_11.md."
+                )
             logger.info("LiveVPINStream disabled (vpin_state_path empty)")
 
         # ── F3 Tier 6: Live dollar-bar spot stream ──

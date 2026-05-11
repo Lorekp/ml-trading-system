@@ -250,7 +250,15 @@ def load_model_bundle(
     drl_policy = SAC.load(
         str(drl_policy_path), device="cpu", custom_objects=custom_objects,
     )
-    logger.info("  DRL policy loaded: %s", drl_policy_path.name)
+    # Cycle-22 (2026-05-11): log SHA256 of the SAC v4 zip alongside the
+    # LGBM/TransVol fingerprints already logged earlier in this function.
+    # Closes the A6 LOW-2 audit gap: pre-fix the operator could not
+    # verify from the engine log that live and backtester loaded
+    # byte-identical SAC weights.
+    drl_sha = _short_sha256(drl_policy_path)
+    logger.info(
+        "  DRL policy loaded: %s, sha256=%s", drl_policy_path.name, drl_sha,
+    )
 
     # Smoke test: one forward pass must succeed (catches cross-platform pickle issues)
     _obs = np.zeros(drl_policy.observation_space.shape, dtype=np.float32)

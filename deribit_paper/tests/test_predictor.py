@@ -1,11 +1,18 @@
 """Tests for Predictor — dynamic half-spread, circuit breaker, signal logic.
 
-Exercises the parity-critical logic that mirrors
-``vol_arb.backtester.VolArbBacktester.compute_spread`` (line ~1204):
+Exercises the parity-critical logic that mirrors the PRODUCTION pipeline in
+``vol_arb.backtester.VolArbBacktester.run_backtest``:
 
-  - dynamic half-spread = base_spread_iv * exp(spread_jump_k * jf)
-    (NO division by 2 — base_spread_iv IS the half-spread; this is the
-    cycle-19 alignment with backtester's interpretation)
+  - ``compute_spread()`` returns ``base_spread_iv * exp(spread_jump_k * jf)``
+    (backtester.py:1204)
+  - the production pipeline then PASSES ``spread / 2.0`` to ``generate_signals``
+    (backtester.py:3189-3190), so the effective half_spread used in the
+    fire/flat decision is ``base_spread_iv * exp(k*jf) / 2.0``.
+  - Live (this module) mirrors that with the same ``/ 2.0`` tail at
+    ``predictor.py:251`` (cycle-19-REVERT 2026-05-11). Treating
+    ``base_spread_iv`` as a half-spread directly would shift live's
+    effective threshold by 1.0vp relative to backtester — discovered
+    by the post-cycle-19 swarm audit.
   - asymmetric thresholds: long needs 30vp + half_spread, short needs 25vp + half_spread
   - circuit breaker: short signals killed when jump_fraction > max_jump_fraction_for_shorts
 """
@@ -99,14 +106,14 @@ def _make_predictor(rv_pred_pct: float, iv_used_pct: float) -> Predictor:
 # ── Half-spread (low jump_fraction) ───────────────────────────────────
 
 def test_flat_when_edge_just_below_long_threshold():
-    """edge = 31.49vp < eff_long = half_spread(jf=0) + 30 = 1.5 + 30 = 31.5 → FLAT.
+    """edge = 30.74vp < eff_long = half_spread(jf=0) + 30 = 0.75 + 30 = 30.75 → FLAT.
 
-    Cycle-19 (2026-05-11): half_spread = base_spread_iv (NOT base/2) to
-    match backtester. With base_spread_iv=1.5 at jf=0, half_spread=1.5
-    (was 0.75 pre-cycle-19).
+    Cycle-19-REVERT (2026-05-11): live's half_spread mirrors the backtester
+    PRODUCTION pipeline (compute_spread() / 2.0). With base_spread_iv=1.5
+    at jf=0, half_spread=0.75.
     """
-    predictor = _make_predictor(rv_pred_pct=106.49, iv_used_pct=75.0)
-    # rv - iv = 106.49 - 75 = 31.49; eff_long = 1.5 + 30 = 31.5
+    predictor = _make_predictor(rv_pred_pct=105.74, iv_used_pct=75.0)
+    # rv - iv = 105.74 - 75 = 30.74; eff_long = 0.75 + 30 = 30.75
     bar = _make_bar()
     tsrv = _make_tsrv(jump_fraction=0.0)
     sig = predictor.predict(bar, tsrv, straddle=_make_straddle())
@@ -114,8 +121,8 @@ def test_flat_when_edge_just_below_long_threshold():
 
 
 def test_long_when_edge_just_above_long_threshold():
-    """edge = 31.51vp > eff_long = 31.5 → LONG (cycle-19 alignment)."""
-    predictor = _make_predictor(rv_pred_pct=106.51, iv_used_pct=75.0)
+    """edge = 30.76vp > eff_long = 30.75 → LONG (cycle-19-REVERT)."""
+    predictor = _make_predictor(rv_pred_pct=105.76, iv_used_pct=75.0)
     bar = _make_bar()
     tsrv = _make_tsrv(jump_fraction=0.0)
     sig = predictor.predict(bar, tsrv, straddle=_make_straddle())
@@ -123,12 +130,13 @@ def test_long_when_edge_just_above_long_threshold():
 
 
 def test_short_when_edge_just_below_short_threshold():
-    """edge = -26.51vp < -eff_short = -(1.5 + 25) = -26.5 → SHORT.
+    """edge = -25.76vp < -eff_short = -(0.75 + 25) = -25.75 → SHORT.
 
-    Cycle-19 (2026-05-11): eff_short = 26.5 (was 25.75 pre-cycle-19).
+    Cycle-19-REVERT (2026-05-11): eff_short = 25.75 mirroring backtester
+    production pipeline (compute_spread / 2.0).
     """
-    predictor = _make_predictor(rv_pred_pct=48.49, iv_used_pct=75.0)
-    # rv - iv = 48.49 - 75 = -26.51; eff_short = 1.5 + 25 = 26.5
+    predictor = _make_predictor(rv_pred_pct=49.24, iv_used_pct=75.0)
+    # rv - iv = 49.24 - 75 = -25.76; eff_short = 0.75 + 25 = 25.75
     bar = _make_bar()
     tsrv = _make_tsrv(jump_fraction=0.0)
     sig = predictor.predict(bar, tsrv, straddle=_make_straddle())
@@ -136,8 +144,8 @@ def test_short_when_edge_just_below_short_threshold():
 
 
 def test_flat_when_edge_just_inside_short_threshold():
-    """edge = -26.49vp > -26.5 → FLAT (cycle-19 alignment)."""
-    predictor = _make_predictor(rv_pred_pct=48.51, iv_used_pct=75.0)
+    """edge = -25.74vp > -25.75 → FLAT (cycle-19-REVERT)."""
+    predictor = _make_predictor(rv_pred_pct=49.26, iv_used_pct=75.0)
     bar = _make_bar()
     tsrv = _make_tsrv(jump_fraction=0.0)
     sig = predictor.predict(bar, tsrv, straddle=_make_straddle())
@@ -147,14 +155,14 @@ def test_flat_when_edge_just_inside_short_threshold():
 # ── Dynamic half-spread widens threshold at high jf ───────────────────
 
 def test_long_signal_killed_by_wider_spread_at_high_jf():
-    """edge = 32vp is LONG at jf=0 but FLAT at jf=0.3 (spread widens).
+    """edge = 31vp is LONG at jf=0 but FLAT at jf=0.3 (spread widens).
 
-    Cycle-19 (2026-05-11) — half_spread = base_spread_iv * exp(k*jf):
-    At jf=0.3: half_spread = 1.5 * exp(3.0 * 0.3) ≈ 3.69vp
-    eff_long = 3.69 + 30 = 33.69 > 32 → FLAT.
-    At jf=0.0: eff_long = 1.5 + 30 = 31.5 < 32 → LONG.
+    Cycle-19-REVERT (2026-05-11) — half_spread = base_spread_iv * exp(k*jf) / 2:
+    At jf=0.3: half_spread = 1.5 * exp(3.0 * 0.3) / 2 ≈ 1.845vp
+    eff_long = 1.845 + 30 = 31.845 > 31 → FLAT.
+    At jf=0.0: eff_long = 0.75 + 30 = 30.75 < 31 → LONG.
     """
-    predictor = _make_predictor(rv_pred_pct=107.0, iv_used_pct=75.0)
+    predictor = _make_predictor(rv_pred_pct=106.0, iv_used_pct=75.0)
     bar = _make_bar()
 
     sig_low_jf = predictor.predict(bar, _make_tsrv(jump_fraction=0.0), straddle=_make_straddle())
@@ -254,20 +262,24 @@ def test_predictor_returns_flat_when_both_iv_tiers_unavailable():
     assert "unavailable" in sig.reason.lower()
 
 
-# ── Cycle-19 parity lock: live half_spread formula must match backtester ─
+# ── Cycle-19-REVERT parity lock: live half_spread must match the EFFECTIVE
+# value the backtester pipeline actually passes to generate_signals. The
+# previous version of this test compared live to `bt.compute_spread()`
+# directly, which is RAW (full spread); the production pipeline at
+# `vol_arb/backtester.py:3189-3190` divides by 2.0 before calling
+# generate_signals. Cycle-19 (REMOVED) had aligned live to the raw value,
+# making live 1vp STRICTER than the production backtester. Cycle-19-REVERT
+# (2026-05-11) restores `/ 2.0` in live and aligns this test to the actual
+# production effective half_spread.
 
 def test_half_spread_formula_matches_backtester_no_jump():
-    """Cycle-19 (2026-05-11) parity lock: live predictor's half_spread
-    must equal backtester's compute_spread() at every input.
+    """Cycle-19-REVERT (2026-05-11) parity lock: live predictor's half_spread
+    must equal the EFFECTIVE half_spread used in the backtester PRODUCTION
+    pipeline (compute_spread / 2.0), not the raw compute_spread.
 
-    Pre-cycle-19 the live engine had a stray `/ 2.0` in the formula that
-    made it 1.0vp more permissive on entry than the backtester. This
-    test directly probes the boundary case: at edge = base_spread_iv +
-    entry_threshold + epsilon, BOTH engines should fire LONG; at edge
-    just below, BOTH should be FLAT.
-
-    Live (cycle-19): half_spread = base * exp(k*jf)
-    Backtester (canonical): half_spread = base * exp(k*jf)
+    Live (cycle-19-REVERT): half_spread = base * exp(k*jf) / 2.0
+    Backtester production:  spread = base * exp(k*jf); pipeline passes
+                            spread / 2.0 to generate_signals (L3189-3190).
     """
     import numpy as np
     from vol_arb.backtester import BacktestConfig, VolArbBacktester
@@ -275,29 +287,42 @@ def test_half_spread_formula_matches_backtester_no_jump():
     k = 0.0
     bt_cfg = BacktestConfig(base_spread_iv=base, spread_jump_k=k)
     bt = VolArbBacktester(bt_cfg)
-    backtester_half_spread = bt.compute_spread(np.array([0.0, 0.1, 0.3]))
+    # Effective half_spread the backtester pipeline ACTUALLY uses:
+    backtester_eff_half_spread = bt.compute_spread(np.array([0.0, 0.1, 0.3])) / 2.0
 
-    # Replicate the live formula at the same jf values
-    live_half_spread = np.array([base * math.exp(k * jf) for jf in [0.0, 0.1, 0.3]])
+    # Live formula (with the /2.0 restored by cycle-19-REVERT)
+    live_half_spread = np.array(
+        [base * math.exp(k * jf) / 2.0 for jf in [0.0, 0.1, 0.3]]
+    )
 
     np.testing.assert_allclose(
-        live_half_spread, backtester_half_spread,
+        live_half_spread, backtester_eff_half_spread,
         rtol=1e-12, atol=1e-12,
-        err_msg="Cycle-19 parity gap: live half_spread != backtester compute_spread"
+        err_msg=(
+            "Cycle-19-REVERT parity gap: live half_spread != backtester "
+            "effective half_spread (compute_spread / 2.0)"
+        ),
     )
 
 
 def test_signal_threshold_matches_backtester_at_boundary():
-    """Cycle-19 (2026-05-11): given identical (edge, jf, thresholds,
+    """Cycle-19-REVERT (2026-05-11): given identical (edge, jf, thresholds,
     base_spread_iv, spread_jump_k), live and backtester must produce
     the same signal direction.
 
+    CRITICAL: this test now goes through the BACKTESTER PRODUCTION
+    pipeline path (compute_spread → spread/2.0 → generate_signals), not
+    just `bt.generate_signals` called directly. The previous version of
+    this test was a green-light cover for a broken cycle-19 fix because
+    it called `bt.generate_signals(half_spread=[compute_spread()[0]])`
+    bypassing the `/ 2.0` step at backtester.py:3189-3190.
+
     Probe: at base_spread_iv=2.0, k=0, entry_threshold=20.0,
-    entry_threshold_long=12.0, eff_short = 22.0 and eff_long = 14.0.
-    A bar with edge = -22.5 should fire SHORT on both;
-    a bar with edge = -21.5 should be FLAT on both (pre-cycle-19,
-    live would have fired SHORT at edge = -21.5 because its
-    half_spread was 1.0 instead of 2.0).
+    entry_threshold_long=12.0, the BACKTESTER PRODUCTION effective
+    thresholds are eff_short = 21.0 and eff_long = 13.0 (because the
+    pipeline halves compute_spread before generate_signals). A bar with
+    edge = -21.5 should fire SHORT on both; edge = -20.5 should be FLAT
+    on both.
     """
     import numpy as np
     from vol_arb.backtester import BacktestConfig, VolArbBacktester
@@ -306,31 +331,30 @@ def test_signal_threshold_matches_backtester_at_boundary():
         entry_threshold=20.0, entry_threshold_long=12.0,
     )
     bt = VolArbBacktester(bt_cfg)
-    half = bt.compute_spread(np.array([0.0]))[0]
-    # Backtester effective thresholds
-    eff_short = half + 20.0
-    eff_long = half + 12.0
-    assert eff_short == pytest.approx(22.0)
-    assert eff_long == pytest.approx(14.0)
-    # Backtester signals at boundary edges
+    # Effective half_spread the production pipeline passes to generate_signals
+    half_effective = bt.compute_spread(np.array([0.0]))[0] / 2.0
+    eff_short = half_effective + 20.0
+    eff_long = half_effective + 12.0
+    assert eff_short == pytest.approx(21.0)
+    assert eff_long == pytest.approx(13.0)
+    # Backtester signals at the production-effective boundary
     sig_inside_short = bt.generate_signals(
-        edge=np.array([-21.5]),
-        half_spread=np.array([half]),
+        edge=np.array([-20.5]),
+        half_spread=np.array([half_effective]),
         jump_fraction=np.array([0.0]),
     )[0]
     sig_outside_short = bt.generate_signals(
-        edge=np.array([-22.5]),
-        half_spread=np.array([half]),
+        edge=np.array([-21.5]),
+        half_spread=np.array([half_effective]),
         jump_fraction=np.array([0.0]),
     )[0]
-    assert sig_inside_short == 0   # edge -21.5 > -22, FLAT
-    assert sig_outside_short == -1 # edge -22.5 < -22, SHORT
+    assert sig_inside_short == 0   # edge -20.5 > -21, FLAT
+    assert sig_outside_short == -1 # edge -21.5 < -21, SHORT
 
-    # Now live: at base=2.0, k=0, half_spread = 2.0 (cycle-19),
-    # eff_short = 22.0, so edge -21.5 must be FLAT
-    # (pre-cycle-19 it would have been SHORT).
+    # Now live: at base=2.0, k=0, half_spread = 1.0 (cycle-19-REVERT),
+    # eff_short = 21.0, so edge -20.5 must be FLAT and -21.5 must be SHORT.
     iv = 75.0
-    predictor_inside = _make_predictor(rv_pred_pct=iv - 21.5, iv_used_pct=iv)
+    predictor_inside = _make_predictor(rv_pred_pct=iv - 20.5, iv_used_pct=iv)
     predictor_inside._base_spread_iv = 2.0
     predictor_inside._spread_jump_k = 0.0
     predictor_inside._entry_threshold = 20.0
@@ -339,11 +363,11 @@ def test_signal_threshold_matches_backtester_at_boundary():
         _make_bar(), _make_tsrv(jump_fraction=0.0), straddle=_make_straddle()
     )
     assert sig_inside_live.direction == 0, (
-        f"Cycle-19 parity gap: live fired at edge=-21.5 with half_spread=2.0; "
+        f"Cycle-19-REVERT parity gap: live fired at edge=-20.5 with eff_short=21.0; "
         f"backtester says FLAT. Got: {sig_inside_live.reason}"
     )
 
-    predictor_outside = _make_predictor(rv_pred_pct=iv - 22.5, iv_used_pct=iv)
+    predictor_outside = _make_predictor(rv_pred_pct=iv - 21.5, iv_used_pct=iv)
     predictor_outside._base_spread_iv = 2.0
     predictor_outside._spread_jump_k = 0.0
     predictor_outside._entry_threshold = 20.0

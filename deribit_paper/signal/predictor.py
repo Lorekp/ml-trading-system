@@ -237,18 +237,18 @@ class Predictor:
         #    for higher entry slippage on long straddles.
         jf = float(bar_tsrv.jump_fraction) if bar_tsrv.jump_fraction is not None else 0.0
         jf = max(0.0, min(1.0, jf))
-        # Cycle-19 (2026-05-11): aligned with backtester's compute_spread()
-        # at vol_arb/backtester.py:1204. Pre-fix this expression had a `/ 2.0`
-        # tail that treated base_spread_iv as a FULL bid-ask spread, while
-        # the backtester treats it as the half-spread directly. The 1.0
-        # vol-point gap meant live fired SHORT 1vp looser than backtester
-        # would (live eff_short = 21vp at base=2/k=0; backtester eff_short
-        # = 22vp). Parity-r3 cycle-2 (S-8 2026-05-08) synced the VALUE
-        # (1.5 -> 2.0) but missed this INTERPRETATION gap. Cycle-19 audit
-        # surfaced the discrepancy when comparing live bar_cursor's
-        # "eff_thresh=21.00" against backtester's expected 22.00. See
-        # STALE_DEFENSE_CAMPAIGN_2026_05_11.md LE3 follow-up.
-        half_spread = self._base_spread_iv * math.exp(self._spread_jump_k * jf)
+        # Cycle-19-REVERT (2026-05-11): RESTORED `/ 2.0` after audit found
+        # the original cycle-19 fix was the WRONG DIRECTION. Backtester's
+        # production pipeline at vol_arb/backtester.py:3189-3190 passes
+        # `spread / 2.0` to generate_signals(), where `spread = compute_spread()`
+        # returns `base_spread_iv * exp(k*jf)`. So the effective half_spread
+        # the backtester applies is `base * exp(k*jf) / 2.0` — IDENTICAL to
+        # the pre-cycle-19 live formula here. Cycle-19 removed the `/2.0`
+        # making live STRICTER than backtester (eff_short=22 vs 21), opposite
+        # of the intended fix. The bar_cursor's "+13.00/-21.00" output that
+        # triggered cycle-19 was actually CORRECT — it matched backtester's
+        # effective thresholds. Reverted on full-codebase parity audit.
+        half_spread = self._base_spread_iv * math.exp(self._spread_jump_k * jf) / 2.0
 
         # E.1.8: compute the 1w-2w term slope ONCE at predict time and
         # cache on the Signal so downstream code (harness, audits) sees

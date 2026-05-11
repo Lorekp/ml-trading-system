@@ -82,6 +82,9 @@ def _run_one(param: str, value, label: str) -> dict:
 
     eq = cfg.initial_equity + exe["net_pnl_nc"].cumsum()
     mdd_nc = float((eq - eq.cummax()).min())
+    # MDD% on $100K NC reference equity (scale-invariant, comparable
+    # across cycles where K1/profit-scaling shift dollar magnitudes).
+    mdd_pct = mdd_nc / cfg.initial_equity * 100.0
 
     per_trade = exe["net_pnl_nc"]
     if per_trade.std(ddof=1) > 0:
@@ -106,6 +109,7 @@ def _run_one(param: str, value, label: str) -> dict:
         "daily_sharpe_nc": daily_sharpe_nc,
         "trade_sharpe_nc": trade_sharpe_nc,
         "mdd_nc": mdd_nc,
+        "mdd_pct": mdd_pct,
         **{f"y_{yr}": v for yr, v in per_year.items()},
         "per_year_min": float(min(per_year.values())) if per_year else 0.0,
         "per_year_strict_5_of_5": int(all(v >= 0 for v in per_year.values())),
@@ -118,7 +122,7 @@ def _find_stable_region(df: pd.DataFrame, ref_value) -> dict:
     ref_row = df[matches].iloc[0] if matches.any() else df.iloc[0]
     pnl_tol = 0.05
     sharpe_tol = 0.50
-    mdd_tol_usd = 5000.0
+    mdd_tol_pct = 5.0  # 5pp of $100K NC reference equity
 
     df = df.copy()
     df["stable_pnl"] = (
@@ -129,7 +133,7 @@ def _find_stable_region(df: pd.DataFrame, ref_value) -> dict:
         (df["daily_sharpe_nc"] >= ref_row["daily_sharpe_nc"] - sharpe_tol) &
         (df["daily_sharpe_nc"] <= ref_row["daily_sharpe_nc"] + sharpe_tol)
     )
-    df["stable_mdd"] = (df["mdd_nc"] >= ref_row["mdd_nc"] - mdd_tol_usd)
+    df["stable_mdd"] = (df["mdd_pct"] >= ref_row["mdd_pct"] - mdd_tol_pct)
     df["stable_strict"] = (df["per_year_strict_5_of_5"] == 1)
     df["stable_all"] = (
         df["stable_pnl"] & df["stable_sharpe"] &
@@ -140,7 +144,7 @@ def _find_stable_region(df: pd.DataFrame, ref_value) -> dict:
         "ref_value": ref_value,
         "ref_nc_pnl": float(ref_row["nc_pnl"]),
         "ref_sharpe": float(ref_row["daily_sharpe_nc"]),
-        "ref_mdd": float(ref_row["mdd_nc"]),
+        "ref_mdd_pct": float(ref_row["mdd_pct"]),
         "stable_values": stable_vals,
         "stable_min": min(stable_vals) if stable_vals else None,
         "stable_max": max(stable_vals) if stable_vals else None,
@@ -186,10 +190,10 @@ def main() -> int:
         r = _run_one(args.param, v, label)
         rows.append(r)
         logger.info(
-            "  done: NC PnL $%s, daily Sharpe %.2f, MDD $%s, "
+            "  done: NC PnL $%s, daily Sharpe %.2f, MDD %.2f%%, "
             "trades %d (%d short, %d long), elapsed %.1fs",
             f"{r['nc_pnl']:,.0f}", r["daily_sharpe_nc"],
-            f"{r['mdd_nc']:,.0f}",
+            r["mdd_pct"],
             r["n_trades"], r["n_short"], r["n_long"], r["elapsed_s"],
         )
 
@@ -202,7 +206,7 @@ def main() -> int:
     print()
     print("=" * 80)
     print(f"  STABLE REGION (within +/- 5% NC PnL, +/- 0.5 Sharpe, MDD not worse")
-    print(f"   by >$5K vs ref={stable['ref_value']}, per-year strict 5/5):")
+    print(f"   by >5pp vs ref={stable['ref_value']}, per-year strict 5/5):")
     print("=" * 80)
     if stable["stable_values"]:
         print(f"  stable range: [{stable['stable_min']}, {stable['stable_max']}]")
@@ -224,7 +228,7 @@ def main() -> int:
     lines.append("")
     lines.append(f"- Reference: `{args.param}`={stable['ref_value']}, "
                  f"NC PnL ${stable['ref_nc_pnl']:,.0f}, "
-                 f"Sharpe {stable['ref_sharpe']:.2f}, MDD ${stable['ref_mdd']:,.0f}")
+                 f"Sharpe {stable['ref_sharpe']:.2f}, MDD {stable['ref_mdd_pct']:.2f}%")
     if stable["stable_values"]:
         lines.append(f"- Stable region: **{args.param} in "
                      f"[{stable['stable_min']}, {stable['stable_max']}]** "
@@ -238,13 +242,13 @@ def main() -> int:
         best = strict.loc[strict["nc_pnl"].idxmax()]
         lines.append(f"- Best NC PnL (strict 5/5): `{args.param}`={best['value']}, "
                      f"NC PnL ${best['nc_pnl']:,.0f}, "
-                     f"Sharpe {best['daily_sharpe_nc']:.2f}, MDD ${best['mdd_nc']:,.0f}")
+                     f"Sharpe {best['daily_sharpe_nc']:.2f}, MDD {best['mdd_pct']:.2f}%")
     lines.append("")
 
     lines.append("## Grid results")
     lines.append("")
     cols = ["value", "n_trades", "n_short", "n_long", "nc_pnl",
-            "daily_sharpe_nc", "trade_sharpe_nc", "mdd_nc",
+            "daily_sharpe_nc", "trade_sharpe_nc", "mdd_pct",
             "per_year_min", "per_year_strict_5_of_5"]
     fmts = {
         "value": "{}",
@@ -254,7 +258,7 @@ def main() -> int:
         "nc_pnl": "${:,.0f}",
         "daily_sharpe_nc": "{:.2f}",
         "trade_sharpe_nc": "{:.2f}",
-        "mdd_nc": "${:,.0f}",
+        "mdd_pct": "{:.2f}%",
         "per_year_min": "${:,.0f}",
         "per_year_strict_5_of_5": "{}",
     }

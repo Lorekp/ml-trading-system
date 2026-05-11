@@ -89,6 +89,8 @@ def _metrics_on_slice(tl: pd.DataFrame, years: set[int]) -> dict:
         trade_sharpe = float("nan")
     eq = exe["net_pnl_nc"].cumsum()
     mdd = float((eq - eq.cummax()).min())
+    # MDD% on $100K NC reference equity (scale-invariant).
+    mdd_pct = mdd / 100_000.0 * 100.0
     per_year = exe.groupby(exe.index.year)["net_pnl_nc"].sum().to_dict()
     return {
         "n_trades": int(len(exe)),
@@ -98,6 +100,7 @@ def _metrics_on_slice(tl: pd.DataFrame, years: set[int]) -> dict:
         "daily_sharpe_nc": daily_sharpe,
         "trade_sharpe_nc": trade_sharpe,
         "mdd_nc": mdd,
+        "mdd_pct": mdd_pct,
         "per_year": {int(k): float(v) for k, v in per_year.items()},
         "per_year_min": float(min(per_year.values())) if per_year else 0.0,
     }
@@ -117,8 +120,8 @@ def main() -> int:
     parser.add_argument("--sharpe-drop-max", type=float, default=0.50,
                         help="G2: max OOS daily Sharpe drop tolerated (default 0.50; "
                              "cycle-12 used 0.50, escalating sweeps should tighten)")
-    parser.add_argument("--mdd-worsen-max-usd", type=float, default=2_000.0,
-                        help="G3: max OOS MDD worsening in $ tolerated (default $2,000)")
+    parser.add_argument("--mdd-worsen-max-pct", type=float, default=2.0,
+                        help="G3: max OOS MDD worsening in pp tolerated (default 2.0pp = $2K on $100K NC ref)")
     parser.add_argument("--require-same-sign-positive", action="store_true",
                         default=True,
                         help="G5 strict mode: require both TRAIN and OOS dPnL > 0 "
@@ -136,7 +139,7 @@ def main() -> int:
     print(f"  Gates:")
     print(f"    G1: OOS dPnL > 0")
     print(f"    G2: OOS daily Sharpe drop <= {args.sharpe_drop_max}")
-    print(f"    G3: OOS MDD worsen <= ${args.mdd_worsen_max_usd:,.0f}")
+    print(f"    G3: OOS MDD worsen <= {args.mdd_worsen_max_pct:.2f}pp")
     print(f"    G4: OOS per-year strict 2/2 non-negative")
     print(f"    G5: TRAIN + OOS dPnL same sign (both positive)")
     print("=" * 80)
@@ -162,6 +165,7 @@ def main() -> int:
             "daily_sharpe_nc": t["daily_sharpe_nc"] - b["daily_sharpe_nc"],
             "trade_sharpe_nc": t["trade_sharpe_nc"] - b["trade_sharpe_nc"],
             "mdd_nc":          t["mdd_nc"]   - b["mdd_nc"],
+            "mdd_pct":         t["mdd_pct"]  - b["mdd_pct"],
             "per_year_min":    t["per_year_min"] - b["per_year_min"],
         }
 
@@ -170,7 +174,7 @@ def main() -> int:
 
     g1 = doos["nc_pnl"] > 0
     g2 = doos["daily_sharpe_nc"] >= -args.sharpe_drop_max
-    g3 = doos["mdd_nc"] >= -args.mdd_worsen_max_usd
+    g3 = doos["mdd_pct"] >= -args.mdd_worsen_max_pct
     g4 = (
         all(v >= 0 for v in trt_oos["per_year"].values())
         and len(trt_oos["per_year"]) == len(OOS_YEARS)
@@ -198,14 +202,16 @@ def main() -> int:
         print(f"  {'-'*26} {'-'*16} {'-'*16} {'-'*16}")
         for k, label in [
             ("nc_pnl", "NC PnL"), ("daily_sharpe_nc", "Daily Sharpe NC"),
-            ("trade_sharpe_nc", "Trade Sharpe NC"), ("mdd_nc", "Max DD NC"),
+            ("trade_sharpe_nc", "Trade Sharpe NC"), ("mdd_pct", "Max DD %"),
             ("n_trades", "Trades"), ("n_short", "Shorts"), ("n_long", "Longs"),
             ("per_year_min", "Per-year min"),
         ]:
             bv, tv, dv = b.get(k, 0), t.get(k, 0), d.get(k, 0)
             if isinstance(bv, float) and k in ("daily_sharpe_nc", "trade_sharpe_nc"):
                 print(f"  {label:<26} {bv:>16.2f} {tv:>16.2f} {dv:>+16.2f}")
-            elif isinstance(bv, float) and ("pnl" in k or "mdd" in k or "year" in k):
+            elif k == "mdd_pct":
+                print(f"  {label:<26} {bv:>15.2f}% {tv:>15.2f}% {dv:>+15.2f}pp")
+            elif isinstance(bv, float) and ("pnl" in k or "year" in k):
                 print(f"  {label:<26} {_fmt_money(bv):>16} {_fmt_money(tv):>16} "
                       f"{('+' if dv>=0 else '')+_fmt_money(dv):>16}")
             else:
@@ -256,8 +262,9 @@ def main() -> int:
         (f"G2: OOS daily Sharpe drop <= {args.sharpe_drop_max}",
          f"OOS dSharpe = {doos['daily_sharpe_nc']:+.2f}",
          g2),
-        (f"G3: OOS MDD worsen <= ${args.mdd_worsen_max_usd:,.0f}",
-         f"OOS dMDD = {('+' if doos['mdd_nc']>=0 else '')+_fmt_money(doos['mdd_nc'])}",
+        (f"G3: OOS MDD worsen <= {args.mdd_worsen_max_pct:.2f}pp",
+         f"OOS dMDD = {doos['mdd_pct']:+.2f}pp (baseline {base_oos['mdd_pct']:.2f}%, "
+         f"treatment {trt_oos['mdd_pct']:.2f}%)",
          g3),
         ("G4: OOS per-year strict 2/2 non-negative",
          f"OOS per-year: {trt_oos['per_year']}",
@@ -308,14 +315,16 @@ def main() -> int:
         lines.append("|---|---:|---:|---:|")
         for k, label in [
             ("nc_pnl", "NC PnL"), ("daily_sharpe_nc", "Daily Sharpe NC"),
-            ("trade_sharpe_nc", "Trade Sharpe NC"), ("mdd_nc", "Max DD NC"),
+            ("trade_sharpe_nc", "Trade Sharpe NC"), ("mdd_pct", "Max DD %"),
             ("n_trades", "Trades"), ("n_short", "Shorts"), ("n_long", "Longs"),
             ("per_year_min", "Per-year min"),
         ]:
             bv, tv, dv = b.get(k, 0), t.get(k, 0), d.get(k, 0)
             if k in {"daily_sharpe_nc", "trade_sharpe_nc"}:
                 lines.append(f"| {label} | {bv:.2f} | {tv:.2f} | {dv:+.2f} |")
-            elif "pnl" in k or "mdd" in k or "year" in k:
+            elif k == "mdd_pct":
+                lines.append(f"| {label} | {bv:.2f}% | {tv:.2f}% | {dv:+.2f}pp |")
+            elif "pnl" in k or "year" in k:
                 lines.append(f"| {label} | {_fmt_money(bv)} | {_fmt_money(tv)} | "
                              f"{('+' if dv>=0 else '')+_fmt_money(dv)} |")
             else:

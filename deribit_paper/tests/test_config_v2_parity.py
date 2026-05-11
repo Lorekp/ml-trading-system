@@ -90,9 +90,17 @@ def test_max_gross_notional_usd_is_200k(v2_paper):
     assert v2_paper.max_gross_notional_usd == 200_000.0
 
 
-def test_target_margin_utilization_is_15pct(v2_paper):
-    """V2 capital-scale: 3x leverage vs default 5%."""
-    assert v2_paper.target_margin_utilization == 0.15
+def test_target_margin_utilization_is_10pct(v2_paper):
+    """V2 capital-scale: 2x leverage vs default 5%.
+
+    Cycle-16 (2026-05-11, stale-defense T4): lowered from 0.15 to 0.10.
+    Full sweep [0.05, 0.30] in 0.01 steps showed compound saturation
+    above ~0.10 — the dynamic_btc_cap binds, so raising X just inflates
+    NC reference numbers without changing real (compound) trades. At
+    X=0.10: NC Sharpe peak 7.88, 2.24pp tighter NC MDD; OOS compound
+    bit-identical to X=0.15 ($14.7M / 7.35 / -12.54%).
+    See STALE_DEFENSE_CAMPAIGN_2026_05_11.md."""
+    assert v2_paper.target_margin_utilization == 0.10
 
 
 def test_use_profit_scaling_enabled(v2_paper):

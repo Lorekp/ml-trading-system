@@ -314,7 +314,7 @@ assert v2.use_profit_scaling is True              # E.1.1
 assert v2.use_tiered_taker is True                # E.1.6
 assert v2.entry_threshold_long == 12.0
 assert v2.skip_long_if_term_slope_gt == 0.0
-assert v2.target_margin_utilization == 0.15
+assert v2.target_margin_utilization == 0.10    # cycle-16 (2026-05-11): compound saturation
 assert v2.entry_threshold == 20.0                  # cycle-10 (2026-05-10)
 assert v2.skip_short_if_skew_1w_gt is None         # cycle-14 (2026-05-11): deactivated
 assert v2.max_jump_fraction_for_shorts == 1.0      # cycle-12 (2026-05-11): jump-filter OFF

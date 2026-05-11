@@ -705,7 +705,23 @@ class BacktestConfig(BaseModel):
             use_drl_hedging=True,
             use_profit_scaling=True,
             profit_scaling_floor=0.3,
-            target_margin_utilization=0.15,
+            # Cycle-16 (2026-05-11, stale-defense T4): lowered 0.15 -> 0.10.
+            # Full sweep [0.05, 0.30] in 0.01 steps revealed compound
+            # saturation: OOS compound PnL/Sharpe/MDD are bit-identical
+            # across X in [0.10, 0.30] ($14.7M / 7.35 / -12.54%) because
+            # dynamic_btc_cap = trailing_vol * max_participation_rate
+            # becomes the binding constraint once compound equity grows.
+            # Raising X above ~0.10 only inflates the NC reference numbers
+            # without changing actual compound trades. At X=0.10:
+            #   - NC Sharpe peak: 7.88 (vs 7.77 at 0.15, +0.11)
+            #   - NC MDD% -4.85% (vs -7.09%, 2.24pp tighter)
+            #   - Compound PnL $26.1M (vs $26.9M, -3%)
+            #   - OOS compound: IDENTICAL to X=0.15
+            # Lower X also gives live engine's max_margin_util_hard=0.20
+            # defense-in-depth more headroom. See
+            # STALE_DEFENSE_CAMPAIGN_2026_05_11.md and
+            # project_cycle16_target_margin_2026_05_11.md.
+            target_margin_utilization=0.10,
             # sizing_model stays "composite_v2" (the v1 default) —
             # native Kelly strategy tested but broke compound-mode
             # path. The Kelly-shrinkage sidecar (kelly_mult_path) is a

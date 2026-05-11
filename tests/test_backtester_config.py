@@ -49,7 +49,7 @@ def test_production_v2_core_filters_preserved():
     assert cfg.use_drl_hedging is True
     assert cfg.use_profit_scaling is True
     assert cfg.profit_scaling_floor == 0.3
-    assert cfg.target_margin_utilization == 0.15
+    assert cfg.target_margin_utilization == 0.10
     assert cfg.entry_threshold_long == 12.0
     assert cfg.skip_long_if_term_slope_gt == 0.0
 

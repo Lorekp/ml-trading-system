@@ -538,7 +538,14 @@ class PaperConfig:
         # the 1-4 DTE band the V2 backtester deliberately skips
         # (theta-decay-dominated, fee-vs-vega ratio is poor).
         cfg.dte_min_days = 5
-        cfg.target_margin_utilization = 0.15
+        # Cycle-16 (2026-05-11, stale-defense T4): lowered 0.15 -> 0.10.
+        # The full sweep [0.05, 0.30] revealed compound saturation: above
+        # ~0.10 the dynamic_btc_cap binds, so X just inflates NC numbers
+        # without changing real (compound) trades. NC Sharpe peaks at 0.10
+        # with 2.24pp tighter NC MDD. OOS compound identical across X >= 0.10.
+        # Also gives live max_margin_util_hard=0.20 more defense-in-depth
+        # headroom. See STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
+        cfg.target_margin_utilization = 0.10
         cfg.use_profit_scaling = True
         cfg.profit_scaling_floor = 0.3
         # D10 (parity 2026-05-07): V2 backtester has no per-trade BTC cap
@@ -659,7 +666,7 @@ class PaperConfig:
             ("skip_short_if_skew_1w_gt", None),   # cycle-14 (2026-05-11): deactivated
             ("skip_long_hours_utc", (14, 15, 16)),
             ("dte_min_days", 5),
-            ("target_margin_utilization", 0.15),
+            ("target_margin_utilization", 0.10),     # cycle-16 (2026-05-11)
             ("use_profit_scaling", True),
             ("max_single_trade_btc", 0.0),
             ("min_single_trade_btc", 0.0),

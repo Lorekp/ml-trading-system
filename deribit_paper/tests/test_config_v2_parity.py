@@ -173,6 +173,23 @@ def test_max_jump_fraction_for_shorts_disabled_under_v2(v2_paper):
     assert v2_paper.max_jump_fraction_for_shorts == 1.0
 
 
+def test_short_sizing_penalty_disabled_under_v2(v2_paper):
+    """Cycle-13 (2026-05-11): the legacy 0.5x "halve short notional"
+    penalty in vol_arb/sizing.py was set when the rule-based delta
+    hedger was the only short-tail defense. SAC v4 now handles
+    short-side gamma adaptively (same architectural story as
+    cycle-12). Walk-forward gate result:
+      TRAIN dPnL +$559K
+      OOS dPnL +$269K (+56%)
+      OOS daily Sharpe +0.61 (8.60 -> 9.21)
+      OOS MDD widens $-3,984 -> $-6,149 (+54%) but per-year strict 5/5
+    Setting to 1.0 disables the penalty (shorts size symmetric with
+    longs at the base sizing layer). See
+    STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md.
+    """
+    assert v2_paper.short_sizing_penalty == 1.0
+
+
 def test_use_drl_hedging_implicit_via_engine(v2_paper):
     """SAC v4 hedging is always-on in the engine path; no flag needed.
 
@@ -236,6 +253,10 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
         # showed the filter was costing $130K OOS PnL. See
         # JUMP_FILTER_WALKFORWARD_2026_05_11.md.
         ("max_jump_fraction_for_shorts", "max_jump_fraction_for_shorts"),
+        # Cycle-13 (2026-05-11): short_sizing_penalty 0.5 -> 1.0
+        # (full deactivation of legacy short-notional halving). See
+        # STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md.
+        ("short_sizing_penalty",         "short_sizing_penalty"),
     ]
     for live_field, backtest_field in shared_invariants:
         live_val = getattr(v2_paper, live_field)

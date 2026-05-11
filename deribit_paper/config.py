@@ -596,6 +596,17 @@ class PaperConfig:
         # The filter was killing 868 OOS shorts averaging $150/trade.
         # See JUMP_FILTER_WALKFORWARD_2026_05_11.md.
         cfg.max_jump_fraction_for_shorts = 1.0
+        # Cycle-13 (2026-05-11): deactivate the legacy short-sizing
+        # penalty (was 0.5, "halve N for short straddles (tail risk)").
+        # Same architectural story as cycle-12: the SAC v4 DRL hedger
+        # handles short-side gamma adaptively; the blanket 0.5x N cut
+        # was double-discounting on top of the hedger's own response.
+        # Walk-forward 2026-05-11: TRAIN dPnL +$559K, OOS dPnL +$269K
+        # (+56%), OOS daily Sharpe +0.61 (8.60 -> 9.21). OOS MDD widens
+        # $-3,984 -> $-6,149 (+54%) but per-year strict 5/5 still passes
+        # ($181K worst year). 1.0 = no penalty (shorts size symmetric
+        # with longs at the base sizing layer).
+        cfg.short_sizing_penalty = 1.0
         return cfg
 
     def ensure_dirs(self) -> None:
@@ -639,6 +650,7 @@ class PaperConfig:
             ("base_spread_iv", 2.0),
             ("max_gross_notional_usd", 200_000.0),  # cycle-10 (2026-05-10)
             ("max_jump_fraction_for_shorts", 1.0),  # cycle-12 (2026-05-11)
+            ("short_sizing_penalty", 1.0),          # cycle-13 (2026-05-11)
         ]
         for name, expected in v2_invariants:
             actual = getattr(self, name, None)

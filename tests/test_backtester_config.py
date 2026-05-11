@@ -112,6 +112,36 @@ def test_v2_jump_fraction_breaker_disabled():
     assert BacktestConfig().max_jump_fraction_for_shorts == 0.15
 
 
+def test_v2_short_sizing_penalty_disabled():
+    """Cycle-13 (2026-05-11): V2 preset deactivates the legacy
+    short-sizing penalty (sets it to 1.0 = no penalty).
+
+    The 0.5 default was a blanket "halve N for short straddles (tail
+    risk)" rule from before the SAC v4 DRL hedger. The hedger now
+    handles short-side gamma adaptively (same architectural story as
+    the cycle-12 jump-fraction breaker deactivation). Walk-forward
+    gate result (STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md):
+    TRAIN dPnL +$559K, OOS dPnL +$269K (+56%), OOS daily Sharpe +0.61
+    (8.60 -> 9.21). G3 (OOS MDD widen) fails by $165 vs the cycle-12
+    $2K gate — accepted Sharpe-for-MDD tradeoff (per Kelly K1 adoption
+    precedent 2026-04-21). Reverting forfeits +$269K OOS PnL and
+    -0.61 OOS Sharpe.
+
+    The bare ``BacktestConfig()`` default stays at 0.5 — the legacy
+    rule-based-hedger guard. The V2 preset (which uses SAC v4 DRL
+    hedger) flips it to 1.0.
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2()
+    assert cfg.short_sizing_penalty == 1.0, (
+        f"V2 preset must set short_sizing_penalty=1.0; "
+        f"got {cfg.short_sizing_penalty}. The cycle-13 walk-forward "
+        f"gate (see project_cycle13_short_sizing_penalty_2026_05_11.md) "
+        f"locked this as the OOS-validated value."
+    )
+    # Bare default preserves legacy value for non-V2 callers.
+    assert BacktestConfig().short_sizing_penalty == 0.5
+
+
 def test_dfl_filter_defaults_off():
     """DFL filter must stay OFF by default so V2 baseline is byte-
     identical when the scores sidecar isn't passed."""

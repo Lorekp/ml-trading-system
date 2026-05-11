@@ -734,6 +734,29 @@ class BacktestConfig(BaseModel):
             # never exceed 1.0). See JUMP_FILTER_WALKFORWARD_2026_05_11.md
             # and JUMP_FRACTION_SWEEP_2026_05_11.md.
             max_jump_fraction_for_shorts=1.0,
+            # Cycle-13 (2026-05-11): the blanket "halve N for short
+            # straddles (tail risk)" penalty in ``vol_arb/sizing.py``
+            # was set when the rule-based delta hedger was the only
+            # short-tail defense. SAC v4 now handles short-side gamma
+            # adaptively (same architectural story as cycle-12). The
+            # penalty was double-discounting: DRL handles the tail
+            # AND we cut size by half. Full-sample sweep
+            # short_sizing_penalty in {0.5..1.0} monotonically improves
+            # PnL AND Sharpe, with diminishing-returns saturation
+            # 0.8 -> 1.0 (Sharpe gain falls to 0.01/step). Walk-forward
+            # 2026-05-11 at 0.5 vs 1.0: TRAIN dPnL +$559K, OOS dPnL
+            # +$269K (+56%), OOS daily Sharpe +0.61 (8.60 -> 9.21),
+            # 4/5 pre-committed gates pass; G3 (OOS MDD widen) fails
+            # by $165 ($-2,165 vs $-2,000 gate). Mechanical sizing
+            # widens OOS MDD $3,984 -> $6,149 (+54%) but per-year strict
+            # 5/5 still passes ($181K worst year). Shipped at 1.0 (full
+            # deactivation) over the 0.8 plateau choice because tuning
+            # the penalty TO a gate is overfitting; the principled test
+            # is on-vs-off. Accepted Sharpe-for-MDD tradeoff template
+            # (same precedent as Kelly K1 adoption 2026-04-21). See
+            # STALE_DEFENSE_S1_short_sizing_penalty_SWEEP_2026_05_11.md
+            # and STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md.
+            short_sizing_penalty=1.0,
         )
 
     @classmethod

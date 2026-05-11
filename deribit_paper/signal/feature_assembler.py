@@ -273,9 +273,18 @@ def _h_n_bars_in_window(ctx: AssemblerContext) -> float:
     buf = getattr(ctx, "dollar_bar_buffer", None)
     bar_ts = getattr(ctx.bar, "timestamp", None) if ctx.bar is not None else None
     if buf is not None and len(buf) > 0 and bar_ts is not None:
-        # 15-min window ending at bar.timestamp (exclusive of next bar's start).
-        window_start = pd.Timestamp(bar_ts).floor("15min")
-        window_end = window_start + pd.Timedelta(minutes=15)
+        # Cycle-23 (2026-05-11): align window to [bar_ts - 15min, bar_ts).
+        # ``bar.timestamp`` is END-stamped (`aggregator.py:43-45`,
+        # `bar_clock.py:47-51`), so the window of dollar bars contributing
+        # to the JUST-CLOSED bar is the 15-min span ENDING at bar_ts.
+        # Pre-fix used ``floor("15min")`` which, for a bar already on
+        # a 15-min boundary (e.g., 12:15), produced ``window_start=12:15``
+        # and ``window_end=12:30`` — the FUTURE window, empty at decision
+        # time, causing live to silently fall back to a frozen
+        # ``baseline_row`` constant where offline produced a dynamic
+        # per-bar value. Caught by A1 (7-agent audit).
+        window_end = pd.Timestamp(bar_ts)
+        window_start = window_end - pd.Timedelta(minutes=15)
         idx = buf.as_index()
         in_window = (idx >= window_start) & (idx < window_end)
         n = int(in_window.sum())

@@ -187,3 +187,78 @@ def test_dollar_bar_features_baseline_when_no_buffer(assembler_with_baseline):
     # All values either finite (from baseline) or NaN (only if a
     # baseline cell was missing — in this fixture all are populated).
     assert np.isfinite(feats).sum() >= 95  # most are finite
+
+
+def test_n_bars_in_window_uses_correct_END_stamped_window():
+    """Cycle-23 (2026-05-11, audit A1 H6): the window for counting dollar
+    bars in the JUST-CLOSED 15-min bar must be ``[bar_ts - 15min, bar_ts)``,
+    not ``[floor("15min"), floor("15min") + 15min)``.
+
+    Pre-cycle-23 the handler computed ``window_start = floor("15min")``
+    and ``window_end = start + 15min``. For an END-stamped bar at 12:15,
+    ``floor("15min") == 12:15``, so the window scanned ``[12:15, 12:30)``
+    — the FUTURE window, empty at decision time. Live then silently fell
+    back to a frozen ``baseline_row`` constant where offline produced a
+    dynamic per-bar value.
+
+    This test wires a minimal AssemblerContext + a stub DollarBarBuffer
+    holding bars in both ``[12:00, 12:15)`` (which the END-stamped bar
+    at 12:15 closes over) and ``[12:15, 12:30)`` (the next, future bar).
+    The handler must count the FIRST set, not the second.
+    """
+    from types import SimpleNamespace
+    from deribit_paper.signal.feature_assembler import (
+        AssemblerContext, _h_n_bars_in_window,
+    )
+
+    bar = _make_bar()  # timestamp = 2026-05-01 12:00 UTC
+    # Override to a non-boundary-coincident bar_ts so the bug is visible:
+    bar.timestamp = pd.Timestamp("2026-05-01 12:15:00", tz="UTC")
+
+    # Build a stub DollarBarBuffer with an `as_index()` method.
+    # Bars in [12:00, 12:15): the JUST-CLOSED bar's window.
+    bars_in_closed_window = pd.DatetimeIndex([
+        "2026-05-01 12:00:30+00:00",
+        "2026-05-01 12:05:00+00:00",
+        "2026-05-01 12:10:00+00:00",
+        "2026-05-01 12:14:30+00:00",
+    ], tz="UTC")
+    # Bars in [12:15, 12:30): the FUTURE bar's window (should NOT count).
+    bars_in_future_window = pd.DatetimeIndex([
+        "2026-05-01 12:15:30+00:00",
+        "2026-05-01 12:20:00+00:00",
+    ], tz="UTC")
+    all_bars = bars_in_closed_window.append(bars_in_future_window)
+    buffer = SimpleNamespace(
+        __len__=lambda: len(all_bars),
+        as_index=lambda: all_bars,
+    )
+    # SimpleNamespace doesn't support __len__ via attribute assignment;
+    # build a tiny class instead.
+    class _StubBuf:
+        def __init__(self, idx): self._idx = idx
+        def __len__(self): return len(self._idx)
+        def as_index(self): return self._idx
+    buffer = _StubBuf(all_bars)
+
+    ctx = AssemblerContext(
+        bar=bar,
+        bar_tsrv=_make_bar_tsrv(),
+        svi_calibrator=None,
+        baseline_row=pd.Series({"n_bars_in_window": 99}),  # fallback sentinel
+        dollar_bar_buffer=buffer,
+    )
+
+    n = _h_n_bars_in_window(ctx)
+    # Cycle-23 fix: counts bars in [12:00, 12:15) = 4. Pre-fix would have
+    # returned the fallback sentinel 99 (because [12:15, 12:30) had only
+    # 2 bars, but the test exists to verify which WINDOW the handler
+    # selects — the closed one, not the open future one).
+    assert n == 4.0, (
+        f"cycle-23 fix: handler must count bars in the END-stamped "
+        f"window [bar_ts-15min, bar_ts) = [12:00, 12:15) (expected 4); "
+        f"got n={n}. If n==2 the handler regressed to the future "
+        f"window [12:15, 12:30). If n==99 the handler returned the "
+        f"baseline fallback (would have been the pre-cycle-23 "
+        f"silent failure)."
+    )

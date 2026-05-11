@@ -222,6 +222,58 @@ def test_short_sizing_penalty_disabled_under_v2(v2_paper):
     assert v2_paper.short_sizing_penalty == 1.0
 
 
+def test_sizing_edge_cap_is_100_under_v2(v2_paper):
+    """Cycle-17 (2026-05-11, stale-defense L6): V2 preset deactivates the
+    no-op ``sizing_edge_cap`` (3.0 -> 100.0). The cap was structurally
+    non-binding under V2's edge distribution. See
+    project_cycle17_sizing_caps_2026_05_11.md."""
+    assert v2_paper.sizing_edge_cap == 100.0
+
+
+def test_sizing_dd_floor_is_1_under_v2(v2_paper):
+    """Cycle-17 (2026-05-11, stale-defense L6): V2 preset deactivates the
+    no-op ``sizing_dd_floor`` (0.25 -> 1.0). Pixel-identical results
+    across [0, 0.75] in the sweep — never bound."""
+    assert v2_paper.sizing_dd_floor == 1.0
+
+
+def test_sizing_liq_cap_is_1_5_under_v2(v2_paper):
+    """Cycle-17 KEPT: ``sizing_liq_cap`` stays at 1.5. Removing this cap
+    drops NC Sharpe ~0.30 via noisy low-slip-bar unbounded upscaling."""
+    assert v2_paper.sizing_liq_cap == 1.5
+
+
+def test_kill_switch_daily_dd_pct_is_5_under_v2(v2_paper):
+    """Cycle-18 (2026-05-11, stale-defense LE3): V2 preset raises the
+    live-only daily-DD kill switch from 2.0% to 5.0%.
+
+    The 2.0% threshold was STRICTLY DOMINATED by OFF — it triggers in
+    a regime (1.5-4%) where halts skip post-trigger recovery trades,
+    deepening realized Cp MDD by 0.79pp. The 5.0% threshold captures
+    the worst observed daily move (-5.50% Nov 2024) with defense-in-
+    depth while avoiding the recovery-skip pathology. Live-engine
+    only — backtester has no halt logic. See
+    project_cycle18_kill_switch_2026_05_11.md."""
+    assert v2_paper.kill_switch_daily_dd_pct == 5.0
+
+
+def test_for_small_account_inherits_kill_switch_from_v2_preset():
+    """Cycle-21 (2026-05-11): ``for_small_account`` no longer hard-codes
+    ``kill_switch_daily_dd_pct=5.0`` independently. It now derives the
+    value from ``with_v2_preset()`` so future cycles that adjust V2's
+    threshold (e.g., cycle-18 was 2.0 -> 5.0) ripple to the small-account
+    path automatically. The audit finding that motivated this was that
+    a separate hard-code creates drift risk."""
+    from deribit_paper.config import PaperConfig
+    small = PaperConfig.for_small_account()
+    v2 = PaperConfig.with_v2_preset()
+    assert small.kill_switch_daily_dd_pct == v2.kill_switch_daily_dd_pct, (
+        f"for_small_account must inherit kill_switch_daily_dd_pct from "
+        f"with_v2_preset(); got small={small.kill_switch_daily_dd_pct} "
+        f"vs v2={v2.kill_switch_daily_dd_pct}. See cycle-21 memory."
+    )
+
+
 def test_use_drl_hedging_implicit_via_engine(v2_paper):
     """SAC v4 hedging is always-on in the engine path; no flag needed.
 
@@ -293,6 +345,14 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
         # of exponential half-spread widening on jumps). See
         # STALE_DEFENSE_S2_spread_jump_k_WALKFORWARD_2026_05_11.md.
         ("spread_jump_k",                "spread_jump_k"),
+        # Cycle-17 (2026-05-11): composite_v2 sizing caps trio.
+        # ``sizing_edge_cap`` and ``sizing_dd_floor`` deactivated (raised
+        # to 100.0 and 1.0 — effectively off); ``sizing_liq_cap`` KEPT at
+        # 1.5 (Sharpe-bounding rule, removing drops NC Sharpe ~0.30).
+        # See project_cycle17_sizing_caps_2026_05_11.md.
+        ("sizing_edge_cap",              "sizing_edge_cap"),
+        ("sizing_dd_floor",              "sizing_dd_floor"),
+        ("sizing_liq_cap",               "sizing_liq_cap"),
     ]
     for live_field, backtest_field in shared_invariants:
         live_val = getattr(v2_paper, live_field)

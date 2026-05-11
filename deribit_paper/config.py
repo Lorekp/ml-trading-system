@@ -472,11 +472,21 @@ class PaperConfig:
 
         Does NOT hardcode ``max_single_trade_btc`` — that would lock
         the account to 0.1 BTC forever even as it scales.
+
+        Cycle-21 (2026-05-11): inherits ``kill_switch_daily_dd_pct``
+        from ``with_v2_preset()`` so future cycle bumps to the V2
+        kill-switch value can't drift the small-account path
+        independently. The cycle-18 audit found this hard-coded 5.0
+        before — same value as V2, but no link between the two.
         """
         cfg = cls.from_env()
         btc_approx = 100_000.0  # overridden from REST at startup
         cfg.max_open_positions = 1
-        cfg.kill_switch_daily_dd_pct = 5.0
+        # Inherit V2's protective kill-switch threshold (cycle-21 fix).
+        # Builds a throwaway V2 preset purely to read the canonical
+        # kill_switch value, so any future change to V2's threshold
+        # ripples here automatically.
+        cfg.kill_switch_daily_dd_pct = cls.with_v2_preset().kill_switch_daily_dd_pct
         cfg.initial_equity = equity_usd / btc_approx
         cfg.min_trade_floor = True
         return cfg
@@ -699,6 +709,10 @@ class PaperConfig:
             ("max_jump_fraction_for_shorts", 1.0),  # cycle-12 (2026-05-11)
             ("short_sizing_penalty", 1.0),          # cycle-13 (2026-05-11)
             ("spread_jump_k", 0.0),                 # cycle-15 (2026-05-11)
+            ("sizing_edge_cap", 100.0),             # cycle-17 (2026-05-11)
+            ("sizing_dd_floor", 1.0),               # cycle-17 (2026-05-11)
+            ("sizing_liq_cap", 1.5),                # cycle-17 KEPT (Sharpe-bounding)
+            ("kill_switch_daily_dd_pct", 5.0),      # cycle-18 (2026-05-11)
         ]
         for name, expected in v2_invariants:
             actual = getattr(self, name, None)

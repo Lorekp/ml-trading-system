@@ -173,6 +173,77 @@ def test_v2_short_sizing_penalty_disabled():
     assert BacktestConfig().short_sizing_penalty == 0.5
 
 
+def test_v2_sizing_edge_cap_is_100():
+    """Cycle-17 (2026-05-11, stale-defense L6): V2 preset deactivates
+    ``sizing_edge_cap`` by raising it from 3.0 to 100.0 (effectively off).
+
+    The 3.0 cap was no-op at the current edge distribution: under V2,
+    `|pred_edge| / rolling_median_edge` rarely exceeds 1.5, so the cap
+    at 3.0 was structurally non-binding. The full 0..100 sweep
+    confirmed NC PnL stays flat across [1, 100]. Cycle-17 removes
+    the no-op cap to simplify the sizing pipeline.
+
+    See ``project_cycle17_sizing_caps_2026_05_11.md`` for the campaign
+    context (L6 trio: edge_cap deactivated, dd_floor deactivated,
+    liq_cap KEPT for Sharpe-bounding).
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2()
+    assert cfg.sizing_edge_cap == 100.0, (
+        f"V2 preset must set sizing_edge_cap=100.0 (cycle-17); "
+        f"got {cfg.sizing_edge_cap}."
+    )
+
+
+def test_v2_sizing_dd_floor_is_1():
+    """Cycle-17 (2026-05-11, stale-defense L6): V2 preset deactivates
+    ``sizing_dd_floor`` by raising it from 0.25 to 1.0 (effectively off).
+
+    The 0.25 floor was a min-scale on drawdown but was pixel-identical
+    in results across [0, 0.75] — it never bound under V2 because the
+    composite_v2 strategy already clamps dd_scale before this floor.
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2()
+    assert cfg.sizing_dd_floor == 1.0, (
+        f"V2 preset must set sizing_dd_floor=1.0 (cycle-17); "
+        f"got {cfg.sizing_dd_floor}."
+    )
+
+
+def test_v2_sizing_liq_cap_is_1_5():
+    """Cycle-17 KEPT: ``sizing_liq_cap`` stays at 1.5 (the bare default).
+
+    Unlike its trio-mates edge_cap and dd_floor, removing this cap
+    drops NC Sharpe by ~0.30 by allowing unbounded upscaling on
+    very-low-slip bars. KEPT as a Sharpe-bounding rule.
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2()
+    assert cfg.sizing_liq_cap == 1.5, (
+        f"V2 preset must keep sizing_liq_cap=1.5 (cycle-17 KEPT); "
+        f"got {cfg.sizing_liq_cap}. Removing this cap drops NC "
+        f"Sharpe ~0.30."
+    )
+
+
+def test_v2_base_spread_iv_under_realistic_costs_is_2():
+    """Parity-r3 cycle-2 (2026-05-08): the canonical V2 recipe is
+    ``BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()``,
+    where ``with_realistic_costs()`` sets ``base_spread_iv = 2.0``.
+
+    Live's V2 preset bakes this in directly; this test locks the
+    backtester side to the same value when the realistic-costs
+    composition is applied (which the canonical regen script does).
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+    assert cfg.base_spread_iv == 2.0, (
+        f"Canonical V2 recipe must yield base_spread_iv=2.0; "
+        f"got {cfg.base_spread_iv}. NOTE: this is the FULL spread; "
+        f"the backtester pipeline halves it at "
+        f"backtester.py:3189-3190 before generate_signals. Live "
+        f"mirrors this with the /2.0 tail in predictor.py:251 "
+        f"(cycle-20 revert of cycle-19's wrong-direction fix)."
+    )
+
+
 def test_dfl_filter_defaults_off():
     """DFL filter must stay OFF by default so V2 baseline is byte-
     identical when the scores sidecar isn't passed."""

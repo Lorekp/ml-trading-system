@@ -242,10 +242,14 @@ def test_v2_h15_preset_byte_identity():
     assert cfg.use_drl_hedging is True
     assert cfg.use_profit_scaling is True
     assert cfg.profit_scaling_floor == 0.3
-    assert cfg.target_margin_utilization == 0.15
+    # Cycle-21 (2026-05-11): updated to reflect cycle-16 (target_margin
+    # 0.15 -> 0.10) and cycle-11 (Kelly K1 -> K1+slope). The stale test
+    # baseline was a missing-update from those cycles; surfaced by the
+    # 7-agent swarm audit and fixed as part of cycle-21 hardening.
+    assert cfg.target_margin_utilization == 0.10
     assert cfg.entry_threshold_long == 12.0
     assert cfg.skip_long_if_term_slope_gt == 0.0
-    assert cfg.kelly_mult_path == "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+    assert cfg.kelly_mult_path == "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
     assert cfg.predictions_path == (
         "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"
     )
@@ -293,7 +297,9 @@ def test_per_horizon_preset_pairs_holding_minutes_with_paths(
     assert cfg.use_drl_hedging is True, preset_method
     assert cfg.use_profit_scaling is True, preset_method
     assert cfg.profit_scaling_floor == 0.3, preset_method
-    assert cfg.target_margin_utilization == 0.15, preset_method
+    # Cycle-21 (2026-05-11): updated to reflect cycle-16
+    # (target_margin 0.15 -> 0.10). Stale baseline from cycle-16 ship.
+    assert cfg.target_margin_utilization == 0.10, preset_method
     assert cfg.entry_threshold_long == 12.0, preset_method
     assert cfg.skip_long_if_term_slope_gt == 0.0, preset_method
 

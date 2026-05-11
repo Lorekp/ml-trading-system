@@ -451,8 +451,15 @@ class TestNCPathMirror:
     # NC PnL drifts -$13,163.02 (-1.285%) after Kelly K1 sidecar
     # regeneration; n_trades unchanged at 7,543. Converged at iteration 2.
     # Rebaseline report: ``vol_arb/output/parity_r3_cycle3_tierC_rebaseline.md``.
-    V2_NC_PNL_BASELINE = 1_010_891.4966
-    V2_NC_TRADES_BASELINE = 7_543
+    # Cycle-21 (2026-05-11): updated baselines to reflect cumulative
+    # impact of cycles 12-18 (jump-filter OFF, short-sizing penalty OFF,
+    # skew filter OFF, spread_jump_k OFF, target_margin 0.10, sizing
+    # caps trio, kill_switch raise). Canonical V2 trade log
+    # ``vol_arb/output/BTC_v2_trade_log.parquet`` is the source of truth.
+    # The cycle-21 hardening sweep (post-7-agent audit) updated these to
+    # close the test-baseline drift gap that was missed cycle-by-cycle.
+    V2_NC_PNL_BASELINE = 1_622_057.1619
+    V2_NC_TRADES_BASELINE = 12_182
 
     def test_preventative_sizing_actually_binds_on_NC(self):
         """Cycle 2 preventative sizing must reduce NC PnL post-fix.

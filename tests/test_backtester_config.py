@@ -112,6 +112,37 @@ def test_v2_jump_fraction_breaker_disabled():
     assert BacktestConfig().max_jump_fraction_for_shorts == 0.15
 
 
+def test_v2_spread_jump_k_disabled():
+    """Cycle-15 (2026-05-11, stale-defense S2): V2 preset deactivates
+    the exponential half-spread widening on jumps (sets it to 0.0).
+
+    half_spread = base_spread_iv * exp(spread_jump_k * jump_fraction)
+
+    At k=0 the jump_fraction term collapses out — implied widening on
+    jumps drops to zero. The widening was punitive for the pre-DRL-
+    hedger era; SAC v4 now handles jumps adaptively (same architectural
+    story as cycle-12 jump-fraction breaker + cycle-13 short-sizing
+    penalty + cycle-14 skew filter). Walk-forward gate result
+    (STALE_DEFENSE_S2_spread_jump_k_WALKFORWARD_2026_05_11.md):
+    TRAIN dPnL +$25K, OOS dPnL +$64K (+8.6%), OOS daily Sharpe +0.41
+    (9.21 -> 9.62), OOS MDD essentially unchanged (-1.69% -> -1.75%),
+    OOS trade count +283 (276 short, 7 long). 5/5 gates pass.
+
+    The bare ``BacktestConfig()`` default stays at 3.0 — legacy
+    rule-based-hedger guard. The V2 preset (which uses SAC v4 DRL
+    hedger) flips it to 0.0.
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2()
+    assert cfg.spread_jump_k == 0.0, (
+        f"V2 preset must set spread_jump_k=0.0; got {cfg.spread_jump_k}. "
+        f"The cycle-15 walk-forward gate (see "
+        f"project_cycle15_spread_jump_k_2026_05_11.md) locked this as "
+        f"the OOS-validated value."
+    )
+    # Bare default preserves legacy value for non-V2 callers.
+    assert BacktestConfig().spread_jump_k == 3.0
+
+
 def test_v2_short_sizing_penalty_disabled():
     """Cycle-13 (2026-05-11): V2 preset deactivates the legacy
     short-sizing penalty (sets it to 1.0 = no penalty).

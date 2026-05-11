@@ -319,7 +319,8 @@ assert v2.entry_threshold == 20.0                  # cycle-10 (2026-05-10)
 assert v2.skip_short_if_skew_1w_gt is None         # cycle-14 (2026-05-11): deactivated
 assert v2.max_jump_fraction_for_shorts == 1.0      # cycle-12 (2026-05-11): jump-filter OFF
 assert v2.short_sizing_penalty == 1.0              # cycle-13 (2026-05-11): penalty OFF
-print(\"V2 preset: OK (cycles 10-14 invariants)\")
+assert v2.spread_jump_k == 0.0                     # cycle-15 (2026-05-11): jump-widening OFF
+print(\"V2 preset: OK (cycles 10-15 invariants)\")
 
 # CLI imports (incl --allow-stale-aligner flag)
 from deribit_paper.cli import _parse_args, main as _cli_main

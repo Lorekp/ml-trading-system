@@ -181,6 +181,22 @@ def test_max_jump_fraction_for_shorts_disabled_under_v2(v2_paper):
     assert v2_paper.max_jump_fraction_for_shorts == 1.0
 
 
+def test_spread_jump_k_disabled_under_v2(v2_paper):
+    """Cycle-15 (2026-05-11, stale-defense campaign S2): the exponential
+    half-spread widening on jumps was punitive for the pre-DRL-hedger
+    era. SAC v4 now handles jumps adaptively (same architectural story
+    as cycle-12 jump-fraction breaker + cycle-13 short-sizing penalty
+    + cycle-14 skew filter). Walk-forward k=3 vs k=0:
+      TRAIN dPnL +$25K, TRAIN dSharpe +0.02
+      OOS dPnL +$64K (+8.6%), OOS dSharpe +0.41 (9.21 -> 9.62, IMPROVES)
+      OOS dMDD -0.06pp (essentially unchanged), OOS trades +283
+      5/5 pre-committed gates pass
+    At k=0 the half_spread = base_spread_iv * exp(0 * jump_fraction)
+    = base_spread_iv, i.e. the jump_fraction term drops out entirely.
+    See STALE_DEFENSE_CAMPAIGN_2026_05_11.md."""
+    assert v2_paper.spread_jump_k == 0.0
+
+
 def test_short_sizing_penalty_disabled_under_v2(v2_paper):
     """Cycle-13 (2026-05-11): the legacy 0.5x "halve short notional"
     penalty in vol_arb/sizing.py was set when the rule-based delta
@@ -265,6 +281,10 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
         # (full deactivation of legacy short-notional halving). See
         # STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md.
         ("short_sizing_penalty",         "short_sizing_penalty"),
+        # Cycle-15 (2026-05-11): spread_jump_k 3.0 -> 0.0 (deactivation
+        # of exponential half-spread widening on jumps). See
+        # STALE_DEFENSE_S2_spread_jump_k_WALKFORWARD_2026_05_11.md.
+        ("spread_jump_k",                "spread_jump_k"),
     ]
     for live_field, backtest_field in shared_invariants:
         live_val = getattr(v2_paper, live_field)

@@ -612,6 +612,17 @@ class PaperConfig:
         # ($181K worst year). 1.0 = no penalty (shorts size symmetric
         # with longs at the base sizing layer).
         cfg.short_sizing_penalty = 1.0
+        # Cycle-15 (2026-05-11, stale-defense S2): deactivate the
+        # exponential half-spread widening on jumps. Same architectural
+        # story as cycle-12/13/14 — the punitive widening was for the
+        # pre-DRL-hedger era; SAC v4 handles jumps adaptively. Full
+        # 0.25-step sweep [0, 5] monotonic improvement to k=0. Walk-
+        # forward k=3 vs k=0: OOS dPnL +$64K, Sharpe +0.41 IMPROVES,
+        # MDD essentially unchanged. 5/5 gates pass. At k=0 the
+        # exp(0 * jump_fraction) = 1 collapse means the jump-fraction
+        # term drops out of half_spread entirely. See
+        # STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
+        cfg.spread_jump_k = 0.0
         return cfg
 
     def ensure_dirs(self) -> None:
@@ -656,6 +667,7 @@ class PaperConfig:
             ("max_gross_notional_usd", 200_000.0),  # cycle-10 (2026-05-10)
             ("max_jump_fraction_for_shorts", 1.0),  # cycle-12 (2026-05-11)
             ("short_sizing_penalty", 1.0),          # cycle-13 (2026-05-11)
+            ("spread_jump_k", 0.0),                 # cycle-15 (2026-05-11)
         ]
         for name, expected in v2_invariants:
             actual = getattr(self, name, None)

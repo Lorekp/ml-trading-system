@@ -766,6 +766,26 @@ class BacktestConfig(BaseModel):
             # STALE_DEFENSE_S1_short_sizing_penalty_SWEEP_2026_05_11.md
             # and STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md.
             short_sizing_penalty=1.0,
+            # Cycle-15 (2026-05-11, stale-defense campaign S2): the
+            # exponential half-spread widening on jumps
+            # (half_spread = base_spread_iv * exp(spread_jump_k * jump_fraction))
+            # was punitive for the pre-DRL-hedger era when high-jump regimes
+            # required wide quotes to prevent fills at adverse prices.
+            # SAC v4 now handles jumps adaptively (same architectural
+            # story as cycle-12 jump-fraction breaker + cycle-13 short
+            # sizing). Full 0.25-step sweep [0, 5] showed monotonic
+            # improvement on PnL, Sharpe AND MDD all the way to k=0
+            # (no widening at all). Walk-forward k=3 vs k=0:
+            # OOS dPnL +$64K (+8.6%), OOS dSharpe +0.41 (IMPROVES),
+            # OOS dMDD -0.06pp (essentially unchanged), OOS trade count
+            # +283 (276 short + 7 long), 5/5 pre-committed gates pass.
+            # Marginal-trade quality OOS $227/trade vs baseline $288/trade
+            # — admitted trades are similar-quality, not noisy tail.
+            # At k=0, exp(0 * jump_fraction) = 1: the jump_fraction term
+            # collapses out of the half-spread entirely (one fewer
+            # parameter). See STALE_DEFENSE_CAMPAIGN_2026_05_11.md
+            # and project_cycle15_spread_jump_k_2026_05_11.md.
+            spread_jump_k=0.0,
         )
 
     @classmethod

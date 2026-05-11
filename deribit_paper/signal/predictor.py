@@ -237,7 +237,18 @@ class Predictor:
         #    for higher entry slippage on long straddles.
         jf = float(bar_tsrv.jump_fraction) if bar_tsrv.jump_fraction is not None else 0.0
         jf = max(0.0, min(1.0, jf))
-        half_spread = self._base_spread_iv * math.exp(self._spread_jump_k * jf) / 2.0
+        # Cycle-19 (2026-05-11): aligned with backtester's compute_spread()
+        # at vol_arb/backtester.py:1204. Pre-fix this expression had a `/ 2.0`
+        # tail that treated base_spread_iv as a FULL bid-ask spread, while
+        # the backtester treats it as the half-spread directly. The 1.0
+        # vol-point gap meant live fired SHORT 1vp looser than backtester
+        # would (live eff_short = 21vp at base=2/k=0; backtester eff_short
+        # = 22vp). Parity-r3 cycle-2 (S-8 2026-05-08) synced the VALUE
+        # (1.5 -> 2.0) but missed this INTERPRETATION gap. Cycle-19 audit
+        # surfaced the discrepancy when comparing live bar_cursor's
+        # "eff_thresh=21.00" against backtester's expected 22.00. See
+        # STALE_DEFENSE_CAMPAIGN_2026_05_11.md LE3 follow-up.
+        half_spread = self._base_spread_iv * math.exp(self._spread_jump_k * jf)
 
         # E.1.8: compute the 1w-2w term slope ONCE at predict time and
         # cache on the Signal so downstream code (harness, audits) sees

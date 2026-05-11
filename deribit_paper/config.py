@@ -640,6 +640,20 @@ class PaperConfig:
         # work (removing it drops NC Sharpe 0.30).
         cfg.sizing_edge_cap = 100.0
         cfg.sizing_dd_floor = 1.0
+        # Cycle-18 (2026-05-11, stale-defense LE3): raise from 2.0% to 5.0%.
+        # Halt-simulation sweep against final cycle-17 trade log revealed
+        # the current 2.0% threshold is STRICTLY DOMINATED by OFF: it
+        # triggers in a regime (1.5-4%) where halts skip post-trigger
+        # recovery trades, deepening realized drawdowns. At 2.0%: 8
+        # historical halts, full-sample Cp MDD -6.87% (vs -6.08% at OFF,
+        # 0.79pp WORSE). At 5.0%: 1 historical halt (Nov 2024 -5.50%
+        # grind event), Cp MDD -5.98% (tighter than 2.0%). The
+        # threshold change covers the worst observed daily move (-5.50%)
+        # while avoiding the recovery-skip pathology. OOS impact: zero
+        # at any threshold (no OOS day exceeds -1% daily DD). Other
+        # kill switches still active (margin_util_hard, consecutive_errors,
+        # network_outage). See STALE_DEFENSE_CAMPAIGN_2026_05_11.md LE3.
+        cfg.kill_switch_daily_dd_pct = 5.0
         return cfg
 
     def ensure_dirs(self) -> None:

@@ -81,10 +81,14 @@ def _run_one(param: str, value, label: str) -> dict:
     )
 
     eq = cfg.initial_equity + exe["net_pnl_nc"].cumsum()
-    mdd_nc = float((eq - eq.cummax()).min())
-    # MDD% on $100K NC reference equity (scale-invariant, comparable
-    # across cycles where K1/profit-scaling shift dollar magnitudes).
-    mdd_pct = mdd_nc / cfg.initial_equity * 100.0
+    peak = eq.cummax()
+    dd_dollars = eq - peak
+    mdd_nc = float(dd_dollars.min())              # largest $ drawdown
+    # True peak->trough MDD%: at the moment of worst drawdown, dd / peak.
+    # Conventional Wall Street definition. Scale-invariant across cycles
+    # because both numerator and denominator scale with position sizing.
+    dd_pct_series = (eq - peak) / peak * 100.0
+    mdd_pct = float(dd_pct_series.min())
 
     per_trade = exe["net_pnl_nc"]
     if per_trade.std(ddof=1) > 0:

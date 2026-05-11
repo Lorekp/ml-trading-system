@@ -87,10 +87,14 @@ def _metrics_on_slice(tl: pd.DataFrame, years: set[int]) -> dict:
         )
     else:
         trade_sharpe = float("nan")
-    eq = exe["net_pnl_nc"].cumsum()
-    mdd = float((eq - eq.cummax()).min())
-    # MDD% on $100K NC reference equity (scale-invariant).
-    mdd_pct = mdd / 100_000.0 * 100.0
+    # Equity curve in dollars: start at $100K reference, accumulate NC PnL.
+    eq = 100_000.0 + exe["net_pnl_nc"].cumsum()
+    peak = eq.cummax()
+    mdd = float((eq - peak).min())
+    # True peak->trough MDD% (conventional Wall Street definition): at
+    # the moment of worst drawdown, dd / running_peak. Scale-invariant.
+    dd_pct_series = (eq - peak) / peak * 100.0
+    mdd_pct = float(dd_pct_series.min())
     per_year = exe.groupby(exe.index.year)["net_pnl_nc"].sum().to_dict()
     return {
         "n_trades": int(len(exe)),

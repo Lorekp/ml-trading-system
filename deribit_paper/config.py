@@ -524,7 +524,12 @@ class PaperConfig:
         # contango-long-skip. Drops shorts in extreme call-skew regime
         # (svi_25d_skew_1w > 25, ~1% of fired shorts, almost entirely
         # 2022 LUNA/3AC/FTX trending-down crisis era).
-        cfg.skip_short_if_skew_1w_gt = 25.0
+        # Cycle-14 (2026-05-11, stale-defense T3): deactivated. Under the
+        # cycle-12+cycle-13 trade pool the filter is a near-no-op (60
+        # catches in 11,521 fired shorts; 0 OOS impact). 1-point sweep
+        # [-15, 40] confirmed wide stable plateau. See
+        # STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
+        cfg.skip_short_if_skew_1w_gt = None
         # D2 (parity 2026-05-07): mute longs at US cash-open hours. The V2
         # backtest applies this in ``_apply_entry_filters``; the live
         # predictor mirrors the same shape after the contango filter.
@@ -640,7 +645,7 @@ class PaperConfig:
             ("entry_threshold", 20.0),
             ("entry_threshold_long", 12.0),
             ("skip_long_if_term_slope_gt", 0.0),
-            ("skip_short_if_skew_1w_gt", 25.0),  # cycle-10 short skew filter
+            ("skip_short_if_skew_1w_gt", None),   # cycle-14 (2026-05-11): deactivated
             ("skip_long_hours_utc", (14, 15, 16)),
             ("dte_min_days", 5),
             ("target_margin_utilization", 0.15),

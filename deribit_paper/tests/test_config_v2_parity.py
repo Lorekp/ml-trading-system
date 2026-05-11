@@ -64,13 +64,21 @@ def test_skip_long_if_term_slope_gt_is_zero(v2_paper):
     assert v2_paper.skip_long_if_term_slope_gt == 0.0
 
 
-def test_skip_short_if_skew_1w_gt_is_25(v2_paper):
-    """Cycle-10 (2026-05-10): drop shorts when 1w 25-delta skew > 25.
+def test_skip_short_if_skew_1w_gt_disabled(v2_paper):
+    """Cycle-14 (2026-05-11, stale-defense campaign T3): deactivated.
 
-    Mirror-symmetric to ``skip_long_if_term_slope_gt`` contango filter.
-    Targets the 2022 LUNA/3AC/FTX trending-down regime where extreme
-    put-skew (downside-priced) shorts get crushed by left-tail vol."""
-    assert v2_paper.skip_short_if_skew_1w_gt == 25.0
+    The filter was added in cycle-10 to drop shorts when 1w 25-delta
+    skew > 25 (2022 LUNA/3AC/FTX guard, "Mirror-symmetric to
+    ``skip_long_if_term_slope_gt`` contango filter"). Under the
+    cycle-12+cycle-13 trade pool it became a near-no-op: 60 catches
+    out of 11,521 fired shorts; zero OOS impact. Full 1-point sweep
+    [-15, 40] showed a wide stable plateau [3, 40] with the current
+    setting (25) sitting well inside. Walk-forward X=25 vs X=None:
+    OOS dPnL -$52 (0.007% measurement noise), Sharpe and MDD%
+    unchanged, OOS trade count delta 0. Deactivated per
+    "less parameters -> less overfitting risk" directive. See
+    STALE_DEFENSE_CAMPAIGN_2026_05_11.md."""
+    assert v2_paper.skip_short_if_skew_1w_gt is None
 
 
 def test_max_gross_notional_usd_is_200k(v2_paper):

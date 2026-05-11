@@ -716,10 +716,19 @@ class BacktestConfig(BaseModel):
             # Cycle-10 (2026-05-10): mirror-symmetric short filter to
             # contango-long-skip. Drops shorts in extreme call-skew regime
             # (svi_25d_skew_1w > 25, ~1% of fired shorts, almost entirely
-            # 2022 LUNA/3AC/FTX trending-down crisis era). Cuts 2022 hit
-            # nearly in half when paired with thr_S=20 loosening, making
-            # the cycle-10 ship strict-stability-passing.
-            skip_short_if_skew_1w_gt=25.0,
+            # 2022 LUNA/3AC/FTX trending-down crisis era).
+            #
+            # Cycle-14 (2026-05-11, stale-defense campaign T3): under the
+            # cycle-12+cycle-13 trade pool, this filter became a near-no-op
+            # (60 catches out of 11,521; zero OOS impact). Full 1-point
+            # sweep [-15, 40] showed a wide stable plateau [3, 40] with
+            # current setting (25) sitting inside it. Walk-forward
+            # X=25 vs X=None: OOS dPnL -$52 (0.007% noise), Sharpe
+            # unchanged, MDD% unchanged, OOS trade count delta 0
+            # (the 60 muted shorts are ALL in 2022 TRAIN). Per
+            # "less parameters -> less overfitting risk" directive,
+            # deactivated. See STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
+            skip_short_if_skew_1w_gt=None,
             # Cycle-12 (2026-05-11): the legacy jump-fraction circuit
             # breaker (default 0.15) was a rule-based defense from
             # before the SAC v4 DRL hedger. The hedger now handles

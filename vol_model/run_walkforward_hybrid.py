@@ -58,6 +58,54 @@ from vol_model.run_walkforward import _make_objective
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _resolve_time_normalizer(
+    ckpt: dict,
+    time_norm_vals: np.ndarray,
+    *,
+    ckpt_name: str = "<unknown>",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve the time-feature normalizer ``(mean, std)`` for extraction.
+
+    Cycle-25 (2026-05-11) — A2 M1 fix from the 7-agent audit:
+    pre-fix this site re-fit ``mean / std`` on the EXTRACTION-window
+    slice ``time_norm_vals[:max(len-1000, 1)]`` — at h=15 that
+    included ~10 days of test-month data, an architectural leak.
+    Now: prefer persisted ``time_normalizer_mean`` / ``time_normalizer_std``
+    from the checkpoint (training-time, train-only). For pre-cycle-25
+    checkpoints those keys are absent; we fall back to the legacy
+    re-fit with a DeprecationWarning so the operator knows the leak
+    is still present until the next retrain.
+
+    Parameters
+    ----------
+    ckpt
+        Loaded torch checkpoint dict.
+    time_norm_vals
+        Raw time-feature values from the extraction window (only
+        consulted by the legacy fallback path).
+    ckpt_name
+        Filename for the deprecation message.
+
+    Returns
+    -------
+    tuple of ``(mean, std)`` as float32 numpy arrays.
+    """
+    if "time_normalizer_mean" in ckpt and "time_normalizer_std" in ckpt:
+        return ckpt["time_normalizer_mean"], ckpt["time_normalizer_std"]
+    import warnings
+    warnings.warn(
+        f"TransVol checkpoint {ckpt_name} predates cycle-25 — "
+        "time normalizer re-fit on extraction window (A2 M1 leak). "
+        "Retrain to close the leak.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    slice_end = max(len(time_norm_vals) - 1000, 1)
+    time_mean = time_norm_vals[:slice_end].mean(axis=0)
+    time_std = time_norm_vals[:slice_end].std(axis=0).clip(min=1e-8)
+    return time_mean, time_std
+
+
 def _load_all_data(asset: str, horizon_minutes: int = 15):
     """Load features, labels, and pruned feature list once for the given asset.
 
@@ -131,7 +179,17 @@ def _train_transvol_for_month(
     # Z-normalize (fit on train only)
     normalizer = FeatureNormalizer().fit(feat_vals[:train_pos])
     feat_norm = normalizer.transform(feat_vals)
-    time_norm = FeatureNormalizer().fit(time_feat_vals[:train_pos]).transform(time_feat_vals)
+    # Cycle-25 (2026-05-11): keep an explicit FeatureNormalizer for the
+    # time features so we can persist mean/std to the checkpoint and
+    # avoid the test-month re-fit at extraction time (A2 M1 leak from
+    # 7-agent audit). Pre-fix this was a one-line fit().transform() with
+    # no persistence, forcing _extract_compact_embeddings to re-derive
+    # mean/std from the EXTRACTION window (which extends to test_end =
+    # M+1month) and used "all but last 1000 rows" — leaking ~10 days of
+    # test-month data into the normalizer. Time features are cyclical
+    # sin/cos so practical impact is sub-bp, but architecturally a leak.
+    time_normalizer = FeatureNormalizer().fit(time_feat_vals[:train_pos])
+    time_norm = time_normalizer.transform(time_feat_vals)
 
     # Normalize jump_var
     jump_mean = max(float(jump_vals[:train_pos].mean()), 1e-15)
@@ -208,9 +266,19 @@ def _train_transvol_for_month(
 
         if val_qlike < best_val:
             best_val = val_qlike
-            torch.save({"model_state_dict": model.state_dict(), "config": config,
-                         "normalizer_mean": normalizer.mean, "normalizer_std": normalizer.std,
-                         "epoch": epoch + 1, "val_qlike": best_val}, best_path)
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "config": config,
+                "normalizer_mean": normalizer.mean,
+                "normalizer_std": normalizer.std,
+                # Cycle-25 (2026-05-11): persist time normalizer mean/std
+                # so _extract_compact_embeddings can restore instead of
+                # re-fitting on the test-window slice (A2 M1 fix).
+                "time_normalizer_mean": time_normalizer.mean,
+                "time_normalizer_std": time_normalizer.std,
+                "epoch": epoch + 1,
+                "val_qlike": best_val,
+            }, best_path)
             no_improve = 0
         else:
             no_improve += 1
@@ -252,9 +320,9 @@ def _extract_compact_embeddings(
 
     feat_norm = normalizer.transform(feats.values.astype(np.float32))
     time_norm_vals = feats[TIME_COLS].values.astype(np.float32)
-    # Normalize time features with same approach
-    time_mean = time_norm_vals[:max(len(time_norm_vals) - 1000, 1)].mean(axis=0)
-    time_std = time_norm_vals[:max(len(time_norm_vals) - 1000, 1)].std(axis=0).clip(min=1e-8)
+    time_mean, time_std = _resolve_time_normalizer(
+        ckpt, time_norm_vals, ckpt_name=ckpt_path.name,
+    )
     time_norm = ((time_norm_vals - time_mean) / time_std).astype(np.float32)
 
     # Dummy targets (not used for extraction)

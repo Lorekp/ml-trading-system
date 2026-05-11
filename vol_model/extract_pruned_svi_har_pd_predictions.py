@@ -66,6 +66,15 @@ def main() -> None:
                              "TransVol checkpoints, and output path per asset.")
     parser.add_argument("--start", default="2022-02")
     parser.add_argument("--end", default="2026-04")
+    parser.add_argument(
+        "--end-date", type=str, default="",
+        help="Optional full ISO timestamp upper bound (e.g. 2026-05-11T12:15). "
+             "When set, the loop also processes the partial month containing "
+             "this timestamp, capping the test window at end_date and falling "
+             "back to the most-recently-available model for any month whose "
+             "walk-forward checkpoint hasn't been trained yet. Use for "
+             "partial-month parity runs against the live engine.",
+    )
     parser.add_argument("--model-dir", type=str, default="",
                         help="Override model dir (else per-asset resolver)")
     parser.add_argument("--output", type=str, default="",
@@ -176,7 +185,58 @@ def main() -> None:
     data_start = X.index.min()
     start = pd.Timestamp(args.start + "-01", tz="UTC")
     end = pd.Timestamp(args.end + "-01", tz="UTC")
+
+    # Partial-month parity support (2026-05-11): when --end-date is set,
+    # extend the month loop to include the partial month containing it.
+    # For any month whose checkpoint is missing (e.g. current in-progress
+    # month) we fall back to the most-recent existing checkpoint — same
+    # logic the live engine uses (latest walk-forward month), so backtest
+    # predictions match live engine predictions on those bars.
+    end_date_partial: pd.Timestamp | None = None
+    if args.end_date:
+        end_date_partial = pd.Timestamp(args.end_date)
+        if end_date_partial.tz is None:
+            end_date_partial = end_date_partial.tz_localize("UTC")
+        # Extend the month grid to cover end_date_partial's month.
+        end_month = end_date_partial.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0,
+        )
+        if end_month > end:
+            end = end_month
+        logger.info("Partial-month extraction enabled: end_date=%s",
+                    end_date_partial)
     months = pd.date_range(start, end, freq="MS")
+
+    # Precompute the chronologically-sorted list of existing model
+    # checkpoints — used as the fallback for any month whose own
+    # checkpoint is missing (partial-month case for the in-progress
+    # month). The fallback is the LATEST checkpoint with date <= M.
+    existing_checkpoints = sorted(
+        p.stem for p in model_dir.glob("*.txt")
+        if (model_dir / f"{p.stem}_features.json").exists()
+    )
+
+    def _resolve_checkpoint(M: pd.Timestamp) -> tuple[Path, Path, str] | None:
+        """Return (lgb_path, feat_manifest, used_month_str) for month M.
+
+        Prefers M's own checkpoint; falls back to the most recent
+        checkpoint strictly before M (for the partial-month current bar).
+        """
+        own_str = M.strftime("%Y-%m")
+        own_lgb = model_dir / f"{own_str}.txt"
+        own_feat = model_dir / f"{own_str}_features.json"
+        if own_lgb.exists() and own_feat.exists():
+            return own_lgb, own_feat, own_str
+        # Fallback: most recent checkpoint strictly before M
+        prior = [c for c in existing_checkpoints if c < own_str]
+        if not prior:
+            return None
+        fb_str = prior[-1]
+        return (
+            model_dir / f"{fb_str}.txt",
+            model_dir / f"{fb_str}_features.json",
+            fb_str,
+        )
 
     all_preds: list[pd.Series] = []
     all_true: list[pd.Series] = []
@@ -185,22 +245,36 @@ def main() -> None:
 
     for i, M in enumerate(months):
         month_str = M.strftime("%Y-%m")
-        lgb_path = model_dir / f"{month_str}.txt"
-        feat_manifest = model_dir / f"{month_str}_features.json"
-
-        if not lgb_path.exists() or not feat_manifest.exists():
-            logger.warning("[%d/%d] %s: model/manifest missing, skipping",
+        ckpt = _resolve_checkpoint(M)
+        if ckpt is None:
+            logger.warning("[%d/%d] %s: no checkpoint available (own or fallback), skipping",
                            i + 1, len(months), month_str)
             n_skip += 1
             continue
+        lgb_path, feat_manifest, used_month = ckpt
+        if used_month != month_str:
+            logger.info("[%d/%d] %s: using fallback checkpoint %s",
+                        i + 1, len(months), month_str, used_month)
 
+        # TransVol checkpoint — also fall back to the most recent
+        # existing one for the partial-month case.
         tv_path = hybrid_dir / f"{month_str}_transvol.pt"
         if not tv_path.exists():
-            logger.warning("[%d/%d] %s: TransVol checkpoint missing", i + 1, len(months), month_str)
-            n_skip += 1
-            continue
+            # Try the fallback used_month's TransVol
+            fallback_tv = hybrid_dir / f"{used_month}_transvol.pt"
+            if fallback_tv.exists():
+                tv_path = fallback_tv
+                logger.info("[%d/%d] %s: using fallback TransVol %s",
+                            i + 1, len(months), month_str, used_month)
+            else:
+                logger.warning("[%d/%d] %s: TransVol checkpoint missing", i + 1, len(months), month_str)
+                n_skip += 1
+                continue
 
         test_end = M + pd.DateOffset(months=1)
+        # Cap test_end at end_date_partial if it's earlier (partial-month case)
+        if end_date_partial is not None and test_end > end_date_partial:
+            test_end = end_date_partial
         V = max(M - pd.DateOffset(months=4), data_start + pd.DateOffset(months=12))
 
         # Extract TransVol embeddings (same as training)

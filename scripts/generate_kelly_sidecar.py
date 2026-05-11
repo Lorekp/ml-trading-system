@@ -60,6 +60,11 @@ def main():
                     help="Currency for output sidecar naming (default BTC).")
     ap.add_argument("--asset", type=str, default="BTCUSDT",
                     help="Asset for predictions path (default BTCUSDT).")
+    ap.add_argument("--output-suffix", type=str, default="",
+                    help="Optional suffix appended to output sidecar stems "
+                         "(e.g. '_partial' -> BTC_v2_kelly_mult_K1_partial.parquet). "
+                         "Used by partial-window pipeline runs to avoid "
+                         "clobbering canonical sidecars.")
     args = ap.parse_args()
 
     h = args.horizon_minutes
@@ -97,7 +102,11 @@ def main():
         n_boost = int((mult > 1.0 + 1e-9).sum())
         print(f"{variant}: {n_boost} boosted, mean={mult.mean():.4f}, max={mult.max():.4f}")
 
-        out_path = kelly_sidecar_path(args.currency, h, variant=variant).as_posix()
+        out_path_obj = kelly_sidecar_path(args.currency, h, variant=variant)
+        if args.output_suffix:
+            stem = out_path_obj.stem + args.output_suffix
+            out_path_obj = out_path_obj.with_name(stem + out_path_obj.suffix)
+        out_path = out_path_obj.as_posix()
         out = pd.DataFrame({"size_mult": mult}, index=tl_k.index)
         out.to_parquet(out_path)
         print(f"  saved: {out_path}")

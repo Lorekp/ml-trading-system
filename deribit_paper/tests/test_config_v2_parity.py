@@ -158,6 +158,21 @@ def test_max_single_trade_btc_disabled_under_v2(v2_paper):
     assert v2_paper.max_single_trade_btc == 0.0
 
 
+def test_max_jump_fraction_for_shorts_disabled_under_v2(v2_paper):
+    """Cycle-12 (2026-05-11): the legacy jump-fraction circuit breaker
+    (default 0.15) was a rule-based defense from the pre-DRL-hedger
+    era. The SAC v4 hedger handles high-jump regimes through its
+    VPIN/jump_fraction/trailing_volume conditioning. Walk-forward
+    test 2026-05-11 (JUMP_FILTER_WALKFORWARD_2026_05_11.md):
+      TRAIN dPnL +$219K, OOS dPnL +$130K
+      OOS daily Sharpe +1.65 (6.95 -> 8.60)
+      OOS MDD +$56 (essentially flat)
+      5/5 pre-committed gates pass
+    Setting to 1.0 disables the breaker (jump_fraction is in [0, 1]).
+    """
+    assert v2_paper.max_jump_fraction_for_shorts == 1.0
+
+
 def test_use_drl_hedging_implicit_via_engine(v2_paper):
     """SAC v4 hedging is always-on in the engine path; no flag needed.
 
@@ -216,6 +231,11 @@ def test_v2_preset_matches_backtest_v2(v2_paper, v2_backtest):
         # values without tripping the ``==`` type check on tuple types.
         ("skip_long_hours_utc",          "skip_long_hours_utc"),
         ("max_single_trade_btc",         "max_position_btc"),
+        # Cycle-12 (2026-05-11): jump-fraction circuit breaker disabled.
+        # The DRL hedger handles high-jump regimes adaptively; walk-forward
+        # showed the filter was costing $130K OOS PnL. See
+        # JUMP_FILTER_WALKFORWARD_2026_05_11.md.
+        ("max_jump_fraction_for_shorts", "max_jump_fraction_for_shorts"),
     ]
     for live_field, backtest_field in shared_invariants:
         live_val = getattr(v2_paper, live_field)

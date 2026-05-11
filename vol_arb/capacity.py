@@ -127,6 +127,7 @@ def compute_vega_capacity(
     Y_vol: float = 0.5,
     edge_fraction: float = 0.5,
     bar_minutes: int = 15,
+    use_deployed_vega: bool = True,
 ) -> CapacityBound:
     """Method 2: per-trade square-root capacity, regime-aggregable.
 
@@ -134,6 +135,13 @@ def compute_vega_capacity(
         η_i        = Q_ν(i) / V_ν(i)              [unitless]
         ΔIV_i(K)   = Y · σ_σ(i) · √(K · η_i)       [vol points]
         K_max(i)   = (|edge_i| · edge_fraction / (Y · σ_σ(i)))² / η_i
+
+    If ``use_deployed_vega=True`` (new default, 2026-05-11), Q_ν uses
+    N_contracts_nc × vega — i.e. the deployed dollar-vega at canonical
+    sizing. This makes K=1 correspond to "today's deployed scale", not
+    "1 BTC of straddle". K=10 then means "10× the canonical per-trade
+    deployed vega". The older `use_deployed_vega=False` path (Q_ν =
+    unit vega per BTC) is kept for backward compatibility.
 
     Trades where V_ν proxy is zero, NaN, or |edge| ≤ 0 are masked
     (K_max = +inf for those — they don't constrain the aggregate
@@ -145,7 +153,10 @@ def compute_vega_capacity(
     exe_mask = trade_log["N_contracts_nc"] > 0
     df = trade_log.loc[exe_mask].copy()
 
-    Q_nu = df["vega"].values                                  # $/vp per BTC of straddle
+    if use_deployed_vega:
+        Q_nu = (df["N_contracts_nc"] * df["vega"]).values     # $/vp deployed
+    else:
+        Q_nu = df["vega"].values                              # $/vp per BTC
     V_nu = compute_market_vega_proxy(df).values               # $/vp per day, market-wide
     edge = np.abs(df["edge"].values)                          # vol points
 
@@ -195,6 +206,7 @@ def compute_impact_adjusted_pnl_nc(
     perm_frac: float = 0.30,
     decay_seconds: float = 600.0,
     bar_minutes: int = 15,
+    use_deployed_vega: bool = True,
 ) -> pd.Series:
     """Replay NC PnL at scale multiplier K with square-root impact.
 
@@ -207,6 +219,12 @@ def compute_impact_adjusted_pnl_nc(
     Then the vega PnL is recomputed; theta, delta-hedge, fees, slippage,
     and hedge costs are taken from the original trade log unchanged
     (they are not first-order functions of size scaling at this stage).
+
+    If ``use_deployed_vega=True`` (new default, 2026-05-11), η uses
+    N_contracts_nc × vega, so K=1 = today's canonical deployed vega
+    and K=10 = 10× the deployed sizing. Cycle-11 K1+slope is already
+    baked into N_contracts_nc, so the K=1 baseline reflects the
+    long-amplified profile.
 
     K=0 returns the original NC PnL (identity by construction —
     no-op test in the smoke suite). Y_vol=0 also returns identity.
@@ -223,9 +241,13 @@ def compute_impact_adjusted_pnl_nc(
     exe_mask = (df["N_contracts_nc"] > 0).values
     signal = df["signal"].values
     vega = df["vega"].values
+    N_nc = df["N_contracts_nc"].values
     iv_used = df["iv_used"].values
     iv_exit = df["iv_exit"].values
-    Q_nu = vega
+    if use_deployed_vega:
+        Q_nu = N_nc * vega
+    else:
+        Q_nu = vega
     V_nu = compute_market_vega_proxy(df).values
     eta = np.where(V_nu > 0, Q_nu / V_nu, 0.0)
 
@@ -244,11 +266,11 @@ def compute_impact_adjusted_pnl_nc(
     # signal=-1 (short): we sold low, market reverts ⇒ exit_IV ↑
     iv_exit_adj = iv_exit - signal * delta_iv_residual
 
-    # Recompute vega_pnl_nc at K=1 sizing (impact applies per-trade
-    # at the IV level; sizing scaling is orthogonal here — capacity
-    # asks "is the SIGNAL still profitable at K× participation?")
+    # Recompute vega_pnl_nc at the original sizing — the IV displacement
+    # is per-trade, baked into ΔIV_K. PnL = N_contracts × signal × vega
+    # × (iv_exit_K − iv_used). Sizing scaling enters through K via the
+    # impact magnitude only.
     dIV_adj = iv_exit_adj - iv_used
-    N_nc = df["N_contracts_nc"].values
     vega_pnl_nc_adj = N_nc * signal * vega * dIV_adj
 
     # Reuse non-vega components from the trade log

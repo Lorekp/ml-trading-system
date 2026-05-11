@@ -73,6 +73,12 @@ def main():
                              "15 (legacy BTC production). At h=5 pass 5; at h=60 "
                              "pass 60. Must divide 1440. See plan "
                              "starry-rolling-rabin.md Phase 2h5.2a.")
+    parser.add_argument("--end-date", type=str, default="",
+                        help="Optional ISO timestamp upper bound for the merged "
+                             "output. When set, rows with index > end_date are "
+                             "filtered out BEFORE writing the parquet. Use for "
+                             "partial-window parity runs against the live "
+                             "engine. Default empty (full sample).")
     args = parser.parse_args()
     if 1440 % args.bar_minutes != 0:
         parser.error(
@@ -121,6 +127,18 @@ def main():
     # Build (SVI outputs persisted internally per config.currency — see
     # build_vol_arb_dataset for the resolver-driven path handling)
     merged = build_vol_arb_dataset(config)
+
+    # Partial-window slice: trim the output to [start, end_date] before
+    # verification + save. Rows beyond end_date are dropped so downstream
+    # consumers (predictions extraction, backtester) see a clean cutoff.
+    if args.end_date:
+        ed = pd.Timestamp(args.end_date)
+        if merged.index.tz is not None and ed.tz is None:
+            ed = ed.tz_localize(merged.index.tz)
+        n_pre = len(merged)
+        merged = merged.loc[merged.index <= ed]
+        logger.info("Partial-window slice: end_date=%s, %d -> %d rows",
+                    ed, n_pre, len(merged))
 
     # Verify
     verify_alignment(merged)

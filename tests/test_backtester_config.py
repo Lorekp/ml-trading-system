@@ -88,6 +88,30 @@ def test_default_predictions_path_is_aligned_bias():
     )
 
 
+def test_v2_jump_fraction_breaker_disabled():
+    """Cycle-12 (2026-05-11): V2 preset disables the legacy
+    jump-fraction-for-shorts circuit breaker by setting it to 1.0
+    (= can never trip; jump_fraction is in [0, 1] by construction).
+
+    Walk-forward gate result (JUMP_FILTER_WALKFORWARD_2026_05_11.md):
+    TRAIN dPnL +$219K, OOS dPnL +$130K, OOS daily Sharpe +1.65,
+    OOS MDD +$56 (essentially flat), 5/5 pre-committed gates pass.
+
+    The bare ``BacktestConfig()`` default stays at 0.15 — the legacy
+    rule-based-hedger guard. The V2 preset (which uses SAC v4 DRL
+    hedger) flips it to 1.0. Reverting forfeits +$130K OOS PnL.
+    """
+    cfg = BacktestConfig().with_btc_production_filters_v2()
+    assert cfg.max_jump_fraction_for_shorts == 1.0, (
+        f"V2 preset must set max_jump_fraction_for_shorts=1.0; "
+        f"got {cfg.max_jump_fraction_for_shorts}. The cycle-12 "
+        f"walk-forward gate (see project_jump_filter_cycle12_2026_05_11.md) "
+        f"locked this as the OOS-validated value."
+    )
+    # Bare default preserves legacy value for non-V2 callers.
+    assert BacktestConfig().max_jump_fraction_for_shorts == 0.15
+
+
 def test_dfl_filter_defaults_off():
     """DFL filter must stay OFF by default so V2 baseline is byte-
     identical when the scores sidecar isn't passed."""

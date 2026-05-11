@@ -23,6 +23,7 @@ Output:
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -32,9 +33,9 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-K1_PATH = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_kelly_mult_K1.parquet"
-TRADE_LOG = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_trade_log.parquet"
-OUT_PATH = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_kelly_mult_K1_slope.parquet"
+K1_PATH_DEFAULT = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_kelly_mult_K1.parquet"
+TRADE_LOG_DEFAULT = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_trade_log.parquet"
+OUT_PATH_DEFAULT = REPO_ROOT / "vol_arb" / "output" / "BTC_v2_kelly_mult_K1_slope.parquet"
 
 TRAIL_MONTHS = 24
 PERCENTILE = 0.20
@@ -45,6 +46,19 @@ WARMUP_MONTHS = TRAIL_MONTHS  # don't amplify before this many months of history
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Generate K1+slope walk-forward Kelly sidecar."
+    )
+    ap.add_argument("--k1-path", type=Path, default=K1_PATH_DEFAULT,
+                    help="Input K1 sidecar (default: canonical).")
+    ap.add_argument("--trade-log", type=Path, default=TRADE_LOG_DEFAULT,
+                    help="Input trade log (default: canonical).")
+    ap.add_argument("--output", type=Path, default=OUT_PATH_DEFAULT,
+                    help="Output K1+slope sidecar path.")
+    args = ap.parse_args()
+    K1_PATH = args.k1_path
+    TRADE_LOG = args.trade_log
+    OUT_PATH = args.output
     print(f"[generate] Reading {K1_PATH.name}")
     k1 = pd.read_parquet(K1_PATH)
     if k1.index.tz is None:
@@ -100,7 +114,11 @@ def main() -> int:
     out = pd.DataFrame({"size_mult": new_mult.astype(np.float64)})
     out.index.name = k1.index.name
     out.to_parquet(OUT_PATH)
-    print(f"[generate] Wrote {OUT_PATH.relative_to(REPO_ROOT)}")
+    try:
+        rel = OUT_PATH.relative_to(REPO_ROOT)
+    except ValueError:
+        rel = OUT_PATH
+    print(f"[generate] Wrote {rel}")
     print(f"[generate]  New: mean={out['size_mult'].mean():.4f}, "
           f"max={out['size_mult'].max():.4f}, "
           f"n_at_cap={(out['size_mult'] >= CAP - 1e-6).sum()}")

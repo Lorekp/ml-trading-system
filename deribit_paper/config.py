@@ -587,6 +587,15 @@ class PaperConfig:
         # ``Predictor._dynamic_half_spread`` (predictor.py:233) to entry
         # threshold gating.
         cfg.base_spread_iv = 2.0
+        # Cycle-12 (2026-05-11): disable the legacy jump-fraction circuit
+        # breaker (was 0.15 inherited from pre-DRL-hedger era). The SAC v4
+        # DRL hedger now handles high-jump regimes adaptively via its
+        # VPIN/jump_fraction/trailing_volume conditioning. Walk-forward
+        # 2026-05-11: TRAIN +$219K, OOS +$130K NC PnL, OOS daily Sharpe
+        # +1.65, OOS MDD essentially flat. 5/5 pre-committed gates pass.
+        # The filter was killing 868 OOS shorts averaging $150/trade.
+        # See JUMP_FILTER_WALKFORWARD_2026_05_11.md.
+        cfg.max_jump_fraction_for_shorts = 1.0
         return cfg
 
     def ensure_dirs(self) -> None:
@@ -629,6 +638,7 @@ class PaperConfig:
             ("min_single_trade_btc", 0.0),
             ("base_spread_iv", 2.0),
             ("max_gross_notional_usd", 200_000.0),  # cycle-10 (2026-05-10)
+            ("max_jump_fraction_for_shorts", 1.0),  # cycle-12 (2026-05-11)
         ]
         for name, expected in v2_invariants:
             actual = getattr(self, name, None)

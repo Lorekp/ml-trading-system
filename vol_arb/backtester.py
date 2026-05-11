@@ -73,6 +73,23 @@ class BacktestConfig(BaseModel):
     # --predictions-path to reproduce pre-aligner results.
     predictions_path: str = "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"
 
+    # ── Partial-window evaluation (2026-05-11) ───────────────────
+    # Inclusive ISO timestamps (or None for full sample). When set, the
+    # backtester slices ``df`` immediately after the predictions join in
+    # ``load_data()``, BEFORE downstream rolling computations (vrp_baseline,
+    # profit-filter EMA, DFL-head year-quantile, sidecar lookups). All of
+    # those are trailing-only (rolling, shift(1), or per-month walk-forward)
+    # so bar T's output is byte-identical regardless of whether the run
+    # ends at T+holding_minutes or at the full sample's end — the
+    # determinism contract enforced by
+    # ``tests/test_backtester_config.py::test_partial_window_byte_identity_at_shared_bars``.
+    # Primary use case: ``end_dt`` set to "latest closed bar" for
+    # live-vs-backtest parity-diff runs while ``start_dt`` stays None
+    # (full history). Setting ``start_dt`` past the data's natural start
+    # is supported but drops the first ~7 days due to vrp_baseline warmup.
+    start_dt: str | None = None
+    end_dt: str | None = None
+
     # Dynamic spread model
     base_spread_iv: float = 1.5   # base IV bid-ask spread (vol points)
     spread_jump_k: float = 3.0    # jump_fraction sensitivity
@@ -703,6 +720,20 @@ class BacktestConfig(BaseModel):
             # nearly in half when paired with thr_S=20 loosening, making
             # the cycle-10 ship strict-stability-passing.
             skip_short_if_skew_1w_gt=25.0,
+            # Cycle-12 (2026-05-11): the legacy jump-fraction circuit
+            # breaker (default 0.15) was a rule-based defense from
+            # before the SAC v4 DRL hedger. The hedger now handles
+            # high-jump regimes through its conditioning on VPIN,
+            # jump_fraction, and trailing_volume (per
+            # project_w5_v4_adopted.md). Walk-forward test 2026-05-11:
+            # TRAIN dPnL +$219K, OOS dPnL +$130K, OOS daily Sharpe
+            # +1.65, OOS MDD +$56 (essentially flat). 5/5 pre-committed
+            # gates pass. The filter was killing 868 OOS shorts that
+            # averaged $150/trade (positive EV). Setting it to 1.0
+            # effectively disables the breaker (jump_fraction can
+            # never exceed 1.0). See JUMP_FILTER_WALKFORWARD_2026_05_11.md
+            # and JUMP_FRACTION_SWEEP_2026_05_11.md.
+            max_jump_fraction_for_shorts=1.0,
         )
 
     @classmethod
@@ -990,6 +1021,29 @@ class VolArbBacktester:
                 n_clf, len(df), 100 * n_clf / len(df),
             )
 
+        # Partial-window slice (2026-05-11) — must happen BEFORE
+        # vrp_baseline rolling and downstream signal generation, so all
+        # subsequent stats operate only on the requested window. Every
+        # trailing computation downstream (.rolling, profit-filter EMA,
+        # DFL-head year-quantile, sidecar lookups by timestamp) is
+        # leakage-safe, so bar T's output is byte-identical to a
+        # full-sample run for the same start_dt. See test
+        # ``test_partial_window_byte_identity_at_shared_bars``.
+        if self.cfg.start_dt is not None or self.cfg.end_dt is not None:
+            sd = pd.Timestamp(self.cfg.start_dt) if self.cfg.start_dt else None
+            ed = pd.Timestamp(self.cfg.end_dt)   if self.cfg.end_dt   else None
+            if df.index.tz is not None:
+                if sd is not None and sd.tz is None:
+                    sd = sd.tz_localize(df.index.tz)
+                if ed is not None and ed.tz is None:
+                    ed = ed.tz_localize(df.index.tz)
+            n_pre = len(df)
+            df = df.loc[sd:ed].copy()
+            logger.info(
+                "Partial-window slice: [%s, %s], %d -> %d bars",
+                sd, ed, n_pre, len(df),
+            )
+
         # IV fallback chain: maturity-matched SVI IV → trade IV → DVOL
         # svi_iv_matched is SVI surface evaluated at the straddle's exact (k, T),
         # so it's directly comparable to trade IV (unlike nearest-expiry svi_atm_vol).
@@ -1272,6 +1326,27 @@ class VolArbBacktester:
 
         # Restore original order
         aligned = aligned.set_index("timestamp").sort_index()
+
+        # Slice-boundary guard (2026-05-11 partial-window parity fix):
+        # When ``end_dt`` is set, the merge_asof above returns a STALE
+        # match for any bar whose ``exit_target`` is past the last
+        # available ``ts`` in the exit lookup — merge_asof backward
+        # silently falls back to the latest row, but that row is NOT
+        # the true exit. Detect this precisely by comparing exit_target
+        # against the max ts in the lookup; interior data gaps (where
+        # merge_asof's fallback IS legitimate) are unaffected because
+        # their exit_target is < max_lookup_ts.
+        max_lookup_ts = exit_lookup["ts"].max()
+        boundary_artifact = aligned["exit_target"] > max_lookup_ts
+        if boundary_artifact.any():
+            n_boundary = int(boundary_artifact.sum())
+            logger.info(
+                "Exit alignment: dropping %d boundary-artifact bars whose "
+                "exit_target lies past end_dt (merge_asof would have "
+                "returned a stale match).", n_boundary,
+            )
+            aligned.loc[boundary_artifact, "iv_exit_legacy"] = np.nan
+            aligned.loc[boundary_artifact, "price_exit"] = np.nan
 
         # Default = rolling-ATM (legacy iv_exit). Opt-in pinned via flag.
         if self.cfg.use_pinned_exit_iv:

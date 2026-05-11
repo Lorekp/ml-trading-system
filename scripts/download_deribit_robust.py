@@ -256,7 +256,27 @@ def main():
     parser = argparse.ArgumentParser(description="Robust Deribit historical trades downloader")
     parser.add_argument("--data-dir", default="/hdd/deribit-trades",
                         help="Output directory (default: /hdd/deribit-trades)")
+    parser.add_argument("--start", default=None,
+                        help="ISO start date (default: hardcoded START)")
+    parser.add_argument("--end", default=None,
+                        help="ISO end date EXCLUSIVE (default: hardcoded END)")
+    parser.add_argument("--currencies", default=None,
+                        help="Comma-separated subset of currencies (default: all)")
+    parser.add_argument("--kinds", default=None,
+                        help="Comma-separated subset of kinds (default: option,future)")
     args = parser.parse_args()
+
+    # Allow CLI overrides of the module-level constants. We mutate the
+    # globals so download_stream picks them up without further refactor.
+    global START, END, CURRENCIES, KINDS
+    if args.start:
+        START = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
+    if args.end:
+        END = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
+    if args.currencies:
+        CURRENCIES = [c.strip() for c in args.currencies.split(",") if c.strip()]
+    if args.kinds:
+        KINDS = [k.strip() for k in args.kinds.split(",") if k.strip()]
 
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)

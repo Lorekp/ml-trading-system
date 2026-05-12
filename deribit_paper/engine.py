@@ -2137,16 +2137,32 @@ class TradingEngine:
                 )
                 return
 
-        # 3. Scheduled SVI recalibration (fire-and-forget background)
+        # 3. Scheduled SVI recalibration (cycle-27: AWAIT at bucket boundary)
+        #
+        # Pre-cycle-27 this was fire-and-forget. Combined with cycle-27's
+        # bucket-boundary trigger in ``LiveSVICalibrator.needs_refresh``,
+        # awaiting means the just-closed bucket is fitted from full
+        # ``[t0, t0+bucket_freq)`` trades BEFORE this bar's IV query
+        # (``signal_pipeline.compute_iv_features``) runs further down.
+        # Without the await, F-4's ``bucket_ts + bucket_freq <= now``
+        # contract would pick the prior bucket (stale by one bucket) at
+        # every boundary, since the freshly-fitted bucket wouldn't land
+        # in ``params_df`` until the recal task completes 5-30s later.
+        #
+        # The recal blocks the bar handler for ~5-30s once per
+        # ``bucket_freq`` (1h in V2) — well within the 15-min bar
+        # interval margin. The internal ``recalibrate_async`` still
+        # dispatches the CPU-bound fit to a worker thread via
+        # ``asyncio.to_thread`` so the event loop itself stays
+        # responsive to WS callbacks during the wait.
         if self.svi_calibrator.needs_refresh(bar.timestamp):
-            logger.info("SVI recalibration scheduled at %s", bar.timestamp)
+            logger.info(
+                "SVI recalibration triggered at bucket boundary %s",
+                bar.timestamp,
+            )
             trades_df = self.option_buffer.to_dataframe() if self.option_buffer else pd.DataFrame()
             if not trades_df.empty:
-                # Run in background thread to avoid blocking the bar loop
-                asyncio.create_task(
-                    self._recalibrate_svi_task(trades_df, bar.timestamp),
-                    name="svi_recalibrate",
-                )
+                await self._recalibrate_svi_task(trades_df, bar.timestamp)
 
         # 3b. SVI staleness check (C3): refuse to trade on stale IV
         if self.svi_calibrator is not None and self.svi_calibrator.is_stale(

@@ -54,9 +54,25 @@ def _synthetic_option_trades(
 
 
 def test_needs_refresh_when_empty():
-    cal = LiveSVICalibrator(cache_path="/tmp/nonexistent.parquet", recalibrate_hours=1.0)
-    now = pd.Timestamp("2026-04-10 12:00:00", tz="UTC")
-    assert cal.needs_refresh(now) is True
+    """Cycle-27: empty calibrator (``_meta is None``) only fires once
+    a fully-observed bucket has closed (i.e., a bucket that STARTED
+    after ``_started_at``). Pre-cycle-27 returned True immediately,
+    which fitted the engine-restart bucket from truncated trades.
+    """
+    cal = LiveSVICalibrator(
+        cache_path="/tmp/nonexistent.parquet",
+        recalibrate_hours=1.0,
+        started_at=pd.Timestamp("2026-04-10 11:15:00", tz="UTC"),
+    )
+    # Bar in startup bucket [11:00, 12:00) — too early.
+    assert cal.needs_refresh(
+        pd.Timestamp("2026-04-10 11:45:00", tz="UTC"),
+    ) is False
+    # Bar at first clean bucket close (started_at.ceil(1h) = 12:00).
+    # Bucket [12:00, 13:00) has just closed at 13:00 → fire.
+    assert cal.needs_refresh(
+        pd.Timestamp("2026-04-10 13:00:00", tz="UTC"),
+    ) is True
 
 
 def test_has_params_false_initially():
@@ -94,17 +110,24 @@ def test_recalibrate_populates_cache(tmp_path):
         assert cache_path.exists()
 
 
-def test_needs_refresh_honors_elapsed(tmp_path):
+def test_needs_refresh_honors_bucket_boundary(tmp_path):
+    """Cycle-27: post-calibration ``needs_refresh`` fires on bucket
+    boundary crossing, not on elapsed time. Pre-cycle-27 a recal that
+    landed at HH:45 anchored the next at HH+1:45, fitting the most
+    recent bucket from 45 min of trades — offline uses the full hour.
+    """
     cache_path = tmp_path / "svi.parquet"
     cal = LiveSVICalibrator(cache_path=cache_path, recalibrate_hours=1.0)
     trades = _synthetic_option_trades(n_per_expiry=30, n_expiries=2)
-    first = pd.Timestamp("2026-04-10 12:00:00", tz="UTC")
+    # Recal lands mid-bucket (12:30 falls in the [12:00, 13:00) bucket).
+    first = pd.Timestamp("2026-04-10 12:30:00", tz="UTC")
     cal.recalibrate(trades, now=first)
 
-    # 30 min later → not yet time to refresh
-    assert cal.needs_refresh(first + pd.Timedelta(minutes=30)) is False
-    # 1h + 1min later → refresh needed
-    assert cal.needs_refresh(first + pd.Timedelta(minutes=61)) is True
+    # 30 min later (13:00) — bucket [12:00, 13:00) just closed,
+    # cur_bucket_start=13:00 > last_bucket_start=12:00 → fire.
+    assert cal.needs_refresh(first + pd.Timedelta(minutes=30)) is True
+    # Same bucket as recal (12:45) — cur=12:00, last=12:00 → no fire.
+    assert cal.needs_refresh(first + pd.Timedelta(minutes=15)) is False
 
 
 @pytest.mark.asyncio

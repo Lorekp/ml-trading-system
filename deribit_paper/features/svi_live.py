@@ -117,11 +117,45 @@ class LiveSVICalibrator:
         return self._meta.last_recalibrated_at if self._meta else None
 
     def needs_refresh(self, now: pd.Timestamp) -> bool:
-        """Return True if it's time to run a new calibration."""
+        """Return True if a fresh calibration is due.
+
+        Cycle-27 (2026-05-13): trigger on bucket-boundary crossing
+        rather than elapsed-time. Pre-cycle-27 the predicate was
+        ``now - last_recalibrated_at >= recalibrate_hours``; with
+        ``recalibrate_hours=1h``, a recal that landed at HH:45 anchored
+        the NEXT recal at HH+1:45 → every recal saw the most recent
+        bucket truncated to ~45 min of trades. Offline calibrates each
+        ``[t0, t0+bucket_freq)`` bucket from trades fully within its
+        window — the 11:00 bucket at decision time 12:00 was fitted
+        from 83 trades offline vs ~75 live (cycle-25 audit). The
+        resulting ~1.4vp IV drift propagates into the LGBM signal.
+
+        Post-cycle-27: fire on the first bar where
+        ``now.floor(bucket_freq) > anchor.floor(bucket_freq)``. The
+        just-closed bucket is then fitted from a full
+        ``[t0, t0+bucket_freq)`` window, byte-identical to offline.
+
+        Bootstrap (``_meta is None``): the engine may restart
+        mid-bucket. The first FULLY-OBSERVED bucket is the one that
+        STARTS after ``_started_at``. We wait for that bucket to close
+        before firing the first recal — otherwise we'd fit a bucket
+        whose prefix trades are missing from ``option_buffer`` (we
+        only started capturing them at ``_started_at``). Until then,
+        the SVI cache prewarm (``svi_cache.parquet``) carries the
+        engine through. ``is_stale`` (max_stale_hours=4h, see L126)
+        is the safety belt if prewarm is too old.
+        """
+        bucket_freq_td = pd.Timedelta(self.svi_config.bucket_freq)
+        cur_bucket_start = now.floor(self.svi_config.bucket_freq)
         if self._meta is None:
-            return True
-        elapsed = now - self._meta.last_recalibrated_at
-        return elapsed >= pd.Timedelta(hours=self.recalibrate_hours)
+            first_clean_bucket_start = self._started_at.ceil(
+                self.svi_config.bucket_freq,
+            )
+            return cur_bucket_start > first_clean_bucket_start
+        last_bucket_start = self._meta.last_recalibrated_at.floor(
+            self.svi_config.bucket_freq,
+        )
+        return cur_bucket_start > last_bucket_start
 
     def is_stale(self, now: pd.Timestamp, max_stale_hours: float = 4.0) -> bool:
         """Return True if cached SVI params are too old to trust.

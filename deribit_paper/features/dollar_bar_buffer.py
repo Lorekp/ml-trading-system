@@ -205,6 +205,25 @@ class DollarBarBuffer:
         onto the dollar-bar grid without paying the full
         :meth:`as_dataframe` cost. The index is recomputed per call —
         callers are expected to cache for the bar's compute pass.
+
+        Cycle-26 (2026-05-13): apply monotonic nanosecond offsets to
+        same-millisecond duplicates, mirroring offline
+        ``vol_model/features/engineer.py:121-122``::
+
+            dup_offsets = bars.groupby(bars.index).cumcount()
+            bars.index = bars.index + pd.to_timedelta(dup_offsets, unit="ns")
+
+        Without this dedup, ``TSRVDollarBarFeatures._ffill_to_dollar_bars``
+        raises ``cannot reindex on an axis with duplicate labels`` whenever
+        two dollar bars complete in the same millisecond (high-volume
+        periods). Cycle-25's parity audit found 86+ such failures per
+        day on May 10-12, causing 7 LGBM features
+        (``tsrv_mean_1d{,_lag1,_lag3,_ema10,_ema50}``,
+        ``up_jump_frac{,_ema50}``) to silently fall back to FROZEN
+        baseline values on every live bar → ~10vp ``rv_pred`` drift
+        vs offline. Adding nanosecond offsets is exactly what offline
+        already does at build time, so the dedup brings live into
+        byte-identical alignment with offline's ``_build_bars_sequential``.
         """
         if not self._bars:
             return pd.DatetimeIndex([], tz="UTC", name="timestamp")
@@ -217,6 +236,18 @@ class DollarBarBuffer:
         idx = pd.DatetimeIndex(
             pd.to_datetime(timestamps, utc=True), name="timestamp",
         )
+        # ``Index.duplicated().any()`` is more portable across pandas
+        # versions than ``Index.has_duplicates`` (the latter routes through
+        # a Series property check in pandas 3.x and can raise on tz-aware
+        # indices in some patch releases).
+        if idx.duplicated().any():
+            # cumcount over groups of identical timestamps → 0, 1, 2, ...
+            # within each group. Add as nanoseconds to make every entry
+            # unique while preserving sort order.
+            dup_offsets = pd.Series(np.arange(len(idx))).groupby(
+                idx.asi8
+            ).cumcount()
+            idx = idx + pd.to_timedelta(dup_offsets.to_numpy(), unit="ns")
         return idx
 
     def tail(self, n: int) -> list[DollarBar]:

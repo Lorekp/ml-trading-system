@@ -20,7 +20,9 @@ so the main bar loop never blocks on SVI.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -491,6 +493,12 @@ class LiveSVICalibrator:
                 window_end=window_end,
             )
             self._persist_cache()
+            # Cycle-28a (2026-05-13): append every recal's per-expiry
+            # param rows to a permanent JSONL log for post-hoc parity
+            # audit. The rolling ``svi_cache.parquet`` evicts old rows
+            # as buckets get overwritten; this audit log is append-only.
+            # Manage rotation externally via logrotate if size grows.
+            self._emit_recal_audit()
             logger.info(
                 "SVI recalibrated: %d buckets, %d param rows, window %s → %s",
                 self._meta.n_buckets, self._meta.n_params_rows,
@@ -530,6 +538,71 @@ class LiveSVICalibrator:
                 "LiveSVICalibrator.evaluate called before any successful recalibration",
             )
         return evaluate_surface_batch(self._params_df, query_df)
+
+    def _emit_recal_audit(
+        self,
+        *,
+        audit_path: str | Path = "deribit_paper/logs/svi_recals.jsonl",
+    ) -> None:
+        """Cycle-28a: append the just-fitted params to a permanent JSONL.
+
+        One JSON record per row of ``self._params_df``. Schema::
+
+            {
+              "recalibrated_at": "<ISO8601 UTC>",
+              "bucket_ts":       "<ISO8601 UTC>",     # bucket label
+              "expiry_dt":       "<ISO8601 UTC>",
+              "a": float, "b": float, "rho": float,
+              "m": float, "sigma": float,
+              "rmse": float, "level": float, "n_strikes": int,
+            }
+
+        The rolling ``svi_cache.parquet`` evicts old rows as buckets
+        get overwritten by subsequent recals. For post-hoc parity
+        audit we want every SVI fit preserved, so this log is
+        append-only. Rotation is the operator's responsibility
+        (logrotate keyed on file size or daily).
+
+        Best-effort: never raises into the recal hot path. If the
+        write fails (disk full, permission, etc.), we log a warning
+        and return — the recal itself still succeeds.
+        """
+        if self._params_df is None or self._params_df.empty:
+            return
+        recalibrated_at = (
+            self._meta.last_recalibrated_at.isoformat()
+            if self._meta is not None else
+            pd.Timestamp.now(tz="UTC").isoformat()
+        )
+        # Restrict to columns present in params_df; calibrate_surface
+        # may or may not emit every optional column depending on
+        # min_strikes / fallback path.
+        col_order = ["timestamp", "expiry_dt", "a", "b", "rho", "m",
+                     "sigma", "rmse", "level", "n_strikes"]
+        cols = [c for c in col_order if c in self._params_df.columns]
+        try:
+            path = Path(audit_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                for _, row in self._params_df.iterrows():
+                    rec: dict[str, Any] = {"recalibrated_at": recalibrated_at}
+                    for c in cols:
+                        val = row[c]
+                        key = "bucket_ts" if c == "timestamp" else c
+                        if isinstance(val, pd.Timestamp):
+                            rec[key] = val.isoformat()
+                        elif val is None or (
+                            isinstance(val, float) and math.isnan(val)
+                        ):
+                            rec[key] = None
+                        else:
+                            try:
+                                rec[key] = float(val)
+                            except (TypeError, ValueError):
+                                rec[key] = str(val)
+                    f.write(json.dumps(rec) + "\n")
+        except Exception as exc:  # noqa: BLE001 - audit log is best-effort
+            logger.warning("SVI recal audit log emit failed: %s", exc)
 
     def _persist_cache(self) -> None:
         """Write the current params_df + meta to disk atomically.

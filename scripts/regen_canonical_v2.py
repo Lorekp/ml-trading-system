@@ -38,6 +38,43 @@ CANON_TL = REPO_ROOT / "vol_arb/output/BTC_v2_trade_log.parquet"
 DRAFT_TL = REPO_ROOT / "vol_arb/output/BTC_v2_trade_log_draft.parquet"
 
 
+def _assert_svi_bucket_freq_parity() -> None:
+    """Cycle-28b (2026-05-13): refuse to regen canonical V2 when live
+    and offline have diverged on ``svi_bucket_freq``.
+
+    The vol_arb pipeline (``vol_arb/pipeline.py``) reads
+    ``VolArbConfig().svi_bucket_freq``; the live engine reads
+    ``PaperConfig.with_v2_preset().svi_bucket_freq``. Both default to
+    ``"1h"``. A mismatch — typically a manual override like
+    ``--svi-bucket-freq 15min`` passed to an upstream regen — means
+    offline calibrated buckets at one cadence while live applies the
+    F-4 contract (``bucket_ts + bucket_freq <= now``) at another. The
+    consequence is silent IV drift at every hourly bar (offline 15min
+    buckets get end-stamped differently than live expects).
+
+    This guard catches the mismatch BEFORE the canonical trade log is
+    overwritten. If it fires, fix the upstream pipeline's bucket
+    cadence and re-run.
+    """
+    from deribit_paper.config import PaperConfig
+    from vol_arb.config import VolArbConfig
+
+    live_freq = PaperConfig.with_v2_preset().svi_bucket_freq
+    offline_freq = VolArbConfig().svi_bucket_freq
+    if live_freq != offline_freq:
+        raise SystemExit(
+            f"Cycle-28b parity guard FAILED: "
+            f"live svi_bucket_freq={live_freq!r}, "
+            f"offline svi_bucket_freq={offline_freq!r}. "
+            "Both must match for live-parity regen. "
+            "Aborting to protect canonical trade log."
+        )
+    logger.info(
+        "Cycle-28b parity guard: svi_bucket_freq=%r live==offline (OK)",
+        live_freq,
+    )
+
+
 def _run_one_v2(kelly_mult_path: str | None) -> pd.DataFrame:
     cfg = (BacktestConfig()
            .with_btc_production_filters_v2()
@@ -48,6 +85,7 @@ def _run_one_v2(kelly_mult_path: str | None) -> pd.DataFrame:
 
 
 def main() -> int:
+    _assert_svi_bucket_freq_parity()
     t0 = time.time()
 
     # ── Pass 1: draft (kelly off) ──

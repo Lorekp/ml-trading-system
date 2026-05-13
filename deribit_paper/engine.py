@@ -667,6 +667,58 @@ class TradingEngine:
                     seq_len=int(tv_cfg.seq_len),
                     max_size=int(tv_cfg.seq_len),
                 )
+                # Cycle-37 (2026-05-13): if the active checkpoint lacks
+                # ``time_normalizer_{mean,std}`` (pre-cycle-25 format —
+                # only the joint ``normalizer_mean/std`` is persisted),
+                # the bundle's ``transvol_time_mean``/``_std`` are shape
+                # (0,). Cycle-29 added a legacy fallback inside
+                # ``prewarm_from_parquet`` but only kept the resolved
+                # values LOCAL — the bundle never received them, so the
+                # PER-BAR live inference at engine.py:2309 still divides
+                # by shape (0,) and raises ``operands could not be
+                # broadcast together with shapes (2,) (0,)``. The engine
+                # then falls back to baseline tv_* slots for EVERY bar.
+                # Surfaced by the cycle-33 bar-trace at 2026-05-13 19:00.
+                # Fix: compute the same legacy fallback HERE, BEFORE
+                # prewarm, and overwrite the bundle's fields so both
+                # prewarm AND live per-bar inference see resolved values.
+                tm = np.asarray(
+                    self.model_bundle.transvol_time_mean, dtype=np.float32,
+                )
+                ts_ = np.asarray(
+                    self.model_bundle.transvol_time_std, dtype=np.float32,
+                )
+                if tm.shape == (0,) or ts_.shape == (0,):
+                    features_df = pd.read_parquet(cfg.features_parquet)
+                    missing_time = [
+                        c for c in TRANSVOL_TIME_COLUMNS
+                        if c not in features_df.columns
+                    ]
+                    if missing_time:
+                        raise KeyError(
+                            f"features parquet missing time columns "
+                            f"{missing_time}; cannot compute legacy time-"
+                            f"normalizer fallback",
+                        )
+                    T_all = features_df[list(TRANSVOL_TIME_COLUMNS)].values.astype(
+                        np.float32,
+                    )
+                    # Mirror vol_model/run_walkforward_hybrid.py::_resolve_time_normalizer
+                    # which slices [:max(len-1000, 1)] to exclude the latest
+                    # test-window — leakage-safe legacy normalizer.
+                    slice_end = max(len(T_all) - 1000, 1)
+                    tm = T_all[:slice_end].mean(axis=0).astype(np.float32)
+                    ts_ = T_all[:slice_end].std(axis=0).astype(np.float32)
+                    ts_ = np.clip(ts_, 1e-8, None)
+                    self.model_bundle.transvol_time_mean = tm
+                    self.model_bundle.transvol_time_std = ts_
+                    logger.warning(
+                        "Cycle-37: applied legacy time-normalizer fallback "
+                        "(checkpoint lacks time_normalizer_{mean,std}). "
+                        "Computed from %d past-only rows. Retrain a "
+                        "cycle-25+ checkpoint to close.",
+                        slice_end,
+                    )
                 n_tv_rows = self.transvol_history_buffer.prewarm_from_parquet(
                     features_parquet=cfg.features_parquet,
                     feature_columns=list(TRANSVOL_INPUT_COLUMNS),

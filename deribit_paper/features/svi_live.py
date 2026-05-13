@@ -85,8 +85,30 @@ class LiveSVICalibrator:
     ):
         self.cache_path = Path(cache_path)
         self.recalibrate_hours = recalibrate_hours
+        # Cycle-30 (2026-05-13): default ``bucket_freq`` flipped from
+        # ``"1h"`` to ``"15min"`` to align with the canonical offline
+        # pipeline. ``vol_arb/run_pipeline.py:121`` sets
+        # ``svi_bucket_freq = bar_freq_str`` which resolves to
+        # ``"{bar_minutes}min"`` = ``"15min"`` at h=15 production.
+        # Empirical: ``vol_arb/output/svi_features_15m.parquet`` has
+        # DISTINCT ``svi_atm_1d`` per 15-min bar; live IV under 1h
+        # cadence was sticky for 4 consecutive 15-min bars → F-4
+        # observable timestamps landed at different decision bars
+        # between live and offline → ~3vp Δiv drift (2026-05-13
+        # parity audit, max abs 37.8vp at one degenerate 06:45
+        # bucket).
+        #
+        # Cycle-27 ``needs_refresh`` is parametric on
+        # ``self.svi_config.bucket_freq`` — flipping the constant
+        # automatically increases recal frequency from 1×/h to 4×/h
+        # without further code changes. CPU cost is dominated by
+        # per-(bucket, expiry) LM fits; thinner 15-min windows have
+        # fewer trades per fit so per-call cost goes DOWN. All recal
+        # work runs in ``asyncio.to_thread`` — main event loop
+        # unaffected. Bootstrap wait after engine restart shortens
+        # from 1-2h to 15-30min.
         self.svi_config = svi_config or SVIConfig(
-            bucket_freq="1h",
+            bucket_freq="15min",
             min_strikes=5,
             fallback_min_strikes=3,
         )

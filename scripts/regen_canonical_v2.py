@@ -38,19 +38,52 @@ CANON_TL = REPO_ROOT / "vol_arb/output/BTC_v2_trade_log.parquet"
 DRAFT_TL = REPO_ROOT / "vol_arb/output/BTC_v2_trade_log_draft.parquet"
 
 
+def _detect_parquet_cadence(parquet_path: Path) -> str:
+    """Cycle-32 (2026-05-13): infer the actual bucket cadence of an
+    SVI params parquet from its timestamp row spacing.
+
+    Returns ``"15min"``, ``"1h"``, or ``"{N}s"`` for unrecognized
+    cadences. Cycle-28b only compared CONFIG defaults; this lets the
+    guard also detect a drift between what the config CLAIMS and what
+    the data ACTUALLY contains.
+    """
+    import pandas as pd
+
+    params = pd.read_parquet(parquet_path)
+    if "timestamp" in params.columns:
+        ts = pd.to_datetime(params["timestamp"], utc=True)
+    else:
+        ts = pd.to_datetime(params.index, utc=True)
+    unique_ts = pd.Series(ts).drop_duplicates().sort_values()
+    if len(unique_ts) < 2:
+        return "unknown"
+    median_spacing_s = float(unique_ts.diff().dropna().dt.total_seconds().median())
+    if abs(median_spacing_s - 900.0) < 60.0:
+        return "15min"
+    if abs(median_spacing_s - 3600.0) < 60.0:
+        return "1h"
+    return f"{median_spacing_s:.0f}s"
+
+
 def _assert_svi_bucket_freq_parity() -> None:
-    """Cycle-28b (2026-05-13): refuse to regen canonical V2 when live
-    and offline have diverged on ``svi_bucket_freq``.
+    """Cycle-28b (2026-05-13, hardened cycle-32 2026-05-13): refuse to
+    regen canonical V2 when live and offline have diverged on
+    ``svi_bucket_freq``.
 
     The vol_arb pipeline (``vol_arb/pipeline.py``) reads
     ``VolArbConfig().svi_bucket_freq``; the live engine reads
-    ``PaperConfig.with_v2_preset().svi_bucket_freq``. Both default to
-    ``"1h"``. A mismatch — typically a manual override like
-    ``--svi-bucket-freq 15min`` passed to an upstream regen — means
+    ``PaperConfig.with_v2_preset().svi_bucket_freq``. Both default
+    align with the canonical offline pipeline cadence (cycle-30:
+    ``"15min"``). A mismatch — typically a manual override like
+    ``--svi-bucket-freq 1h`` passed to an upstream regen — means
     offline calibrated buckets at one cadence while live applies the
     F-4 contract (``bucket_ts + bucket_freq <= now``) at another. The
-    consequence is silent IV drift at every hourly bar (offline 15min
-    buckets get end-stamped differently than live expects).
+    consequence is silent IV drift at every hourly bar.
+
+    Cycle-28b checked config-default strings only. Cycle-32 also
+    inspects the ACTUAL svi_surface_params parquet's row spacing —
+    catches drift where the config says one thing but the parquet was
+    built at another cadence (the cycle-30 root-cause class).
 
     This guard catches the mismatch BEFORE the canonical trade log is
     overwritten. If it fires, fix the upstream pipeline's bucket
@@ -61,6 +94,8 @@ def _assert_svi_bucket_freq_parity() -> None:
 
     live_freq = PaperConfig.with_v2_preset().svi_bucket_freq
     offline_freq = VolArbConfig().svi_bucket_freq
+
+    # Layer 1 (cycle-28b): config-default parity.
     if live_freq != offline_freq:
         raise SystemExit(
             f"Cycle-28b parity guard FAILED: "
@@ -69,8 +104,44 @@ def _assert_svi_bucket_freq_parity() -> None:
             "Both must match for live-parity regen. "
             "Aborting to protect canonical trade log."
         )
+
+    # Layer 2 (cycle-32): parquet-cadence parity. Inspect the actual
+    # offline params parquet whose cadence the live F-4 contract MUST
+    # match for observable-timestamp alignment. We check the matched-
+    # cadence file the backtester reads (svi_surface_params_15min for
+    # 15min cadence, svi_surface_params_1h for 1h, etc.).
+    candidates = [
+        REPO_ROOT / "vol_arb/output/svi_surface_params_15min.parquet",
+        REPO_ROOT / "vol_arb/output/svi_surface_params_1h.parquet",
+    ]
+    existing = [p for p in candidates if p.exists()]
+    if existing:
+        # Detect cadence of each existing file; whichever matches the
+        # config gets greenlight, mismatch raises.
+        cadences = {p.name: _detect_parquet_cadence(p) for p in existing}
+        # Pick the parquet whose cadence matches live_freq if present;
+        # otherwise flag every existing file with its detected cadence.
+        matching = [
+            name for name, cad in cadences.items() if cad == live_freq
+        ]
+        if not matching:
+            raise SystemExit(
+                f"Cycle-32 parity guard FAILED: live svi_bucket_freq="
+                f"{live_freq!r} but no offline params parquet matches "
+                f"that cadence. Detected: {cadences}. "
+                "Either rebuild the offline parquet at the live cadence "
+                "(via vol_arb/run_pipeline.py --svi-bucket-freq "
+                f"{live_freq}) OR change live's "
+                "LiveSVICalibrator.svi_config.bucket_freq to match the "
+                "existing parquet."
+            )
+        logger.info(
+            "Cycle-32 parquet-cadence guard: live=%r matches %s (OK)",
+            live_freq, matching[0],
+        )
+
     logger.info(
-        "Cycle-28b parity guard: svi_bucket_freq=%r live==offline (OK)",
+        "Cycle-28b config-parity guard: svi_bucket_freq=%r live==offline (OK)",
         live_freq,
     )
 

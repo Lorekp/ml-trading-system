@@ -36,6 +36,18 @@ import numpy as np
 import pandas as pd
 
 from deribit_paper.features.svi_live import LiveSVICalibrator, SVICacheMeta
+from vol_arb.svi import SVIConfig
+
+
+# Cycle-30 (2026-05-13): the production default ``bucket_freq`` is
+# ``"15min"``. These cycle-27 tests intentionally exercise the LOGIC
+# at ``"1h"`` cadence (so timestamps like ``12:30``/``13:00`` straddle
+# a single bucket boundary). The ``needs_refresh`` predicate is
+# parametric on ``svi_config.bucket_freq``, so passing an explicit
+# 1h config preserves the original cycle-27 semantics regardless of
+# the production default. The cycle-30 production constant is pinned
+# separately in ``test_svi_live_bucket_cadence.py``.
+_BUCKET_1H = SVIConfig(bucket_freq="1h", min_strikes=5, fallback_min_strikes=3)
 
 
 # ── Bucket-boundary trigger (post-cycle-27 semantics) ────────────────
@@ -45,7 +57,7 @@ def test_post_calibration_does_not_fire_within_same_bucket(tmp_path):
     """A recal at 12:30 must NOT trigger another at 12:45 — both fall
     in the [12:00, 13:00) bucket. Pre-cycle-27 the elapsed predicate
     correctly returned False here; cycle-27 must preserve that."""
-    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet")
+    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet", svi_config=_BUCKET_1H)
     cal._meta = SVICacheMeta(
         last_recalibrated_at=pd.Timestamp("2026-05-12 12:30:00", tz="UTC"),
         n_buckets=1, n_params_rows=2,
@@ -62,7 +74,7 @@ def test_post_calibration_fires_at_next_bucket_boundary(tmp_path):
     """Cycle-27: a recal at 12:30 must trigger again at 13:00 — that
     is when the [12:00, 13:00) bucket has fully closed and the
     [12:00, 13:00) trade set is in option_buffer for refit."""
-    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet")
+    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet", svi_config=_BUCKET_1H)
     cal._meta = SVICacheMeta(
         last_recalibrated_at=pd.Timestamp("2026-05-12 12:30:00", tz="UTC"),
         n_buckets=1, n_params_rows=2,
@@ -78,7 +90,7 @@ def test_post_calibration_does_not_double_fire_within_new_bucket(tmp_path):
     """Once a recal lands at 13:00 (next bucket), the 13:15 bar
     must NOT trigger another fit — we already have the 12:00 bucket
     fresh and the 13:00 bucket hasn't closed yet."""
-    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet")
+    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet", svi_config=_BUCKET_1H)
     cal._meta = SVICacheMeta(
         last_recalibrated_at=pd.Timestamp("2026-05-12 13:00:00", tz="UTC"),
         n_buckets=2, n_params_rows=4,
@@ -104,6 +116,7 @@ def test_bootstrap_does_not_fire_in_startup_bucket(tmp_path):
     cal = LiveSVICalibrator(
         cache_path=tmp_path / "svi.parquet",
         started_at=pd.Timestamp("2026-05-12 11:15:00", tz="UTC"),
+        svi_config=_BUCKET_1H,
     )
     # _meta is None; ceil(11:15, 1h) = 12:00; cur_bucket_start at 12:00 is 12:00.
     # 12:00 > 12:00 is False → no fire. (Bucket [12:00, 13:00) hasn't closed.)
@@ -124,6 +137,7 @@ def test_bootstrap_fires_after_first_clean_bucket_closes(tmp_path):
     cal = LiveSVICalibrator(
         cache_path=tmp_path / "svi.parquet",
         started_at=pd.Timestamp("2026-05-12 11:15:00", tz="UTC"),
+        svi_config=_BUCKET_1H,
     )
     # 13:00 bar: cur_bucket_start=13:00 > ceil(11:15, 1h)=12:00 → fire.
     assert cal.needs_refresh(
@@ -138,6 +152,7 @@ def test_bootstrap_started_at_on_bucket_edge(tmp_path):
     cal = LiveSVICalibrator(
         cache_path=tmp_path / "svi.parquet",
         started_at=pd.Timestamp("2026-05-12 11:00:00", tz="UTC"),
+        svi_config=_BUCKET_1H,
     )
     # 11:30 bar — same [11:00, 12:00) bucket — no fire.
     assert cal.needs_refresh(
@@ -209,7 +224,7 @@ def test_recal_at_boundary_fits_bucket_from_full_window_trades(tmp_path):
     timestamp's floor(bucket_freq), so a trade at 12:55 lands in the
     12:00 bucket. (Mirrors offline's bucketing convention.)
     """
-    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet")
+    cal = LiveSVICalibrator(cache_path=tmp_path / "svi.parquet", svi_config=_BUCKET_1H)
     rng = np.random.default_rng(42)
     rows = []
     base_ts = pd.Timestamp("2026-05-12 12:00:00", tz="UTC")

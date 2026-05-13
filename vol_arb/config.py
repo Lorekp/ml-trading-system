@@ -39,9 +39,16 @@ class VolArbConfig(BaseModel):
     # (e.g. "15min" for 15m TSRV, "60min" for 1h TSRV, "4h" for 240m TSRV)
     bucket_freq: str = "15min"
 
-    # SVI surface calibration
+    # SVI surface calibration.
+    # Cycle-30 (2026-05-13): default flipped from ``"1h"`` to ``"15min"``
+    # to match what ``vol_arb/run_pipeline.py:121`` actually uses
+    # (``bar_freq_str = "{args.bar_minutes}min"`` = ``"15min"`` at h=15).
+    # Pre-cycle-30 the field default was structurally drifted from the
+    # runner default; cycle-28b's parity guard then passed when both
+    # config defaults matched even though the actual offline parquet
+    # was at the runner-derived "15min" cadence (silent mismatch).
     svi_enabled: bool = False
-    svi_bucket_freq: str = "1h"
+    svi_bucket_freq: str = "15min"
     svi_min_strikes: int = 5
     svi_fallback_min_strikes: int = 3
     svi_use_pcp_forward: bool = True

@@ -58,11 +58,18 @@ def test_needs_refresh_when_empty():
     a fully-observed bucket has closed (i.e., a bucket that STARTED
     after ``_started_at``). Pre-cycle-27 returned True immediately,
     which fitted the engine-restart bucket from truncated trades.
+
+    Cycle-30 (2026-05-13): explicitly use ``bucket_freq="1h"`` so the
+    test's hour-scale timestamps continue to exercise the cycle-27
+    boundary logic. The production default flipped to ``"15min"``
+    (pinned by ``test_svi_live_bucket_cadence.py``).
     """
+    from vol_arb.svi import SVIConfig
     cal = LiveSVICalibrator(
         cache_path="/tmp/nonexistent.parquet",
         recalibrate_hours=1.0,
         started_at=pd.Timestamp("2026-04-10 11:15:00", tz="UTC"),
+        svi_config=SVIConfig(bucket_freq="1h", min_strikes=5, fallback_min_strikes=3),
     )
     # Bar in startup bucket [11:00, 12:00) — too early.
     assert cal.needs_refresh(
@@ -115,9 +122,17 @@ def test_needs_refresh_honors_bucket_boundary(tmp_path):
     boundary crossing, not on elapsed time. Pre-cycle-27 a recal that
     landed at HH:45 anchored the next at HH+1:45, fitting the most
     recent bucket from 45 min of trades — offline uses the full hour.
+
+    Cycle-30 (2026-05-13): explicit 1h config keeps the cycle-27
+    hour-scale logic intact regardless of the production default.
     """
+    from vol_arb.svi import SVIConfig
     cache_path = tmp_path / "svi.parquet"
-    cal = LiveSVICalibrator(cache_path=cache_path, recalibrate_hours=1.0)
+    cal = LiveSVICalibrator(
+        cache_path=cache_path,
+        recalibrate_hours=1.0,
+        svi_config=SVIConfig(bucket_freq="1h", min_strikes=5, fallback_min_strikes=3),
+    )
     trades = _synthetic_option_trades(n_per_expiry=30, n_expiries=2)
     # Recal lands mid-bucket (12:30 falls in the [12:00, 13:00) bucket).
     first = pd.Timestamp("2026-04-10 12:30:00", tz="UTC")

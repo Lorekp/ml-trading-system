@@ -324,9 +324,18 @@ class PaperConfig:
     bar_exec_quality_path: str = ""
 
     # ── SVI live calibration ───────────────────────────────────────
-    svi_recalibrate_hours: int = 1           # run calibrate_surface() every N hours
+    # Cycle-27 (2026-05-13) made ``LiveSVICalibrator.needs_refresh``
+    # bucket-boundary aligned, ignoring ``svi_recalibrate_hours``;
+    # the field is retained for backward-compat with engine wiring
+    # that passes it through, but is now functionally unused.
+    svi_recalibrate_hours: int = 1           # LEGACY (cycle-27): functionally unused
     svi_rolling_window_hours: int = 2        # use the last N hours of option trades as input
-    svi_bucket_freq: str = "1h"
+    # Cycle-30 (2026-05-13): aligned with offline ``run_pipeline.py:121``
+    # which defaults ``svi_bucket_freq`` to ``bar_freq_str`` ("15min" at h=15).
+    # Field not currently read by engine wiring (LiveSVICalibrator
+    # hardcodes its own default) but kept here as the documented intent
+    # so a future refactor that wires this through doesn't regress.
+    svi_bucket_freq: str = "15min"
 
     # ── TSRV live ──────────────────────────────────────────────────
     tsrv_rolling_window_hours: int = 2       # use the last N hours of perp trades

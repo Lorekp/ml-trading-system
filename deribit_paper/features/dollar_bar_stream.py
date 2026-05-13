@@ -1,32 +1,47 @@
-"""Live dollar-bar stream from Binance Spot aggTrades REST polling.
+"""Live dollar-bar stream from Binance USD-M Futures aggTrades REST polling.
 
-F3 Tier 2 (parity-cycle round 3 — 2026-05-07): drives a
-``DollarBarAggregator`` from the Binance Spot REST endpoint
-(``https://api.binance.com/api/v3/aggTrades``). Spot — NOT Futures —
-because the offline pipeline trains on Binance Vision spot aggTrades
-(``data/binance-aggTrades-parquet/BTCUSDT/``); live MUST consume from
-the same source for the dollar-bar-derived features to byte-identity
-match offline.
+F3 Tier 2 (parity-cycle round 3 — 2026-05-07; corrected cycle-31
+2026-05-13): drives a ``DollarBarAggregator`` from the Binance USD-M
+Futures REST endpoint (``https://fapi.binance.com/fapi/v1/aggTrades``).
 
-Round-4 F6/F8 (2026-05-07): the same poller now optionally fans every
-parsed trade out to a second consumer via ``extra_trade_sink`` so the
-live TSRV computation can read from the same Binance Spot trades the
-offline pipeline trains on (closing the Deribit-perp-vs-Binance-spot
-venue gap on TSRV-derived features).
+**Venue history** (the class name ``DollarBarSpotStream`` is retained
+for back-compat after cycle-31 corrected the venue):
+
+* Original F3/F6/F8 (2026-05-07): pointed the stream at Binance SPOT
+  (``api.binance.com/api/v3/aggTrades``). The accompanying docstring
+  claimed the offline pipeline trained on Binance Vision SPOT aggTrades.
+* Cycle-31 (2026-05-13) parity audit: discovered the canonical offline
+  downloader (``scripts/download_binance_aggtrades.sh:10``) actually
+  pulls from ``data.binance.vision/data/futures/um/monthly/aggTrades``
+  i.e. Binance USD-M FUTURES. The F6/F8 claim was descriptively wrong.
+* Cycle-31 flipped the engine's REST client wiring from
+  ``BinanceRESTClient.for_spot()`` back to the default (futures), so
+  live consumes the same venue the models were trained on.
+
+The class name + the engine-side buffer name (``spot_trade_buffer``)
+are retained as historical artefacts; functionally the stream and
+buffer now hold Binance USD-M Futures trades. A future cleanup can
+rename both to ``DollarBarBinanceStream`` / ``binance_futures_trade_buffer``
+without behaviour change.
+
+Round-4 F6/F8 fan-out hook (2026-05-07, semantics preserved
+cycle-31): the same poller optionally fans every parsed trade out to
+a second consumer via ``extra_trade_sink`` so the live TSRV
+computation can read from the same venue the offline pipeline trains
+on (closing the Deribit-perp-vs-Binance-futures venue gap on
+TSRV-derived features).
 
 The architecture mirrors :class:`LiveVPINStream._run_rest_loop`:
-periodic ``GET /api/v3/aggTrades?fromId=last+1`` polling, feeding each
-trade into the aggregator, with thread-safe locks on the latest-bar
-property and an explicit shutdown event for graceful stop.
+periodic ``GET /fapi/v1/aggTrades?fromId=last+1`` polling, feeding
+each trade into the aggregator, with thread-safe locks on the
+latest-bar property and an explicit shutdown event for graceful stop.
 
 Key differences vs the VPIN stream:
 
 * Drives a :class:`DollarBarAggregator`, not a bucket-VPIN accumulator.
-* Spot trades, not Futures (Spot REST is geographically-unblocked
-  from the homeserver too — same endpoint family).
-* Each trade's ``dollar_volume = qty * price`` (Spot doesn't carry an
-  exchange-precomputed dollar-volume field; Futures does, but Spot is
-  authoritative for the offline pipeline).
+* Same venue as VPIN now (Binance USD-M Futures) since cycle-31;
+  prior to that they were different (VPIN=futures, DollarBar=spot).
+* Each trade's ``dollar_volume = qty * price``.
 
 The stream itself does NOT keep a history of emitted bars — that's
 the consumer's job (the engine wires a :class:`DollarBarBuffer` via

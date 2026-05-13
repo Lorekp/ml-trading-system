@@ -428,12 +428,17 @@ class TradingEngine:
             window_seconds=cfg.option_buffer_hours * 3600.0,
         )
         self.index_buffer = IndexPriceBuffer(window_seconds=3600.0)
-        # Round-4 F6/F8 (parity-cycle 2026-05-07): Binance Spot trade
-        # buffer fed by ``DollarBarSpotStream``'s fan-out hook. Live
-        # ``compute_bar_tsrv`` reads from this buffer instead of the
-        # Deribit perp buffer so TSRV-derived features match the
-        # venue the offline pipeline (Binance Vision spot aggTrades)
-        # trains on. Window mirrors ``tsrv_rolling_window_hours``.
+        # Round-4 F6/F8 (parity-cycle 2026-05-07, corrected cycle-31
+        # 2026-05-13): Binance USD-M FUTURES trade buffer fed by
+        # ``DollarBarSpotStream``'s fan-out hook. (Stream name retained
+        # for back-compat; cycle-31 flipped its underlying REST client
+        # from spot to futures.) The pre-cycle-31 docstring claimed
+        # the offline pipeline trained on Binance Vision SPOT trades,
+        # but the canonical downloader (``scripts/download_binance_aggtrades.sh:10``)
+        # actually pulls from ``data.binance.vision/data/futures/um/monthly/aggTrades``
+        # (USD-M perp). Live consuming spot was a venue mismatch the
+        # models were never trained on; cycle-31 closes it. Window
+        # mirrors ``tsrv_rolling_window_hours``.
         self.spot_trade_buffer = TradeBuffer(
             name="spot",
             window_seconds=float(cfg.spot_trade_buffer_hours) * 3600.0,
@@ -937,15 +942,27 @@ class TradingEngine:
                 )
             logger.info("LiveVPINStream disabled (vpin_state_path empty)")
 
-        # ── F3 Tier 6: Live dollar-bar spot stream ──
-        # Polls Binance spot aggTrades into the DollarBarAggregator,
-        # which emits dollar bars into self.dollar_bar_buffer (via
-        # on_bar_close). Tier 3+5 handlers consume from the buffer.
-        # Runs in parallel with the existing LiveVPINStream (Futures perp)
-        # — they feed independent layers; cutover happens once the live
-        # spot-VPIN has soaked.
+        # ── F3 Tier 6: Live dollar-bar Binance-Futures stream ──
+        # Cycle-31 (2026-05-13): switched from Binance Spot to Binance
+        # USD-M Futures REST. The F3/F6/F8 docstrings claimed the
+        # offline pipeline trained on Binance Vision SPOT aggTrades —
+        # but the canonical downloader (``scripts/download_binance_aggtrades.sh:10``)
+        # actually pulls from ``data.binance.vision/data/futures/um/monthly/aggTrades``
+        # i.e. USD-M FUTURES. Live consuming spot was a venue mismatch
+        # the models were never trained on. Closing it returns live to
+        # the training distribution.
+        #
+        # The DollarBarAggregator emits dollar bars into
+        # self.dollar_bar_buffer (via on_bar_close). Tier 3+5 handlers
+        # consume from the buffer. The fan-out hook
+        # (``extra_trade_sink``) feeds the same trades into
+        # ``spot_trade_buffer`` — its name is now historically
+        # misleading but functionally correct (it holds Binance futures
+        # trades feeding live TSRV).
         from deribit_paper.client.binance_rest import BinanceRESTClient
-        self._dollar_bar_rest = BinanceRESTClient.for_spot()
+        # BinanceRESTClient() default base_url is https://fapi.binance.com
+        # (Binance USD-M Futures). Same endpoint LiveVPINStream uses.
+        self._dollar_bar_rest = BinanceRESTClient()
         self.dollar_bar_aggregator = DollarBarAggregator(
             threshold=cfg.dollar_bar_threshold_btc,
             on_bar_close=self.dollar_bar_buffer.append,

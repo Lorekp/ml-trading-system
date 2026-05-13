@@ -477,6 +477,14 @@ class PaperConfig:
         # PAPER_DRY_RUN env var can set dry_run=False only if explicitly "false"
         dry_run_env = os.environ.get("PAPER_DRY_RUN", "true").lower()
         cfg.dry_run = dry_run_env != "false"
+        # Cycle-33 (2026-05-13): opt-in per-bar feature trace via env var.
+        # When ``DERIBIT_PAPER_FEATURE_TRACE_PATH`` is set to a non-empty
+        # string, the engine appends one JSONL line per bar to that path.
+        # Operator sets this on the homeserver to capture a parity window
+        # then unsets after capturing to drop the per-bar I/O.
+        feature_trace_env = os.environ.get("DERIBIT_PAPER_FEATURE_TRACE_PATH", "")
+        if feature_trace_env:
+            cfg.feature_trace_path = feature_trace_env
         return cfg
 
     @classmethod

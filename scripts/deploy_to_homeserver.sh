@@ -153,6 +153,10 @@ SOURCE_FILES=(
     "deribit_paper/utils/__init__.py"
     "deribit_paper/utils/sidecar_staleness.py"         # parity-2 S4 (2026-05-07)
 
+    # Cycle-33 (2026-05-13): per-bar feature-trace writer
+    "deribit_paper/diagnostics/__init__.py"
+    "deribit_paper/diagnostics/bar_trace.py"
+
     # Live engine — engine-internal scripts
     "deribit_paper/scripts/__init__.py"
     "deribit_paper/scripts/validate_dry_run.py"

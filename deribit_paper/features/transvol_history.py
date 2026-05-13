@@ -261,12 +261,37 @@ class TransVolHistoryBuffer:
         feat_mean = np.asarray(feat_mean, dtype=np.float32)
         feat_std = np.asarray(feat_std, dtype=np.float32).clip(min=1e-8)
         time_mean = np.asarray(time_mean, dtype=np.float32)
-        time_std = np.asarray(time_std, dtype=np.float32).clip(min=1e-8)
+        time_std = np.asarray(time_std, dtype=np.float32)
         if feat_mean.shape != (self._n_features,):
             raise ValueError(
                 f"feat_mean shape mismatch: ({self._n_features},) "
                 f"expected, got {feat_mean.shape}"
             )
+
+        # Cycle-29 (2026-05-13) legacy fallback for pre-cycle-25 checkpoints
+        # that never persisted ``time_normalizer_{mean,std}``: compute the
+        # normalizer in-place from the prewarm parquet's time columns. The
+        # ``as_of`` filter above caps to past-only rows, so this is
+        # leakage-safe in the LIVE context (unlike offline extraction
+        # where the leak motivated cycle-25). Mirrors the legacy fallback
+        # in vol_model/run_walkforward_hybrid.py::_resolve_time_normalizer
+        # which slices ``[:max(len-1000, 1)]`` to exclude the latest
+        # ``test-window`` slice; we replicate that slice here for byte
+        # parity with the offline legacy path.
+        if time_mean.shape == (0,) or time_std.shape == (0,):
+            import warnings
+            warnings.warn(
+                f"TransVol checkpoint missing time_normalizer_{{mean,std}} keys; "
+                f"computing legacy fallback from prewarm parquet ({path}). "
+                "Retrain a cycle-25+ checkpoint to close.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            slice_end = max(len(T) - 1000, 1)
+            time_mean = T[:slice_end].mean(axis=0).astype(np.float32)
+            time_std = T[:slice_end].std(axis=0).astype(np.float32)
+
+        time_std = np.asarray(time_std, dtype=np.float32).clip(min=1e-8)
         Xn = (X - feat_mean) / feat_std
         Tn = (T - time_mean) / time_std
 

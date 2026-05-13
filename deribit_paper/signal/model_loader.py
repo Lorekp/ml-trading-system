@@ -184,9 +184,28 @@ def load_model_bundle(
 
     # The checkpoint format has evolved over time:
     # - Newest format stores a ``config`` object + ``normalizer_mean/std``
-    #   for the joint feature+time normaliser
-    # - Older format stores separate ``feat_mean/std`` and ``time_mean/std``
-    # We accept both.
+    #   for the joint feature+time normaliser, with the time-feature
+    #   normalizer split out as ``time_normalizer_mean/std`` (cycle-25
+    #   2026-05-11, A2 M1 leakage fix — see
+    #   vol_model/run_walkforward_hybrid.py:277-278).
+    # - Older format stores separate ``feat_mean/std`` and previously
+    #   used ``time_mean/std`` keys that NEVER ACTUALLY EXISTED in any
+    #   shipped checkpoint (the prior code path always re-fit the time
+    #   normalizer at extraction time, which cycle-25 closed as a leak).
+    # We accept both. ``time_normalizer_*`` keys are the cycle-25 canon.
+    #
+    # Cycle-29 (2026-05-13): renamed the lookup keys from ``time_mean``
+    # / ``time_std`` to ``time_normalizer_mean`` / ``time_normalizer_std``
+    # so live actually reads the values cycle-25 persists. Pre-fix,
+    # every prod checkpoint (2026-02/03/04 …) returned (0,) here →
+    # downstream prewarm_from_parquet raised ``operands could not be
+    # broadcast together with shapes (32,2) (0,)`` → live engine ran
+    # the entire session with FROZEN baseline tv_* slots, contributing
+    # ~6vp Δrv_pred drift vs offline (parity audit 2026-05-13). When
+    # the keys are still absent (truly pre-cycle-25 checkpoint), live's
+    # prewarm_from_parquet computes a leakage-safe normalizer from the
+    # past-only prewarm parquet (see ``transvol_history.py`` legacy
+    # fallback path) — mirrors ``run_walkforward_hybrid.py:_resolve_time_normalizer``.
     if "config" in ckpt and ckpt["config"] is not None:
         config = ckpt["config"]
         if "normalizer_mean" in ckpt:
@@ -195,8 +214,14 @@ def load_model_bundle(
         else:
             feat_mean = np.asarray(ckpt.get("feat_mean", [])) if ckpt.get("feat_mean") is not None else np.zeros(0)
             feat_std = np.asarray(ckpt.get("feat_std", [])) if ckpt.get("feat_std") is not None else np.zeros(0)
-        time_mean = np.asarray(ckpt.get("time_mean", [])) if ckpt.get("time_mean") is not None else np.zeros(0)
-        time_std = np.asarray(ckpt.get("time_std", [])) if ckpt.get("time_std") is not None else np.zeros(0)
+        time_mean = (
+            np.asarray(ckpt["time_normalizer_mean"])
+            if ckpt.get("time_normalizer_mean") is not None else np.zeros(0)
+        )
+        time_std = (
+            np.asarray(ckpt["time_normalizer_std"])
+            if ckpt.get("time_normalizer_std") is not None else np.zeros(0)
+        )
     else:
         feat_mean_raw = ckpt.get("feat_mean")
         feat_std_raw = ckpt.get("feat_std")
@@ -209,8 +234,14 @@ def load_model_bundle(
         feat_std = np.asarray(feat_std_raw)
         n_features = int(feat_mean.shape[0])
         config = TransVolConfig(n_features=n_features)
-        time_mean = np.asarray(ckpt.get("time_mean", [])) if ckpt.get("time_mean") is not None else np.zeros(0)
-        time_std = np.asarray(ckpt.get("time_std", [])) if ckpt.get("time_std") is not None else np.zeros(0)
+        time_mean = (
+            np.asarray(ckpt["time_normalizer_mean"])
+            if ckpt.get("time_normalizer_mean") is not None else np.zeros(0)
+        )
+        time_std = (
+            np.asarray(ckpt["time_normalizer_std"])
+            if ckpt.get("time_normalizer_std") is not None else np.zeros(0)
+        )
 
     encoder = TransVolEncoder(config)
     encoder.load_state_dict(ckpt["model_state_dict"])

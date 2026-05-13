@@ -355,6 +355,16 @@ class PaperConfig:
     logs_dir: str = "deribit_paper/logs"
     metrics_parquet: str = "deribit_paper/state/live_metrics.parquet"
     sqlite_db: str = "deribit_paper/state/paper.db"
+    # Cycle-33 (2026-05-13): per-bar feature-trace JSONL path. ``None``
+    # = disabled (production default; zero overhead). When set, the
+    # engine constructs a :class:`BarTraceWriter` and appends one JSONL
+    # line per bar capturing every intermediate value produced by the
+    # signal pipeline (raw inputs → TSRV → SVI → 77-feature vector →
+    # tv embedding → raw y_pred → β* → rv_pred_pct → iv_used → edge
+    # → signal). Diff'd against the offline backtester's parallel trace
+    # by ``scripts/feature_trace_diff.py`` to find the FIRST checkpoint
+    # where live and offline disagree on a given bar.
+    feature_trace_path: str | None = None
 
     # ── Small-account sizing ─────────────────────────────────────────
     # When True, size_position() returns the exchange minimum (0.1 BTC)

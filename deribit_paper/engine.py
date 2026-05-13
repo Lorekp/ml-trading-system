@@ -237,6 +237,11 @@ class TradingEngine:
 
         self.telegram: TelegramNotifier | None = None
         self.metrics_sink: MetricsSink | None = None
+        # Cycle-33 (2026-05-13): feature-trace writer. None until enabled
+        # via ``cfg.feature_trace_path``; when set, every ``process_bar``
+        # writes one JSONL line capturing every intermediate value in the
+        # signal pipeline.
+        self.bar_trace_writer: "BarTraceWriter | None" = None
 
         self.stats = EngineStats()
         self._stop = asyncio.Event()
@@ -1185,6 +1190,13 @@ class TradingEngine:
         )
         await self.telegram.start()
         self.metrics_sink = MetricsSink(path=cfg.metrics_parquet, flush_every=20)
+        # Cycle-33 (2026-05-13): construct the feature-trace writer.
+        # ``path=None`` → :class:`BarTraceWriter` is a no-op (enabled=False);
+        # zero overhead when the operator hasn't opted in.
+        from deribit_paper.diagnostics.bar_trace import BarTraceWriter
+        self.bar_trace_writer = BarTraceWriter(
+            path=getattr(cfg, "feature_trace_path", None),
+        )
 
         self.risk_limits = RiskLimits(
             position_tracker=self.position_tracker,
@@ -2022,6 +2034,35 @@ class TradingEngine:
             bar.tsrv_dataframe(),
             bar_seconds=float(self.config.bar_seconds),
         )
+        # Cycle-33 (2026-05-13): start a feature trace for this bar.
+        # ``None`` when the writer is disabled (production default) —
+        # all downstream code paths fall through cheaply on ``None``.
+        bar_trace = None
+        if self.bar_trace_writer is not None and self.bar_trace_writer.enabled:
+            from deribit_paper.diagnostics.bar_trace import BarTrace
+            bar_trace = BarTrace(bar_close_ts=bar.timestamp, side="live")
+            # C0 raw inputs
+            bar_trace.index_price_close = (
+                float(bar.index_price) if bar.index_price is not None else None
+            )
+            try:
+                bar_trace.bar_open_ts = bar.window_start
+            except Exception:  # noqa: BLE001
+                pass
+            bar_trace.n_perp_trades = int(bar.n_perp_trades)
+            # Cycle-31: ``tsrv_trades`` is the Binance USD-M Futures buffer
+            # (was renamed from "spot" — class name still reads spot for
+            # back-compat, but the venue is futures-perp).
+            bar_trace.n_binance_fut_trades = int(bar.n_tsrv_trades)
+            # C1 TSRV
+            for field_name in (
+                "tsrv", "rv_fast", "rv_slow", "bpv", "medrv",
+                "continuous_var", "jump_var", "jump_fraction",
+                "vol_ann_continuous", "vol_ann",
+            ):
+                v = getattr(bar_tsrv, field_name, None)
+                if v is not None and math.isfinite(float(v)):
+                    setattr(bar_trace, field_name, float(v))
         # NOTE: ``tsrv_history_buffer.append_bar`` for this bar's TSRV is
         # deferred to AFTER ``predictor.predict`` below — see the F-1 fix
         # comment near line ~1925. Pre-fix the append ran here, before
@@ -2287,7 +2328,12 @@ class TradingEngine:
         signal = self.predictor.predict(
             bar=bar, bar_tsrv=bar_tsrv, straddle=straddle,
             transvol_embedding=transvol_embedding,
+            trace=bar_trace,
         )
+        # Cycle-33: flush the trace once the predictor has populated
+        # C2–C8. Writes one JSONL line per bar; no-op when disabled.
+        if bar_trace is not None and self.bar_trace_writer is not None:
+            self.bar_trace_writer.record(bar_trace)
         # D-8 (parity-r3 cycle 2 — 2026-05-08): capture vol_ann_lagged
         # BEFORE the F-1 append below so it reflects bar T-1's vol_ann
         # (the value training env + offline backtester consume as the

@@ -8,6 +8,7 @@ Position sizing uses constant capital (initial_equity) for instant array computa
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,50 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+# ── Cycle-34 (2026-05-13): per-bar feature-trace helpers ─────────
+
+
+def _safe_float(v: object) -> float | None:
+    """Coerce a per-bar value to a JSON-safe float, or None when not finite."""
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x):
+        return None
+    return x
+
+
+def _safe_int(v: object) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iv_source_offline(
+    svi_iv_matched: object,
+    iv_native: object,
+    dvol_close: object,
+) -> str | None:
+    """Replicate the offline 3-tier iv chain to label the source per bar.
+
+    Mirrors ``df["iv_used"] = df["svi_iv_matched"].fillna(df["iv"]).fillna(df["dvol_close"])``
+    in :meth:`Backtester.load_data` ~line 1161.
+    """
+    if _safe_float(svi_iv_matched) is not None:
+        return "svi"
+    if _safe_float(iv_native) is not None:
+        return "iv"
+    if _safe_float(dvol_close) is not None:
+        return "dvol_close"
+    return None
 
 
 # ── Fee math ───────────────────────────────────────────────────
@@ -89,6 +134,21 @@ class BacktestConfig(BaseModel):
     # is supported but drops the first ~7 days due to vrp_baseline warmup.
     start_dt: str | None = None
     end_dt: str | None = None
+
+    # Cycle-34 (2026-05-13): per-bar feature-trace JSONL path. ``None``
+    # (default) → no trace emitted, byte-identical existing behaviour.
+    # When set, after ``_prepare()`` the backtester appends one JSONL
+    # line per bar (filtered to ``trace_start``..``trace_end``) capturing
+    # checkpoints C0 (index_price, dollar-bar counts), C1 (TSRV: vol_ann,
+    # jump_fraction, etc.), C3 (iv_used + iv chain components),
+    # C7 (rv_pred_pct + aligner month key), and C8 (edge, spread,
+    # thresholds, signal). Diff'd against the live engine's
+    # ``bar_trace_live.jsonl`` via ``scripts/feature_trace_diff.py``.
+    # C2 (svi surface params) and C4/C5/C6 are merged in later by
+    # ``scripts/build_offline_bar_trace.py``.
+    feature_trace_path: str | None = None
+    feature_trace_start: str | None = None
+    feature_trace_end: str | None = None
 
     # Dynamic spread model
     base_spread_iv: float = 1.5   # base IV bid-ask spread (vol points)
@@ -3201,7 +3261,117 @@ class VolArbBacktester:
                     100 * (n_long + n_short) / len(df))
 
         df = self.align_exits(df)
+
+        # Cycle-34 (2026-05-13): emit per-bar feature trace if requested.
+        if self.cfg.feature_trace_path:
+            self._emit_feature_trace(df)
+
         return df
+
+    def _emit_feature_trace(self, df: pd.DataFrame) -> None:
+        """Cycle-34: append per-bar checkpoint values to JSONL trace.
+
+        Captures the offline pipeline's view of each bar — checkpoints
+        C0 (raw inputs), C1 (TSRV), C3 (iv chain), C7 (rv_pred_pct +
+        β* key) and C8 (edge + signal). Counterpart to the live
+        engine's ``BarTraceWriter``. ``scripts/build_offline_bar_trace.py``
+        joins this with the predictions-trace (C4 feature vector + C5 tv
+        + C6 raw y_pred) and the SVI params parquet (C2) for a full
+        offline trace JSONL keyed on ``bar_close_ts``.
+
+        Window-bounded by ``feature_trace_start`` / ``feature_trace_end``;
+        all bars emitted when both are None.
+        """
+        import json as _json
+
+        path = Path(self.cfg.feature_trace_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate so re-runs overwrite — matches the live writer's
+        # append-only semantics within a single engine run (one
+        # backtester run = one trace file).
+        path.write_text("", encoding="utf-8")
+
+        d = df
+        if self.cfg.feature_trace_start:
+            start_ts = pd.Timestamp(self.cfg.feature_trace_start)
+            d = d[d.index >= start_ts]
+        if self.cfg.feature_trace_end:
+            end_ts = pd.Timestamp(self.cfg.feature_trace_end)
+            d = d[d.index <= end_ts]
+
+        if d.empty:
+            logger.info(
+                "feature_trace_path set but window is empty — no rows emitted",
+            )
+            return
+
+        col = lambda c: d[c].values if c in d.columns else [None] * len(d)
+        timestamps = d.index
+        index_price = col("index_price")
+        vol_ann = col("vol_ann")
+        jump_fraction = col("jump_fraction")
+        iv_used = col("iv_used")
+        iv_native = col("iv")
+        svi_iv_matched = col("svi_iv_matched")
+        dvol_close = col("dvol_close")
+        rv_pred_pct = col("rv_pred_pct")
+        y_pred = col("y_pred")
+        edge = col("edge")
+        spread_iv = col("spread_iv")
+        signal = col("signal")
+
+        # No-VRP baseline: a base_spread_iv * exp(spread_jump_k * jf)
+        # mirror so we expose ``half_spread`` and the effective long/short
+        # thresholds as the engine sees them.
+        base = float(self.cfg.base_spread_iv)
+        k = float(self.cfg.spread_jump_k)
+        thr = float(self.cfg.entry_threshold)
+        thr_l = float(self.cfg.entry_threshold_long)
+
+        n = 0
+        with path.open("a", encoding="utf-8") as f:
+            for i, ts in enumerate(timestamps):
+                # C8 thresholds derived from this bar's jump_fraction.
+                jf = float(jump_fraction[i]) if jump_fraction[i] is not None else 0.0
+                if not math.isfinite(jf):
+                    jf = 0.0
+                jf = max(0.0, min(1.0, jf))
+                half_spread = base * math.exp(k * jf) / 2.0
+
+                row: dict[str, object] = {
+                    "side": "offline",
+                    "bar_close_ts": pd.Timestamp(ts).isoformat(),
+                    # C0 raw input (index price).
+                    "index_price_close": _safe_float(index_price[i]),
+                    # C1 TSRV outputs (only what's persisted in the parquet).
+                    "jump_fraction": jf,
+                    "vol_ann": _safe_float(vol_ann[i]),
+                    # C3 iv chain.
+                    "svi_iv_at_atm_pct": _safe_float(svi_iv_matched[i]),
+                    "fallback_iv_pct": _safe_float(iv_native[i]),
+                    "fallback_dvol_pct": _safe_float(dvol_close[i]),
+                    "iv_used_pct": _safe_float(iv_used[i]),
+                    "iv_source": _iv_source_offline(
+                        svi_iv_matched[i], iv_native[i], dvol_close[i],
+                    ),
+                    # C7 aligner + rv_pred_pct.
+                    "aligner_month_key": pd.Timestamp(ts).strftime("%Y-%m"),
+                    "y_pred_aligned": _safe_float(y_pred[i]),
+                    "rv_pred_pct": _safe_float(rv_pred_pct[i]),
+                    # C8 signal decision.
+                    "edge_vol_pts": _safe_float(edge[i]),
+                    "base_spread_iv": base,
+                    "spread_jump_k": k,
+                    "half_spread": half_spread,
+                    "effective_long_thresh": half_spread + thr_l,
+                    "effective_short_thresh": half_spread + thr,
+                    "signal_final": _safe_int(signal[i]),
+                }
+                # Strip None values so the diff tool doesn't choke on missing.
+                row_clean = {kk: vv for kk, vv in row.items() if vv is not None}
+                f.write(_json.dumps(row_clean, separators=(",", ":")) + "\n")
+                n += 1
+        logger.info("Cycle-34: emitted %d offline trace rows → %s", n, path)
 
     # ── Delta hedge band sweep ────────────────────────────────
 

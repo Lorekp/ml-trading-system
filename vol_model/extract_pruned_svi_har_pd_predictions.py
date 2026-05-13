@@ -58,6 +58,78 @@ logging.basicConfig(
 logger = logging.getLogger("extract_pruned_svi_har_pd")
 
 
+def _emit_trace_rows(
+    *,
+    path: Path,
+    X: pd.DataFrame,
+    preds: np.ndarray,
+    emb_df: pd.DataFrame,
+    month_str: str,
+    start: pd.Timestamp | None,
+    end: pd.Timestamp | None,
+) -> int:
+    """Cycle-34 (2026-05-13): append per-row feature/tv/y_pred trace lines.
+
+    Schema mirrors the live :class:`deribit_paper.diagnostics.bar_trace.BarTrace`
+    JSONL with checkpoints C4 (``feature_vector``), C5 (``transvol_embedding``)
+    and C6 (``y_pred_raw``). The remaining checkpoints (C0/C1/C2/C3/C7/C8) are
+    populated by ``scripts/build_offline_bar_trace.py`` from the existing
+    ``vol_arb/output/BTC_vol_arb_svi.parquet`` and ``svi_surface_params_15min.parquet``
+    plus the offline backtester's per-bar materialised df.
+
+    Append-only — caller pre-truncates the file once before the per-month
+    loop, then this helper just appends per row.
+
+    Returns the count of rows emitted (post window filter).
+    """
+    if start is not None or end is not None:
+        idx = X.index
+        if start is not None:
+            idx = idx[idx >= start]
+        if end is not None:
+            idx = idx[idx <= end]
+        if len(idx) == 0:
+            return 0
+        X_w = X.loc[idx]
+        preds_w = preds[X.index.isin(idx)]
+        emb_w = emb_df.loc[emb_df.index.isin(idx)]
+    else:
+        X_w = X
+        preds_w = preds
+        emb_w = emb_df
+
+    tv_cols = [c for c in X_w.columns if c.startswith("tv_")]
+
+    n_written = 0
+    with path.open("a", encoding="utf-8") as f:
+        feat_dict_full = X_w.to_dict(orient="index")  # ts → {feat: val}
+        for ts, y_raw in zip(X_w.index, preds_w):
+            row_feats = feat_dict_full.get(ts, {})
+            row: dict[str, object] = {
+                "side": "offline",
+                "bar_close_ts": pd.Timestamp(ts).isoformat(),
+                "month_str": month_str,
+                # C4: 77-named-feature vector (post-winsorize).
+                "feature_vector": {
+                    k: float(v) for k, v in row_feats.items()
+                    if v is not None and pd.notna(v)
+                },
+                # C6: raw LGBM y_pred.
+                "y_pred_raw": float(y_raw),
+                # C7: aligner month key (β* lookup keyed by month).
+                "aligner_month_key": pd.Timestamp(ts).strftime("%Y-%m"),
+            }
+            # C5: tv embedding (extracted from the same X row to guarantee
+            # it's the exact vector LGBM saw, not the un-aligned emb_df).
+            tv_vals = [row_feats.get(c) for c in tv_cols]
+            if all(v is not None and pd.notna(v) for v in tv_vals):
+                row["transvol_embedding"] = [float(v) for v in tv_vals]
+                row["transvol_status"] = "computed"
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+            n_written += 1
+    return n_written
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract pruned+SVI predictions")
     parser.add_argument("--asset", default="BTCUSDT",
@@ -89,6 +161,27 @@ def main() -> None:
                              "are computed on the same target the model saw. "
                              "Auto-applies tag 'excess' when unset, and suffixes "
                              "the output predictions parquet with '_excess'.")
+    parser.add_argument(
+        "--emit-trace-jsonl", type=str, default="",
+        help="Cycle-34 (2026-05-13): when set, append one JSONL line per "
+             "predicted row containing the full 77-feature LGBM input "
+             "vector (post-winsorize, in feat_cols order), tv_0..tv_15, "
+             "and the raw y_pred (pre-β*). Used by "
+             "``scripts/build_offline_bar_trace.py`` to construct the "
+             "offline feature trace that diff'd against the live engine's "
+             "``bar_trace_live.jsonl`` reveals which checkpoint diverges.",
+    )
+    parser.add_argument(
+        "--emit-trace-start", type=str, default="",
+        help="Optional ISO timestamp lower bound for --emit-trace-jsonl. "
+             "When set, only rows with timestamp >= this are emitted. "
+             "Defaults to the entire test window per month.",
+    )
+    parser.add_argument(
+        "--emit-trace-end", type=str, default="",
+        help="Optional ISO timestamp upper bound for --emit-trace-jsonl. "
+             "When set, only rows with timestamp <= this are emitted.",
+    )
     args = parser.parse_args()
     # Auto-tag & output-suffix so excess predictions never clobber defaults.
     if args.predict_excess_logvol and not args.tag and not args.model_dir:
@@ -243,6 +336,21 @@ def main() -> None:
     n_ok = 0
     n_skip = 0
 
+    # Cycle-34: prepare emit-trace window if requested.
+    emit_trace_path = Path(args.emit_trace_jsonl) if args.emit_trace_jsonl else None
+    emit_trace_start = pd.Timestamp(args.emit_trace_start) if args.emit_trace_start else None
+    emit_trace_end = pd.Timestamp(args.emit_trace_end) if args.emit_trace_end else None
+    if emit_trace_path is not None:
+        emit_trace_path.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate so re-runs overwrite (the offline-trace builder
+        # invokes this script as a fresh pass — append-during-same-pass
+        # is preserved because we open in append mode below).
+        emit_trace_path.write_text("", encoding="utf-8")
+        logger.info(
+            "Cycle-34: --emit-trace-jsonl=%s (window=[%s, %s])",
+            emit_trace_path, emit_trace_start, emit_trace_end,
+        )
+
     for i, M in enumerate(months):
         month_str = M.strftime("%Y-%m")
         ckpt = _resolve_checkpoint(M)
@@ -349,6 +457,16 @@ def main() -> None:
             "[%d/%d] %s: %d predictions",
             i + 1, len(months), month_str, len(preds_series),
         )
+
+        # Cycle-34: emit per-row feature/tv/y_pred trace if requested.
+        if emit_trace_path is not None:
+            _emit_trace_rows(
+                path=emit_trace_path,
+                X=X_test_ordered, preds=preds,
+                emb_df=emb_df,
+                month_str=month_str,
+                start=emit_trace_start, end=emit_trace_end,
+            )
 
     if not all_preds:
         logger.error("No predictions extracted — nothing to save")

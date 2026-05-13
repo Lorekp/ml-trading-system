@@ -279,6 +279,50 @@ class LiveSVICalibrator:
         except (KeyError, TypeError, ValueError):
             return None
 
+    def slice_consumed_by_eval(
+        self,
+        *,
+        now: pd.Timestamp,
+        expiry_dt: pd.Timestamp,
+    ) -> dict[str, Any] | None:
+        """Cycle-33 (2026-05-13): return the slice that ``evaluate`` would consume.
+
+        Mirrors the ``evaluate_surface_batch`` merge_asof contract:
+        most recent bucket with ``timestamp <= now`` matching the same
+        ``YYYY-MM-DD`` expiry key. Used by the per-bar feature trace
+        writer to dump SVI surface state (a, b, rho, m, sigma, T, F,
+        rmse, n_strikes, level, bucket_ts) for live↔offline diff.
+
+        Returns ``None`` when the calibrator is uncalibrated OR no
+        slice exists for the requested expiry at the requested time.
+        """
+        if self._params_df is None or self._params_df.empty:
+            return None
+        if "expiry_dt" not in self._params_df.columns:
+            return None
+        target_key = pd.to_datetime(expiry_dt, utc=True).strftime("%Y-%m-%d")
+        params = self._params_df
+        exp_keys = pd.to_datetime(params["expiry_dt"], utc=True).dt.strftime("%Y-%m-%d")
+        matching = params[(exp_keys.values == target_key)
+                          & (params["timestamp"] <= pd.Timestamp(now))]
+        if matching.empty:
+            return None
+        latest_ts = matching["timestamp"].max()
+        row = matching[matching["timestamp"] == latest_ts].iloc[0]
+        out: dict[str, Any] = {"bucket_ts": pd.Timestamp(latest_ts)}
+        for col in ("expiry_dt", "T", "F", "a", "b", "rho", "m", "sigma",
+                    "rmse", "level", "n_strikes"):
+            if col in row.index:
+                v = row[col]
+                if isinstance(v, pd.Timestamp):
+                    out[col] = pd.Timestamp(v)
+                else:
+                    try:
+                        out[col] = float(v) if v is not None and pd.notna(v) else None
+                    except (TypeError, ValueError):
+                        out[col] = None
+        return out
+
     def atm_vol_at_dte(
         self,
         dte_days: float,

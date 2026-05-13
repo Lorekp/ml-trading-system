@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,9 @@ from deribit_paper.features.svi_live import LiveSVICalibrator
 from deribit_paper.features.tsrv_live import BarTSRV, compute_bar_tsrv
 from deribit_paper.market_data.aggregator import Bar
 from deribit_paper.signal.feature_assembler import FeatureAssembler
+
+if TYPE_CHECKING:
+    from deribit_paper.diagnostics.bar_trace import BarTrace  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +151,7 @@ class Predictor:
         *,
         straddle: StraddleSelection | None = None,
         transvol_embedding: np.ndarray | None = None,
+        trace: "BarTrace | None" = None,
     ) -> Signal:
         """Generate the signal for one bar.
 
@@ -164,9 +168,31 @@ class Predictor:
         transvol_embedding : np.ndarray, optional
             The 16-dim TransVol embedding for this bar.  If None, the
             assembler will fall back to baseline (stale) values.
+        trace : BarTrace, optional
+            Cycle-33 (2026-05-13): when provided (engine ran with
+            ``feature_trace_path`` set), the predictor mutates this in
+            place to capture the per-bar C2–C8 intermediate values
+            (SVI surface state, 77-feature vector, tv embedding, raw
+            y_pred, β*, rv_pred_pct, edge, signal). The engine writes
+            it out via :class:`BarTraceWriter` after this method returns.
+            Default ``None`` = production behaviour, zero cost.
         """
         # 1) Build the 51-dim feature row for LightGBM
         row = self._assembler.build_row(bar, bar_tsrv, transvol_embedding)
+        # Cycle-33 C4 + C5: capture the LGBM input row + tv embedding.
+        if trace is not None and row is not None:
+            try:
+                trace.feature_vector = {k: float(v) for k, v in row.as_dict.items()}
+            except Exception:  # noqa: BLE001
+                pass
+            if transvol_embedding is not None:
+                trace.transvol_embedding = [float(x) for x in transvol_embedding]
+                trace.transvol_status = "computed"
+            else:
+                trace.transvol_status = "warmup_fallback"
+            trace.transvol_window_size = (
+                len(transvol_embedding) if transvol_embedding is not None else 0
+            )
 
         # R1: If the assembler detected NaN features, it returns None → flat signal
         if row is None:
@@ -182,6 +208,12 @@ class Predictor:
         # (y_pred = y_pred_raw + β*_month). Lookup falls back to the
         # most-recent-prior month when ``aligner_betas`` lags real time.
         pred_ln_raw = float(self._bundle.lgbm_model.predict(row.values.reshape(1, -1))[0])
+        # Cycle-33 C6: raw LGBM y_pred (pre-β*).
+        if trace is not None:
+            trace.y_pred_raw = pred_ln_raw
+            sha = getattr(self._bundle, "lgbm_sha256", None)
+            if sha:
+                trace.lgbm_model_sha256 = str(sha)
         if self._aligner_betas:
             from vol_arb.sidecars import lookup_beta_for_month
             beta_star = lookup_beta_for_month(
@@ -216,6 +248,12 @@ class Predictor:
             )
         rv_pred_decimal = math.exp(pred_ln)
         rv_pred_pct = rv_pred_decimal * 100.0
+        # Cycle-33 C7: aligner + exp() outputs.
+        if trace is not None:
+            trace.aligner_month_key = bar.timestamp.strftime("%Y-%m")
+            trace.beta_star = float(beta_star) if self._aligner_betas else 0.0
+            trace.y_pred_aligned = float(pred_ln)
+            trace.rv_pred_pct = float(rv_pred_pct)
 
         # 3) Resolve iv_used via the 2-tier fallback chain (S-3, parity-r3
         #    cycle 2 — 2026-05-08). Primary: SVI at the ATM strike (the
@@ -230,6 +268,37 @@ class Predictor:
                 reason="iv_used unavailable (no SVI slice, no straddle, no TSRV)",
             )
         iv_used_pct, iv_source = iv_lookup
+        # Cycle-33 C2 + C3: SVI surface state + ATM eval result.
+        if trace is not None and straddle is not None:
+            try:
+                slice_used = self._svi.slice_consumed_by_eval(
+                    now=bar.timestamp, expiry_dt=straddle.expiry_dt,
+                )
+            except Exception:  # noqa: BLE001
+                slice_used = None
+            if slice_used is not None:
+                trace.svi_bucket_ts = slice_used.get("bucket_ts")
+                trace.svi_expiry_dt = slice_used.get("expiry_dt")
+                trace.svi_a = slice_used.get("a")
+                trace.svi_b = slice_used.get("b")
+                trace.svi_rho = slice_used.get("rho")
+                trace.svi_m = slice_used.get("m")
+                trace.svi_sigma = slice_used.get("sigma")
+                trace.svi_T_years = slice_used.get("T")
+                trace.svi_F = slice_used.get("F")
+                trace.svi_rmse = slice_used.get("rmse")
+                trace.svi_level = slice_used.get("level")
+                n_strikes = slice_used.get("n_strikes")
+                trace.svi_n_strikes = (
+                    int(n_strikes) if n_strikes is not None and math.isfinite(n_strikes) else None
+                )
+                bucket_ts = slice_used.get("bucket_ts")
+                if bucket_ts is not None:
+                    age_s = (bar.timestamp - bucket_ts).total_seconds()
+                    trace.svi_age_seconds = float(age_s)
+            trace.atm_strike = float(straddle.strike)
+            trace.iv_used_pct = float(iv_used_pct)
+            trace.iv_source = iv_source
 
         # 4) Edge + signal direction — mirrors backtester's generate_signals() exactly:
         #    dynamic half-spread widens the effective threshold during stress
@@ -336,6 +405,26 @@ class Predictor:
                 "Signal @ %s: %s",
                 bar.timestamp, reason,
             )
+
+        # Cycle-33 C8: edge + signal-decision intermediates.
+        if trace is not None:
+            trace.edge_vol_pts = float(edge)
+            trace.base_spread_iv = float(self._base_spread_iv)
+            trace.spread_jump_k = float(self._spread_jump_k)
+            trace.half_spread = float(half_spread)
+            trace.effective_long_thresh = float(effective_long)
+            trace.effective_short_thresh = float(effective_short)
+            # signal_raw = direction before filter suppression. We can
+            # recover it from edge vs the bare thresholds (excluding
+            # contango/hour/skew/circuit-breaker overrides).
+            if edge > effective_long:
+                trace.signal_raw = 1
+            elif edge < -effective_short:
+                trace.signal_raw = -1
+            else:
+                trace.signal_raw = 0
+            trace.signal_final = int(direction)
+            trace.filter_reason = reason
 
         # D1 (parity-cycle round 2 — 2026-05-07): pull the SVI slice
         # params for the picked straddle's expiry so the DRL hedger can

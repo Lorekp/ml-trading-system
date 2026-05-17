@@ -67,6 +67,7 @@ SOURCE_FILES=(
     "vol_model/transvol/model.py"
     "vol_model/transvol/config.py"
     "TSRV/tsrv_series.py"
+    "TSRV/config.py"                                    # cycle-39: TSRV sub-bar threshold SSOT
 
     # DRL training module — referenced by SAC v4 pickle's _schedule
     # callable; needs to be importable on the homeserver even though

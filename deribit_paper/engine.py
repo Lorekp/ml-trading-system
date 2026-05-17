@@ -46,6 +46,7 @@ from deribit_paper.execution.profit_scale import (
     bsm_vega_per_vol_pt,
 )
 from deribit_paper.features import LiveSVICalibrator, StrikePicker, compute_bar_tsrv
+from TSRV.config import BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD
 from deribit_paper.features.dollar_bar import DollarBarAggregator
 from deribit_paper.features.dollar_bar_buffer import DollarBarBuffer
 from deribit_paper.features.dollar_bar_stream import DollarBarSpotStream
@@ -2082,9 +2083,15 @@ class TradingEngine:
         # spot aggTrades. ``Bar.tsrv_dataframe()`` returns the perp
         # DataFrame if ``Bar.tsrv_trades`` is None (back-compat for
         # tests and any non-spot-wired path).
+        # Cycle-39 (2026-05-17): pass the sub-bar dollar threshold
+        # explicitly from the SSOT constant so this call site greps
+        # back to the canonical value the offline TSRV parquet uses.
+        # ``compute_bar_tsrv`` already defaults to the same constant;
+        # naming it here makes the live↔offline contract explicit.
         bar_tsrv = compute_bar_tsrv(
             bar.tsrv_dataframe(),
             bar_seconds=float(self.config.bar_seconds),
+            dollar_threshold_usd=BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD,
         )
         # Cycle-33 (2026-05-13): start a feature trace for this bar.
         # ``None`` when the writer is disabled (production default) —

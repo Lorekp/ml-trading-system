@@ -50,25 +50,30 @@ logger = logging.getLogger("TSRV-incremental")
 def _resolve_threshold(
     cli_threshold: float | None, parquet_path: Path,
 ) -> float:
-    """Resolve the sub-bar threshold from CLI or a sidecar txt.
+    """Resolve the sub-bar threshold from CLI, a sidecar txt, or the SSOT.
 
     Priority:
     1. ``--threshold`` if passed.
     2. Sidecar ``{parquet_stem}_threshold.txt`` next to the parquet.
-    3. Hard-fail (incremental runs must NOT recalibrate — that would
-       change historical TSRV values vs the canonical batch).
+    3. Cycle-39 (2026-05-17): the SSOT constant
+       ``TSRV.config.BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD`` — the
+       single canonical value the live engine's ``compute_bar_tsrv``
+       also reads. Pre-cycle-39 this branch hard-failed; the SSOT
+       removes the "forgot --threshold" foot-gun while still keeping
+       the value pinned in exactly one place.
     """
     if cli_threshold is not None:
         return float(cli_threshold)
     sidecar = parquet_path.with_name(parquet_path.stem + "_threshold.txt")
     if sidecar.exists():
         return float(sidecar.read_text().strip())
-    raise SystemExit(
-        f"No threshold passed and no sidecar at {sidecar}. "
-        f"Pass --threshold <value> from the original batch calibration to "
-        f"preserve byte-identity with the canonical TSRV parquet. "
-        f"For BTCUSDT 15m production this is typically 250000."
+    from TSRV.config import BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD
+    logger.warning(
+        "No --threshold and no sidecar %s; falling back to SSOT "
+        "BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD=%.0f",
+        sidecar, BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD,
     )
+    return float(BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD)
 
 
 def main() -> int:

@@ -3,6 +3,24 @@
 from pydantic import BaseModel, Field
 
 
+# ── Cycle-39 (2026-05-17): canonical sub-bar dollar threshold SSOT ──
+#
+# The production BTCUSDT 15-min TSRV series
+# (``TSRV/output/BTCUSDT_tsrv_15m.parquet``) is built with this
+# sub-bar dollar threshold (via ``run_tsrv_incremental --threshold``).
+# The live engine's ``compute_bar_tsrv`` MUST use the IDENTICAL value
+# or its TSRV decomposition diverges from the offline pipeline.
+#
+# Parity audit 2026-05-17: live ``compute_bar_tsrv`` defaulted to
+# 50_000 while the offline parquet was built at 250_000 — a 5x
+# mismatch that biased live ``jump_fraction`` +0.167 and ``vol_ann``
+# by ~0.09 over a 377-bar window. Both paths share
+# ``compute_tsrv_window``; only this threshold differed. This module
+# constant is the single source of truth: ``deribit_paper`` imports
+# it for the live engine, ``run_tsrv_incremental`` falls back to it.
+BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD: float = 250_000.0
+
+
 class TSRVConfig(BaseModel):
     # Data
     tick_dir: str = "data/bookTicker_parquet"

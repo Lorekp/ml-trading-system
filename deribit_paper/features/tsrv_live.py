@@ -28,14 +28,19 @@ from dataclasses import asdict, dataclass
 import numpy as np
 import pandas as pd
 
+from TSRV.config import BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD
 from TSRV.tsrv_series import compute_tsrv_window
 
 logger = logging.getLogger(__name__)
 
 
-# Default dollar-bar threshold: 50k USD.  Matches the batch TSRV config
-# default for BTC.  Can be overridden per-call.
-DEFAULT_DOLLAR_THRESHOLD_USD: float = 50_000.0
+# Cycle-39 (2026-05-17): the sub-bar dollar threshold MUST match the
+# value the offline ``BTCUSDT_tsrv_15m.parquet`` was built with, or
+# live TSRV (jump_fraction, vol_ann) diverges from the backtester.
+# Pre-cycle-39 this was a bare 50_000 with a stale comment claiming it
+# "matches the batch TSRV config" — it did not (offline uses 250_000).
+# Now sourced from the single SSOT constant in ``TSRV/config.py``.
+DEFAULT_DOLLAR_THRESHOLD_USD: float = BTCUSDT_TSRV_15M_SUBBAR_THRESHOLD_USD
 
 # Seconds in a year — Zhang-style annualisation.  The batch pipeline
 # uses the same value (365.25 * 24 * 3600).

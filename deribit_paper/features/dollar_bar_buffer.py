@@ -171,6 +171,37 @@ class DollarBarBuffer:
             return None
         return self._bars[-1]
 
+    def snapshot_before(self, cutoff: pd.Timestamp) -> "DollarBarBuffer":
+        """Cycle-41 (2026-05-17): a frozen buffer view of bars BEFORE ``cutoff``.
+
+        The live ``DollarBarBuffer`` is fed continuously by the async
+        Binance poll loop, so by the time ``FeatureAssembler.build_row``
+        runs for decision bar T the buffer ALREADY holds dollar bars
+        that completed a few seconds AFTER T. Offline computes
+        per-dollar-bar features then aggregates with
+        ``groupby(index.floor("15min")).last()`` — the feature row
+        covering ``[T-15min, T)`` strictly excludes anything ``>= T``.
+
+        Reading the absolute buffer tail (``latest_bar()``,
+        ``as_dataframe()``) therefore contaminates every dollar-bar
+        feature (``n_trades``, ``duration_s`` and their lag/EMA
+        variants) with post-T bars. ``build_row`` takes ONE snapshot at
+        the top so every downstream consumer — :class:`DollarBarFeatures`,
+        the ``n_trades``/``duration_s`` handlers, ``n_bars_in_window``,
+        the TSRV-dollar-bar grid — sees the same clamped view.
+
+        Returns a NEW ``DollarBarBuffer`` (the originals are shared by
+        reference — bars are immutable dataclasses, so this is cheap and
+        safe). The async poll loop keeps appending to the original; the
+        snapshot stays frozen for the duration of the bar.
+        """
+        cut = pd.Timestamp(cutoff)
+        snap = DollarBarBuffer(max_size=self._max_size)
+        for bar in self._bars:
+            if pd.Timestamp(bar.timestamp) < cut:
+                snap._bars.append(bar)
+        return snap
+
     def timestamp_at(self, idx: int) -> pd.Timestamp | None:
         """S-1d (parity-r3 cycle 7 — 2026-05-08): timestamp of the bar
         at position ``idx``.

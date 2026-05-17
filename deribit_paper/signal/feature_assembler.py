@@ -1519,6 +1519,20 @@ class FeatureAssembler:
         # append the current bar's TSRV — strict-past contract.
         har_pd_features = self._har_pd_state.compute_features()
 
+        # Cycle-41 (2026-05-17): snapshot the dollar-bar buffer to bars
+        # STRICTLY BEFORE this bar's close. The async Binance poll loop
+        # keeps appending dollar bars that complete AFTER T; offline's
+        # ``groupby(index.floor("15min")).last()`` window for the
+        # ``[T-15min, T)`` feature row excludes anything ``>= T``.
+        # Taking ONE snapshot here means every downstream consumer
+        # (DollarBarFeatures, the n_trades/duration_s handlers,
+        # n_bars_in_window, the TSRV-dollar-bar grid) sees the same
+        # clamped view — no per-handler post-T contamination.
+        dollar_bar_buffer_snap = (
+            self._dollar_bar_buffer.snapshot_before(bar.timestamp)
+            if self._dollar_bar_buffer is not None else None
+        )
+
         # F3 Tier 3 (parity-cycle round 3 — 2026-05-07): build a
         # ``DollarBarFeatures`` cached view over the live buffer. Each
         # of the 16 dollar-bar handlers reads from this view; the cache
@@ -1527,8 +1541,8 @@ class FeatureAssembler:
         # (engine warmup / test fixtures); handlers detect that and
         # fall back to baseline.
         dollar_bar_features = (
-            DollarBarFeatures(self._dollar_bar_buffer)
-            if self._dollar_bar_buffer is not None else None
+            DollarBarFeatures(dollar_bar_buffer_snap)
+            if dollar_bar_buffer_snap is not None else None
         )
 
         # F3 Tier 5: same pattern for the TSRV history buffer.
@@ -1540,11 +1554,11 @@ class FeatureAssembler:
         # S-1d (parity-r3 cycle 7 — 2026-05-08): TSRV-on-dollar-bar-
         # grid wrapper, byte-equivalent to offline. Constructed only
         # when both buffers are wired; falls through to ``tsrv_features``
-        # otherwise.
+        # otherwise. Cycle-41: uses the <T dollar-bar snapshot.
         tsrv_db_features = (
-            TSRVDollarBarFeatures(self._tsrv_history_buffer, self._dollar_bar_buffer)
+            TSRVDollarBarFeatures(self._tsrv_history_buffer, dollar_bar_buffer_snap)
             if (self._tsrv_history_buffer is not None
-                and self._dollar_bar_buffer is not None)
+                and dollar_bar_buffer_snap is not None)
             else None
         )
 
@@ -1554,7 +1568,7 @@ class FeatureAssembler:
             svi_calibrator=self._svi_calibrator,
             baseline_row=self._baseline_row,
             har_pd_features=har_pd_features,
-            dollar_bar_buffer=self._dollar_bar_buffer,
+            dollar_bar_buffer=dollar_bar_buffer_snap,
             dollar_bar_features=dollar_bar_features,
             tsrv_history_buffer=self._tsrv_history_buffer,
             tsrv_features=tsrv_features,
@@ -1687,9 +1701,16 @@ class FeatureAssembler:
         # handler sees the same dependency graph (HAR-PD, dollar-bar
         # cached features, TSRV cached features, funding provider).
         har_pd_features = self._har_pd_state.compute_features()
-        dollar_bar_features = (
-            DollarBarFeatures(self._dollar_bar_buffer)
+        # Cycle-41 (2026-05-17): same <T dollar-bar snapshot as build_row
+        # so the TransVol encoder input row is free of post-T-bar
+        # contamination (otherwise the tv_* embedding diverges).
+        dollar_bar_buffer_snap = (
+            self._dollar_bar_buffer.snapshot_before(bar.timestamp)
             if self._dollar_bar_buffer is not None else None
+        )
+        dollar_bar_features = (
+            DollarBarFeatures(dollar_bar_buffer_snap)
+            if dollar_bar_buffer_snap is not None else None
         )
         tsrv_features = (
             TSRVFeatures(self._tsrv_history_buffer)
@@ -1697,9 +1718,9 @@ class FeatureAssembler:
         )
         # S-1d (parity-r3 cycle 7): TSRV-on-dollar-bar-grid wrapper.
         tsrv_db_features = (
-            TSRVDollarBarFeatures(self._tsrv_history_buffer, self._dollar_bar_buffer)
+            TSRVDollarBarFeatures(self._tsrv_history_buffer, dollar_bar_buffer_snap)
             if (self._tsrv_history_buffer is not None
-                and self._dollar_bar_buffer is not None)
+                and dollar_bar_buffer_snap is not None)
             else None
         )
         ctx = AssemblerContext(
@@ -1708,7 +1729,7 @@ class FeatureAssembler:
             svi_calibrator=self._svi_calibrator,
             baseline_row=self._baseline_row,
             har_pd_features=har_pd_features,
-            dollar_bar_buffer=self._dollar_bar_buffer,
+            dollar_bar_buffer=dollar_bar_buffer_snap,
             dollar_bar_features=dollar_bar_features,
             tsrv_history_buffer=self._tsrv_history_buffer,
             tsrv_features=tsrv_features,

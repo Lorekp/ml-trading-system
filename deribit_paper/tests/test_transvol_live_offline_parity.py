@@ -213,10 +213,24 @@ def parity_setup():
         funding_provider=funding_provider,
     )
 
-    # The bar we'll replay: the latest timestamp in the offline parquet.
-    bar_ts = features_df.index[-1]
+    # The bar we'll replay. ``features_df`` is the RAW offline features
+    # parquet — FLOOR-labeled by ``_window_and_aggregate``: row L
+    # aggregates dollar bars in ``[L, L+15min)``. The live ``Bar`` is
+    # END-stamped (``aggregator.py``: bar T covers ``[T-15min, T)`` —
+    # see cycle-23). So a live bar END-stamped ``E`` corresponds to the
+    # offline feature row labeled ``E - 15min``.
+    #
+    # Cycle-41 (2026-05-17): pre-cycle-40 the funding handlers read
+    # ``buf.latest_bar()`` (the absolute buffer tail), ignoring
+    # ``bar.timestamp`` entirely — so this fixture passed even though
+    # it set ``bar.timestamp`` to the FLOOR label (15min too early).
+    # Cycle-40/41 made the handlers respect ``bar.timestamp`` (clamp to
+    # ``< bar.timestamp``); the fixture must now END-stamp the bar
+    # correctly: ``bar_close_ts = offline_floor_label + 15min``.
+    offline_label_ts = features_df.index[-1]
+    bar_close_ts = offline_label_ts + pd.Timedelta(minutes=15)
     bar = Bar(
-        timestamp=bar_ts, bar_minutes=15,
+        timestamp=bar_close_ts, bar_minutes=15,
         perp_trades=[], option_trades=[],
         index_price=70_000.0,
     )
@@ -244,17 +258,19 @@ def parity_setup():
         vol_ann_continuous=float(tsrv_latest["vol_ann"] * 0.99),
     )
 
-    # Advance funding provider through the bar timestamp.
-    funding_provider.advance(bar_ts)
+    # Advance funding provider through the bar's END timestamp.
+    funding_provider.advance(bar_close_ts)
 
     feats, time_feats = assembler.assemble_transvol_input_row(bar, bar_tsrv)
-    offline_row = features_df.loc[bar_ts, list(TRANSVOL_INPUT_COLUMNS)]
+    # The live END-stamped bar ``bar_close_ts`` maps to the offline
+    # FLOOR-labeled feature row ``offline_label_ts`` (= bar_close_ts - 15min).
+    offline_row = features_df.loc[offline_label_ts, list(TRANSVOL_INPUT_COLUMNS)]
 
     return {
         "live_feats": feats,
         "live_time_feats": time_feats,
         "offline_row": offline_row,
-        "bar_ts": bar_ts,
+        "bar_ts": offline_label_ts,
     }
 
 

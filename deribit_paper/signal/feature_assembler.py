@@ -406,6 +406,38 @@ def _time_to_funding_seconds(ts: pd.Timestamp) -> float:
     return (24.0 - h) * 3600.0
 
 
+def _dollar_bar_timestamps_before(ctx: AssemblerContext) -> pd.DatetimeIndex:
+    """Cycle-40 (2026-05-17): dollar-bar timestamps STRICTLY BEFORE the
+    decision bar's close.
+
+    The live ``DollarBarBuffer`` is fed continuously by the Binance
+    poll loop, so at ``process_bar`` time for bar T it already holds
+    dollar bars that completed a few seconds AFTER T (the engine runs
+    ~30s past the boundary). Offline computes per-dollar-bar features
+    then aggregates with ``groupby(index.floor("15min")).last()`` — the
+    feature row covering ``[T-15min, T)`` strictly excludes anything
+    ``>= T``.
+
+    Pre-cycle-40 the funding handlers read ``buf.latest_bar()`` /
+    ``buf.timestamp_at(-n)`` / ``buf.as_index()`` — all anchored on the
+    ABSOLUTE buffer tail, which includes post-T bars. For
+    ``time_to_funding`` — a sawtooth that resets at the 8h funding
+    boundaries (08/16/24 UTC) — picking a post-T bar when T itself is
+    near a boundary reads the WRONG side of the reset, a ~28800s
+    error. Clamping to ``< ctx.bar.timestamp`` reproduces offline's
+    window exactly.
+
+    Returns an empty index when no buffer is wired (warmup / test
+    fixtures); callers fall back to the bar timestamp.
+    """
+    buf = getattr(ctx, "dollar_bar_buffer", None)
+    if buf is None or len(buf) == 0:
+        return pd.DatetimeIndex([], tz="UTC", name="timestamp")
+    idx = buf.as_index()
+    cutoff = pd.Timestamp(ctx.bar.timestamp)
+    return idx[idx < cutoff]
+
+
 def _effective_timestamp_for_funding(ctx: AssemblerContext) -> pd.Timestamp:
     """Pick the timestamp the offline pipeline used for time_to_funding.
 
@@ -413,18 +445,16 @@ def _effective_timestamp_for_funding(ctx: AssemblerContext) -> pd.Timestamp:
     ``time_to_funding`` on the dollar-bar grid, then aggregates to
     15-min via ``groupby(window_labels).last()`` — i.e. the value at
     the 15-min row is the LAST dollar bar's value in that window.
-    Pre-cycle-6 the live handler used ``ctx.bar.timestamp`` (the
-    15-min wall-clock boundary), which deviates by up to ~15 minutes
-    from the offline last-dollar-bar timestamp. The fix: when a
-    ``DollarBarBuffer`` is present, use its latest bar's timestamp
-    instead. Falls back to the bar timestamp when no buffer is wired
-    (test fixtures, cold start).
+
+    Cycle-40 (2026-05-17): use the last dollar bar STRICTLY BEFORE the
+    bar close (see :func:`_dollar_bar_timestamps_before`). Cycle-6 used
+    ``buf.latest_bar()`` — the absolute buffer tail — which the async
+    poll loop has already advanced past the boundary by process_bar
+    time. Falls back to the bar timestamp when no buffer is wired.
     """
-    buf = getattr(ctx, "dollar_bar_buffer", None)
-    if buf is not None and len(buf) > 0:
-        last = buf.latest_bar()
-        if last is not None and last.timestamp is not None:
-            return pd.Timestamp(last.timestamp)
+    before = _dollar_bar_timestamps_before(ctx)
+    if len(before) > 0:
+        return pd.Timestamp(before[-1])
     return ctx.bar.timestamp
 
 
@@ -446,25 +476,29 @@ def _h_time_to_funding_lag1(ctx: AssemblerContext) -> float:
     sub-15-min DollarBarBuffer timestamps. Offline computes
     ``series.shift(1)`` on the dollar-bar grid; the n-th-prior dollar
     bar's timestamp is what offline reads, NOT the 15-min wall-clock
-    earlier value. Falls back to the cycle-6 ``eff_ts - 15min`` path
-    when no DollarBarBuffer is wired.
+    earlier value.
+
+    Cycle-40 (2026-05-17): walk back through the dollar bars STRICTLY
+    BEFORE the bar close — ``before[-2]`` — not the absolute buffer
+    tail (which the poll loop has advanced past T). Falls back to the
+    ``eff_ts - 15min`` path when no buffer is wired.
     """
-    buf = getattr(ctx, "dollar_bar_buffer", None)
-    if buf is not None and len(buf) >= 2:
-        prev_ts = buf.timestamp_at(-2)
-        if prev_ts is not None:
-            return _time_to_funding_seconds(prev_ts)
+    before = _dollar_bar_timestamps_before(ctx)
+    if len(before) >= 2:
+        return _time_to_funding_seconds(pd.Timestamp(before[-2]))
     eff_ts = _effective_timestamp_for_funding(ctx)
     return _time_to_funding_seconds(eff_ts - pd.Timedelta(minutes=15))
 
 
 def _h_time_to_funding_lag3(ctx: AssemblerContext) -> float:
-    """time_to_funding at the 3-bars-prior dollar bar."""
-    buf = getattr(ctx, "dollar_bar_buffer", None)
-    if buf is not None and len(buf) >= 4:
-        prev_ts = buf.timestamp_at(-4)
-        if prev_ts is not None:
-            return _time_to_funding_seconds(prev_ts)
+    """time_to_funding at the 3-bars-prior dollar bar.
+
+    Cycle-40 (2026-05-17): ``before[-4]`` over the dollar bars strictly
+    before the bar close (see :func:`_dollar_bar_timestamps_before`).
+    """
+    before = _dollar_bar_timestamps_before(ctx)
+    if len(before) >= 4:
+        return _time_to_funding_seconds(pd.Timestamp(before[-4]))
     eff_ts = _effective_timestamp_for_funding(ctx)
     return _time_to_funding_seconds(eff_ts - pd.Timedelta(minutes=15 * 3))
 
@@ -481,14 +515,19 @@ def _time_to_funding_ema_on_dollar_bars(
     .last()``. The latest dollar bar IS the last in the current
     15-min window so its EMA value matches offline byte-equal.
 
+    Cycle-40 (2026-05-17): the EWM runs over the dollar-bar
+    timestamps STRICTLY BEFORE the bar close (see
+    :func:`_dollar_bar_timestamps_before`) — the absolute buffer tail
+    includes post-T bars the async poll loop appended, which offline's
+    ``groupby(floor("15min")).last()`` window excludes.
+
     Falls back to the cycle-6 15-min-cadence reconstruction when no
     DollarBarBuffer is wired.
     """
-    buf = getattr(ctx, "dollar_bar_buffer", None)
-    if buf is not None and len(buf) > 0:
-        timestamps = list(buf.as_index())
+    before = _dollar_bar_timestamps_before(ctx)
+    if len(before) > 0:
         series = pd.Series(
-            [_time_to_funding_seconds(t) for t in timestamps],
+            [_time_to_funding_seconds(t) for t in before],
             dtype=np.float64,
         )
         ema_val = series.ewm(span=span, adjust=True, min_periods=1).mean().iloc[-1]

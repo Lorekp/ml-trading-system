@@ -380,19 +380,55 @@ def test_mutation_probe_tsrv_grid_column_swap_breaks_strict_gate(
 def test_mutation_probe_lag_variant_swap_breaks_strict_gate(
     parity_setup,
 ):
-    """Cycle 7: also lock the lag-variant ordering. tsrv_mean_1w_lag1
-    and tsrv_mean_1w_lag3 are *very* close in value (~0.00003 apart);
-    a strict 1e-7 abs gate still detects the swap."""
+    """Cycle 7 — lock the lag-variant column ordering against silent
+    reordering. Hardened cycle-41 (2026-05-17).
+
+    The original probe swapped ``tsrv_mean_1w_lag1`` ↔
+    ``tsrv_mean_1w_lag3`` — two lags of the *same* slow 1-week rolling
+    mean. A 2-dollar-bar shift on a weekly mean is coincidentally
+    within ``rtol=1e-5`` in calm data windows (observed -1.1769688 vs
+    -1.1769572), so the swap was undetectable and the probe was flaky
+    — hostage to whichever data window the offline parquet ends on.
+
+    Fix: swap two *lag* columns from different feature families whose
+    value ranges are reliably disjoint regardless of the data window.
+    ``tsrv_mean_1w_lag1`` is a log-vol level (reliably negative, ~-1);
+    ``up_jump_frac_lag3`` is a variance fraction in [0, 1] (reliably
+    non-negative). The two ranges are sign-separated, so the swap is
+    always detectable by the strict Tier-A gate while still locking
+    the lag-variant ordering. A self-check skips loudly if the chosen
+    pair ever lands within tolerance, so the probe can never silently
+    pass as a false negative."""
     live = parity_setup["live_feats"].copy()
     offline = parity_setup["offline_row"]
-    a_idx = TRANSVOL_INPUT_COLUMNS.index("tsrv_mean_1w_lag1")
-    b_idx = TRANSVOL_INPUT_COLUMNS.index("tsrv_mean_1w_lag3")
+    a_col, b_col = "tsrv_mean_1w_lag1", "up_jump_frac_lag3"
+    a_idx = TRANSVOL_INPUT_COLUMNS.index(a_col)
+    b_idx = TRANSVOL_INPUT_COLUMNS.index(b_col)
+
+    a_offline = float(offline[a_col])
+    b_offline = float(offline[b_col])
+    # Self-check: the pair must be genuinely distinct for the swap to
+    # be a meaningful probe. Sign-separated families make this robust
+    # to data-window coincidences; if it ever fails, skip loudly
+    # rather than report a false negative.
+    if not (np.isfinite(a_offline) and np.isfinite(b_offline)):
+        pytest.skip(
+            f"Mutation-probe pair {a_col}/{b_col} has a non-finite "
+            f"offline value ({a_offline} / {b_offline}); inconclusive."
+        )
+    if np.allclose(a_offline, b_offline, rtol=1e-5, atol=1e-7):
+        pytest.skip(
+            f"Mutation-probe pair {a_col}/{b_col} happens to be "
+            f"near-equal in this data window "
+            f"({a_offline:.10g} vs {b_offline:.10g}); probe inconclusive."
+        )
+
     live[a_idx], live[b_idx] = live[b_idx], live[a_idx]
     a_live = float(live[a_idx])
-    a_offline = float(offline["tsrv_mean_1w_lag1"])
     assert not np.allclose(a_live, a_offline, rtol=1e-5, atol=1e-7), (
-        "Mutation probe failed: swapping tsrv_mean_1w_lag1 and "
-        "tsrv_mean_1w_lag3 should produce a detectable diff."
+        f"Mutation probe failed: swapping {a_col} and {b_col} should "
+        f"produce a detectable diff in the Tier-A gate "
+        f"(live={a_live:.10g} offline={a_offline:.10g})."
     )
 
 

@@ -3291,6 +3291,29 @@ class VolArbBacktester:
         # backtester run = one trace file).
         path.write_text("", encoding="utf-8")
 
+        # Cycle-38b (2026-05-17): the TSRV-derived columns of
+        # ``BTC_vol_arb_svi.parquet`` are OPEN-stamped — row T carries
+        # the TSRV of ``[T, T+15min)`` (verified: compute_bar_tsrv over
+        # [14:00,14:15) reproduces the parquet's 14:00 row n_ticks +
+        # vol_ann exactly). The LIVE engine END-stamps — bar T uses
+        # ``[T-15min, T)``. The cycle-33/34/35 trace comparator joins
+        # live[T]<->offline[T], so without this shift it compares two
+        # different 15-min windows on every C1 field and reports a
+        # spurious TSRV divergence (this masked the true post-cycle-39
+        # residual). Shift the TSRV-derived columns +1 bar so the
+        # offline trace row ``bar_close_ts=T`` carries the ``[T-15,T)``
+        # TSRV that matches the live engine's end-stamped bar.
+        #
+        # ONLY the TSRV-family columns are open-stamped; ``index_price``,
+        # the SVI/iv chain and the predictions are end-stamped already
+        # (they join cleanly — 90%+ signal agreement in the cycle-36
+        # trace). The shift is on a local copy — the backtester's PnL
+        # path is untouched.
+        df = df.copy()
+        for _tsrv_col in ("vol_ann", "jump_fraction", "tsrv"):
+            if _tsrv_col in df.columns:
+                df[_tsrv_col] = df[_tsrv_col].shift(1)
+
         d = df
         if self.cfg.feature_trace_start:
             start_ts = pd.Timestamp(self.cfg.feature_trace_start)
@@ -3344,7 +3367,12 @@ class VolArbBacktester:
                     # C0 raw input (index price).
                     "index_price_close": _safe_float(index_price[i]),
                     # C1 TSRV outputs (only what's persisted in the parquet).
-                    "jump_fraction": jf,
+                    # Cycle-38b: emit the raw shifted jump_fraction
+                    # (-> None when NaN, e.g. the window's first bar
+                    # after the +1 stamp shift) so it drops consistently
+                    # with vol_ann rather than masquerading as 0.0. The
+                    # local ``jf`` (NaN-clamped) still drives half_spread.
+                    "jump_fraction": _safe_float(jump_fraction[i]),
                     "vol_ann": _safe_float(vol_ann[i]),
                     # C3 iv chain.
                     "svi_iv_at_atm_pct": _safe_float(svi_iv_matched[i]),

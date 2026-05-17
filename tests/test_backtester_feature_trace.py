@@ -95,13 +95,15 @@ def test_emit_feature_trace_writes_per_bar_jsonl(tmp_path: Path) -> None:
 
     lines = out.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 3
-    for line in lines:
+    for i, line in enumerate(lines):
         row = json.loads(line)
         assert row["side"] == "offline"
         # C0
         assert "index_price_close" in row
-        # C1
-        assert "jump_fraction" in row
+        # C1 — cycle-38b shifts TSRV columns +1 bar, so the window's
+        # FIRST row has NaN jump_fraction/vol_ann (dropped from JSONL).
+        if i > 0:
+            assert "jump_fraction" in row
         # C3
         assert "iv_used_pct" in row
         assert row["iv_source"] == "svi"

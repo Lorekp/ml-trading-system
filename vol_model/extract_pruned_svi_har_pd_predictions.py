@@ -338,8 +338,12 @@ def main() -> None:
 
     # Cycle-34: prepare emit-trace window if requested.
     emit_trace_path = Path(args.emit_trace_jsonl) if args.emit_trace_jsonl else None
-    emit_trace_start = pd.Timestamp(args.emit_trace_start) if args.emit_trace_start else None
-    emit_trace_end = pd.Timestamp(args.emit_trace_end) if args.emit_trace_end else None
+    def _utc_ts(s: str) -> pd.Timestamp:
+        ts = pd.Timestamp(s)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+    emit_trace_start = _utc_ts(args.emit_trace_start) if args.emit_trace_start else None
+    emit_trace_end = _utc_ts(args.emit_trace_end) if args.emit_trace_end else None
     if emit_trace_path is not None:
         emit_trace_path.parent.mkdir(parents=True, exist_ok=True)
         # Truncate so re-runs overwrite (the offline-trace builder

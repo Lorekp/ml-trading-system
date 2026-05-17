@@ -50,8 +50,12 @@ logger = logging.getLogger(__name__)
 # would surface there first.
 TOLERANCES: dict[str, dict[str, float]] = {
     "default":   {"rtol": 1e-3, "atol": 1e-6},
-    # C0 raw inputs — exact match expected (live + offline see same Deribit/Binance feed).
-    "c0":        {"rtol": 0.0,  "atol": 1e-4},
+    # C0 raw inputs — index_price_close is sub-bar-sampled differently
+    # on each side (live: WS deribit_price_index push at bar close;
+    # offline: vol_arb parquet's per-bar index). They track the same
+    # series but never match to the penny — a 0.5% band confirms
+    # "same bar" without masking the genuine downstream divergence.
+    "c0":        {"rtol": 5e-3, "atol": 1.0},
     # C1 TSRV — derived from trade streams which may have tiny windowing differences.
     "c1":        {"rtol": 1e-3, "atol": 1e-6},
     # C2 SVI surface params — exact match if same bucket_ts; comparator flags bucket_ts drift separately.

@@ -355,3 +355,31 @@ def test_window_filtering_correctness():
     ]
     # Empty grid when end precedes start.
     assert _bar_grid(end, start) == []
+
+
+def test_cycle39b_harness_uses_exchange_order() -> None:
+    """Cycle-39b source sentinel: the harness reconstructs tsrv_trades in
+    exchange (agg_trade_id) order — the order the live fapi /aggTrades
+    REST poller feeds the buffer.
+
+    The replay MUST NOT order Binance trades by:
+      * timestamp alone (unstable quicksort -> arbitrary same-ms ties),
+      * the offline ``load_trades`` ``sort_index()`` order (which would
+        make the parity test circular).
+    ``_accumulate_bars`` is order-sensitive, so an unrealistic order
+    fabricates a TSRV divergence that the live engine never produces.
+    """
+    import re
+    src = Path("scripts/replay_parity_harness.py").read_text(encoding="utf-8")
+    assert re.search(r'sort_values\(\s*"agg_trade_id"', src), (
+        "harness must order Binance aggTrades by agg_trade_id (exchange order)"
+    )
+    # The circular / unrealistic orderings must not drive the load:
+    # load_trades must not be imported or called (a comment may still
+    # name it to explain WHY it is avoided).
+    assert "import load_trades" not in src and "load_trades(" not in src, (
+        "harness must NOT use the offline load_trades order (circular)"
+    )
+    assert 'sort_values("binance_ts")' not in src, (
+        "harness must NOT order by timestamp alone (arbitrary tie order)"
+    )

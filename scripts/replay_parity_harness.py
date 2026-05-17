@@ -372,32 +372,55 @@ def _load_sources(bars: list[pd.Timestamp]) -> ReplaySources:
     for t in bars:
         months.add(t.strftime("%Y-%m"))
         months.add((t - pd.Timedelta(minutes=BAR_MINUTES)).strftime("%Y-%m"))
+    # Cycle-39b (2026-05-17): reconstruct ``tsrv_trades`` in the order
+    # the LIVE engine actually sees them — the exchange aggregate-trade
+    # sequence (``agg_trade_id`` ascending). The live engine sources
+    # Binance USD-M trades from the fapi ``/aggTrades`` REST endpoint
+    # (cycle-31), paginated by ``fromId``, which returns aggregate
+    # trades in ``agg_trade_id`` order; they are appended to the trade
+    # buffer in that order. ``compute_bar_tsrv`` then stable-mergesorts
+    # by timestamp, preserving the ``agg_trade_id`` order for same-ms
+    # ties — i.e. the realised exchange order.
+    #
+    # This MUST be the replay order. ``_accumulate_bars`` (sub-bar
+    # dollar accumulation) is order-sensitive, so a different tie order
+    # shifts the sub-bar grid and the jump/continuous split. Two WRONG
+    # orderings to avoid:
+    #   * sort by ``transact_time`` alone (unstable quicksort) — ties
+    #     resolved arbitrarily, not what live sees;
+    #   * the offline ``load_trades`` ``sort_index()`` order — that
+    #     would force the harness to reproduce the offline answer by
+    #     construction, making the parity test circular.
+    # The realistic ``agg_trade_id`` order lets the harness expose a
+    # genuine live<->offline TSRV divergence if one exists.
     binance_frames: list[pd.DataFrame] = []
     for month in sorted(months):
         path = _REPO_ROOT / BINANCE_AGGTRADES_DIR / f"{month}.parquet"
         if not path.exists():
             logger.warning("Binance aggTrades parquet missing: %s", path)
             continue
-        # Only the columns the harness needs — the monthly file is huge.
         cols = ["agg_trade_id", "price", "quantity", "transact_time",
                 "is_buyer_maker"]
-        bdf = pd.read_parquet(path, columns=cols)
-        binance_frames.append(bdf)
+        binance_frames.append(pd.read_parquet(path, columns=cols))
     if binance_frames:
         binance_df = pd.concat(binance_frames, ignore_index=True)
         binance_df["binance_ts"] = pd.to_datetime(
             binance_df["transact_time"], unit="ms", utc=True,
         )
-        # Keep only the rows the replay window can touch — bounds the
-        # downstream per-bar slicing cost.
+        # Exchange / arrival order — what the live fapi /aggTrades REST
+        # poller appends to the buffer.
+        binance_df = binance_df.sort_values(
+            "agg_trade_id", kind="mergesort",
+        ).reset_index(drop=True)
         lo = (bars[0] - pd.Timedelta(minutes=BAR_MINUTES))
         hi = bars[-1]
         binance_df = binance_df.loc[
             (binance_df["binance_ts"] >= lo) & (binance_df["binance_ts"] < hi)
-        ].sort_values("binance_ts").reset_index(drop=True)
+        ].reset_index(drop=True)
     else:
         binance_df = pd.DataFrame(columns=["agg_trade_id", "price", "quantity",
-                                           "transact_time", "is_buyer_maker", "binance_ts"])
+                                           "transact_time", "is_buyer_maker",
+                                           "binance_ts"])
 
     option_nonempty = [d for d in option_by_day.values() if not d.empty]
     all_option_df = (

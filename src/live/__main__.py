@@ -124,6 +124,7 @@ def build_engine(config):
         monitor_config=config.monitor,
         reconciler_config=config.reconciler,
         data_validator_config=config.data_validator,
+        vol_overlay_config=config.vol_overlay,
         quote_currency=config.exchange.quote_currency,
         tf_lookbacks={tf.tf: tf.lookback for tf in config.full5},
         paper_mode=paper_mode,

@@ -29,7 +29,7 @@ from live.core.data_validator import validate_ohlcv, validate_ticker
 from live.notifier import TelegramNotifier
 from live.config import (
     TF_MINUTES, PortfolioConfig, MonitorConfig, ReconcilerConfig,
-    DataValidatorConfig,
+    DataValidatorConfig, VolOverlayConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,7 @@ class TradingEngine:
         monitor_config: MonitorConfig | None = None,
         reconciler_config: ReconcilerConfig | None = None,
         data_validator_config: DataValidatorConfig | None = None,
+        vol_overlay_config: VolOverlayConfig | None = None,
         quote_currency: str = "USDT",
         tf_lookbacks: dict[str, int] | None = None,
         paper_mode: bool = False,
@@ -109,6 +110,9 @@ class TradingEngine:
 
         # Store reconciler config for use in initialize()
         self._reconciler_config = reconciler_config or ReconcilerConfig()
+
+        # Vol overlay — universe vol-screen threshold (defence-in-depth).
+        self._screen_max_vol = (vol_overlay_config or VolOverlayConfig()).screen_max_vol
 
         self._aggregator = SignalAggregator(
             max_positions_per_strategy=pc.max_positions_per_strategy,
@@ -456,6 +460,19 @@ class TradingEngine:
         # Update vol series if needed
         await self._ensure_vol_series(signal.asset)
 
+        # Universe vol-screen (defence-in-depth on top of inverse-vol
+        # sizing): skip pathologically volatile assets outright. Risk-parity
+        # sizing handles ordinary vol dispersion; this excludes only the
+        # untradeable tail (death-spiral / listing-day-pump coins).
+        vs = self._vol_series.get(signal.asset)
+        if vs is not None and len(vs):
+            last_vol = vs.iloc[-1]
+            if np.isfinite(last_vol) and last_vol > self._screen_max_vol:
+                logger.warning(
+                    "VOL_SCREEN: skipping %s — daily vol %.1f%% > %.1f%% cap",
+                    signal.asset, last_vol * 100, self._screen_max_vol * 100)
+                return
+
         # Compute vol multiplier
         vol_mult = 1.0
         if hasattr(strategy, 'compute_vol_mult'):
@@ -704,17 +721,57 @@ class TradingEngine:
         return (self._peak_equity - self._equity) / self._peak_equity
 
     async def _ensure_vol_series(self, asset: str) -> None:
+        """Populate / refresh the per-asset daily realized-vol series that
+        drives the inverse-vol sizing overlay (strategy.compute_vol_mult).
+
+        Robustness — the previous version required >=30 daily bars and
+        swallowed every exception, so any asset whose fetch failed or which
+        lacked daily history was simply absent from _vol_series and
+        compute_vol_mult then fell back to 1.0 (full notional). That sized
+        the highest-vol microcaps (DENT, PIPPIN) at full risk and caused
+        97% of the live paper loss.
+
+        New listings now fall back to an hourly-derived daily-vol estimate
+        (hourly_vol * sqrt(24)); fetch failures are logged, not swallowed,
+        and leave the asset out of _vol_series so compute_vol_mult fails
+        safe to the clip floor (minimum size) and the next bar retries.
+        """
         now = time.monotonic()
         cached_at = self._vol_cache_times.get(asset, 0)
         if asset in self._vol_series and (now - cached_at) < 86400:  # 24h TTL
             return
+
+        symbol = f"{asset}{self._quote_currency}"
+        # Primary: 20-day rolling std of daily returns (matches backtest).
         try:
-            df = await self._data.fetch_ohlcv(f"{asset}{self._quote_currency}", "1d", 200)
-            if len(df) >= 30:
-                self._vol_series[asset] = df["close"].pct_change().rolling(20).std()
-                self._vol_cache_times[asset] = now
-        except Exception:
-            pass
+            df = await self._data.fetch_ohlcv(symbol, "1d", 200)
+        except Exception as e:
+            logger.warning("vol fetch failed for %s (%s); will retry", asset, e)
+            return
+
+        series: Optional[pd.Series] = None
+        if df is not None and len(df) >= 30:
+            series = df["close"].pct_change().rolling(20).std()
+        else:
+            # New listing — derive daily vol from hourly bars so the asset
+            # is still risk-scaled rather than sized at full notional.
+            try:
+                hdf = await self._data.fetch_ohlcv(symbol, "1h", 720)
+            except Exception as e:
+                logger.warning("hourly vol fallback failed for %s (%s)", asset, e)
+                hdf = None
+            if hdf is not None and len(hdf) > 480:
+                hvol = hdf["close"].pct_change().rolling(480).std()
+                series = hvol * float(np.sqrt(24.0))  # hourly -> daily
+
+        last = series.iloc[-1] if series is not None and len(series) else np.nan
+        if series is None or not np.isfinite(last):
+            logger.warning(
+                "no usable vol series for %s; compute_vol_mult fails safe "
+                "to floor (minimum size)", asset)
+            return
+        self._vol_series[asset] = series
+        self._vol_cache_times[asset] = now
 
     async def _save_state(self) -> None:
         await self._state.save_checkpoint("equity", str(self._equity))

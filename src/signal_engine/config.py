@@ -95,6 +95,14 @@ class PortfolioConfig(BaseModel):
     sizing_mode: str = "probability_edge"  # "signal_strength" | "probability_edge"
     use_regime_exposure_multiplier: bool = True
     regime_exposure_floor: float = 0.50
+    # Per-asset inverse-vol sizing overlay — risk-parity across the universe.
+    # vol_mult = clip(target / asset_daily_vol, floor, cap), fail-safe to floor.
+    # Opt-in (False) to keep existing backtests byte-identical; the honest
+    # Binance re-backtest enables it. Mirrors the live S8Sym15 overlay.
+    per_asset_vol_scaling: bool = False
+    per_asset_vol_target: float = 0.025
+    per_asset_vol_floor: float = 0.10
+    per_asset_vol_cap: float = 2.0
 
     @field_validator("sizing_mode")
     @classmethod

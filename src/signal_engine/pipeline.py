@@ -81,6 +81,55 @@ def apply_vol_overlay(
     return out
 
 
+def apply_per_asset_vol_overlay(
+    signals: pd.DataFrame,
+    vol_series: dict[str, pd.Series],
+    target_vol: float,
+    floor: float,
+    cap: float,
+) -> pd.DataFrame:
+    """Per-asset inverse-vol sizing overlay — risk parity across the universe.
+
+    Multiplies the existing ``sizing_mult`` column by
+    ``clip(target_vol / asset_daily_vol, floor, cap)``. Mirrors the live
+    ``S8Sym15Strategy.compute_vol_mult`` and the experiments backtester's
+    ``apply_vol()``.
+
+    FAILS SAFE: an asset with no vol series, an out-of-range point-in-time
+    lookup, or a non-finite vol is scaled by ``floor`` (the smallest size) —
+    never left at full notional. Equal-dollar-notional sizing across the
+    ~27x-vol-dispersion live universe is what blew up DENT/PIPPIN in live
+    paper trading. The ``idx-1`` searchsorted lookup keeps the vol
+    point-in-time (no lookahead). Original DataFrame is not mutated.
+    """
+    out = signals.copy()
+    if "sizing_mult" not in out.columns:
+        out["sizing_mult"] = 1.0
+    ts = pd.to_datetime(out["timestamp"])
+    if ts.dt.tz is not None:
+        ts = ts.dt.tz_localize(None)
+    col = out.columns.get_loc("sizing_mult")
+    n_failsafe = 0
+    for i in range(len(out)):
+        a = out.iloc[i].get("asset", "")
+        vs = vol_series.get(a)
+        mult = floor  # fail-safe: unknown vol -> smallest size, never 1.0
+        if vs is not None and len(vs):
+            idx = vs.index.searchsorted(ts.iloc[i])
+            if 0 < idx <= len(vs):
+                v = vs.iloc[idx - 1]
+                if pd.notna(v) and v > 0:
+                    mult = float(np.clip(target_vol / v, floor, cap))
+        if mult == floor:
+            n_failsafe += 1
+        out.iat[i, col] *= mult
+    logger.info(
+        "Per-asset vol overlay: %d signals scaled (%d fail-safe to floor)",
+        len(out), n_failsafe,
+    )
+    return out
+
+
 def _process_single_asset(
     asset_name: str,
     symbol: str,
@@ -401,6 +450,31 @@ def run_backtest(config: SystemConfig, max_workers: int = 1) -> dict[str, Any]:
             filtered = apply_vol_overlay(filtered, btc_daily, config.vol_overlay)
         except Exception as exc:
             logger.warning("Vol overlay skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Phase 2d: per-asset inverse-vol sizing overlay (risk parity)
+    # ------------------------------------------------------------------
+    if config.portfolio.per_asset_vol_scaling:
+        data_dirs = [Path(d) for d in config.data.data_dirs]
+        vol_series: dict[str, pd.Series] = {}
+        for asset in filtered["asset"].unique():
+            symbol = config.assets.get(asset, f"{asset}USDT")
+            try:
+                daily = resample_ohlcv(
+                    load_binance_1m(symbol, data_dirs), "1D")["close"]
+                if daily.index.tz is not None:
+                    daily.index = daily.index.tz_localize(None)
+                vs = daily.pct_change().rolling(20).std()
+                if vs.notna().any():
+                    vol_series[asset] = vs
+            except Exception as exc:
+                logger.warning("per-asset vol skipped for %s: %s", asset, exc)
+        filtered = apply_per_asset_vol_overlay(
+            filtered, vol_series,
+            config.portfolio.per_asset_vol_target,
+            config.portfolio.per_asset_vol_floor,
+            config.portfolio.per_asset_vol_cap,
+        )
 
     # ------------------------------------------------------------------
     # Phase 3: portfolio simulation

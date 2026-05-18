@@ -99,9 +99,12 @@ strategies:
       regime_exposure_floor: 0.50
     quote_currency: "USDT"
     vol_overlay:
+      # floor lowered 0.3 -> 0.10 (sizing-fix 2026-05-18): the 0.3 floor
+      # under-scaled the highest-vol microcaps in a ~27x dispersion
+      # universe; compute_vol_mult also fails safe to this floor.
       target_vol: 0.025
-      floor: 0.3
-      cap: 1.5
+      floor: 0.10
+      cap: 2.0
     signal_generator:
       conf_threshold: 0.08
       regime_ema_span: 20
@@ -153,9 +156,10 @@ data_validator:
   min_bars: 30
 
 vol_overlay:
+  # floor lowered 0.3 -> 0.10 (sizing-fix 2026-05-18) — see PortfolioManager.
   target_vol: 0.025
-  floor: 0.3
-  cap: 1.5
+  floor: 0.10
+  cap: 2.0
 
 max_risk_per_trade: 0.03
 sl_cap: 0.75

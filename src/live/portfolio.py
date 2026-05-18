@@ -14,7 +14,7 @@ from typing import Optional
 
 import numpy as np
 
-from live.config import BASELINE_WR, PortfolioConfig
+from live.config import BASELINE_WR, PortfolioConfig, VolOverlayConfig
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,10 @@ class PortfolioManager:
     Same logic as simulate_with_breaker() lines 320-397.
     """
 
-    def __init__(self, config: PortfolioConfig, starting_capital: float) -> None:
+    def __init__(self, config: PortfolioConfig, starting_capital: float,
+                 vol_overlay: VolOverlayConfig | None = None) -> None:
         self._config = config
+        self._vol_overlay = vol_overlay or VolOverlayConfig()
         self.equity = starting_capital
         self.peak_equity = starting_capital
         self._positions: list[Position] = []
@@ -162,19 +164,30 @@ class PortfolioManager:
         return pnl
 
     def compute_vol_mult(self, asset: str, vol_series: dict) -> float:
-        """Vol overlay — same as apply_vol() from circuit_breaker_v2:174-187.
+        """Per-asset inverse-vol sizing overlay.
 
-        Scales sizing by 0.025 / current_vol, clipped to [0.3, 1.5].
+        ``vol_mult = clip(target_vol / asset_daily_vol, floor, cap)`` —
+        same risk-parity formula as ``apply_vol()`` in
+        circuit_breaker_v2_experiment.py, but the band is config-driven
+        (VolOverlayConfig) instead of hard-coded.
+
+        FAILS SAFE: when the asset's volatility is unknown (series
+        missing/empty, or a non-finite last value) this returns the
+        clip FLOOR — the smallest size — never 1.0. Returning 1.0 was
+        the live bug: during warmup / on any failed vol fetch the
+        highest-vol assets (DENT, PIPPIN) were sized at full notional
+        and produced 97% of the live paper loss.
         """
+        vo = self._vol_overlay
         vs = vol_series.get(asset)
         if vs is None or len(vs) == 0:
-            return 1.0
+            return vo.floor
 
         v = vs.iloc[-1]
         if not np.isfinite(v) or v <= 0:
-            return 1.0
+            return vo.floor
 
-        return float(np.clip(0.025 / v, 0.3, 1.5))
+        return float(np.clip(vo.target_vol / v, vo.floor, vo.cap))
 
     def restore_positions(self, positions: list[Position]) -> None:
         """Restore open positions from DB on restart."""

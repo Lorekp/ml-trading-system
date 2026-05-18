@@ -162,9 +162,24 @@ class DataValidatorConfig(BaseModel):
 
 
 class VolOverlayConfig(BaseModel):
+    """Per-asset inverse-vol position-sizing overlay.
+
+    vol_mult = clip(target_vol / asset_daily_vol, floor, cap).
+
+    ``floor`` was 0.3 — far too high for the live universe's ~27x
+    volatility dispersion (microcaps need ~0.08-0.10x to risk-match
+    BTC). The 0.3 floor + a fail-open missing-vol path let DENT/PIPPIN
+    size at near-full notional and account for 97% of the live paper
+    loss. Floor lowered to 0.10; consumed by PortfolioManager.compute_vol_mult.
+    """
     target_vol: float = 0.025
-    floor: float = 0.3
-    cap: float = 1.5
+    floor: float = 0.10
+    cap: float = 2.0
+    # Universe vol-screen (defence-in-depth on top of inverse-vol sizing):
+    # skip any asset whose realized daily vol exceeds this. 0.20 = 20%/day,
+    # a pathological-asset rail (death-spiral / listing-day pump). Risk-parity
+    # sizing is the PRIMARY control; this only excludes the untradeable tail.
+    screen_max_vol: float = 0.20
 
 
 class SignalGeneratorConfig(BaseModel):

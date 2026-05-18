@@ -94,11 +94,13 @@ class S8Sym15Strategy:
         # Quote currency for symbol formatting
         self._quote_currency = config.get("quote_currency", "USDT")
 
-        # Vol overlay params
+        # Vol overlay params — inverse-vol sizing: clip(target/vol, floor, cap).
+        # floor default lowered 0.3 -> 0.10 (sizing-fix 2026-05-18): 0.3 was
+        # too high for the live universe's ~27x vol dispersion.
         vol_cfg = config.get("vol_overlay", {})
         self._vol_target = vol_cfg.get("target_vol", 0.025)
-        self._vol_floor = vol_cfg.get("floor", 0.3)
-        self._vol_cap = vol_cfg.get("cap", 1.5)
+        self._vol_floor = vol_cfg.get("floor", 0.10)
+        self._vol_cap = vol_cfg.get("cap", 2.0)
 
         # Correlation throttle (CT90: cut sizing when >90% signals agree)
         ct_cfg = config.get("correlation_throttle", {})
@@ -449,11 +451,22 @@ class S8Sym15Strategy:
         self._vol_series = vol_series
 
     def compute_vol_mult(self, asset: str) -> float:
-        """Vol overlay — same as apply_vol() from circuit_breaker_v2:174-187."""
+        """Per-asset inverse-vol sizing overlay.
+
+        ``vol_mult = clip(target_vol / asset_daily_vol, floor, cap)`` — same
+        risk-parity formula as ``apply_vol()`` in circuit_breaker_v2_experiment.py.
+
+        FAILS SAFE: when the asset's volatility is unknown (series
+        missing/empty, or a non-finite last value) this returns the clip
+        FLOOR — the smallest size — never 1.0. Returning 1.0 was the live
+        bug: during warmup / on any failed vol fetch the highest-vol assets
+        (DENT, PIPPIN) were sized at full notional and produced 97% of the
+        live paper loss.
+        """
         vs = self._vol_series.get(asset)
         if vs is None or len(vs) == 0:
-            return 1.0
+            return self._vol_floor
         v = vs.iloc[-1]
         if not np.isfinite(v) or v <= 0:
-            return 1.0
+            return self._vol_floor
         return float(np.clip(self._vol_target / v, self._vol_floor, self._vol_cap))

@@ -82,7 +82,8 @@ class PaperTradingEngine:
             self._breaker.restore_state(breaker_state)
 
         # 5. Portfolio manager
-        self._portfolio = PortfolioManager(cfg.portfolio, cfg.capital)
+        self._portfolio = PortfolioManager(cfg.portfolio, cfg.capital,
+                                           cfg.vol_overlay)
 
         # Restore equity from checkpoint
         saved_equity = await self._state.load_checkpoint("equity")
@@ -214,7 +215,7 @@ class PaperTradingEngine:
                 ohlcv_4h[asset] = self._bars_to_df(bars)
 
         # 5. Update vol series (for vol overlay)
-        await self._update_vol_series(universe)
+        await self._update_vol_series(universe, bar_time)
 
         # 6. Generate signals
         signals = []
@@ -328,23 +329,64 @@ class PaperTradingEngine:
         await self._notifier.notify_exit(
             pos.asset, pos.side, pnl, pos.entry_price, exit_price)
 
-    async def _update_vol_series(self, universe: list[str]) -> None:
-        """Update daily vol series for vol overlay.
+    async def _update_vol_series(self, universe: list[str],
+                                 bar_time: datetime) -> None:
+        """Populate / refresh the per-asset daily realized-vol series that
+        drives the inverse-vol sizing overlay (PortfolioManager.compute_vol_mult).
 
-        Fetches 200 daily bars (not 30) to match the experiment's apply_vol()
-        which uses the full daily return history for rolling(20).std().
-        200 bars gives a stable vol estimate matching the backtest.
+        Robustness — the previous version silently failed open: it fetched
+        each asset once per session, required >=30 daily bars, and swallowed
+        every exception. Any asset whose fetch failed or which lacked daily
+        history was simply absent from _vol_series, and compute_vol_mult then
+        returned 1.0 (full notional). That sized DENT/PIPPIN at full risk and
+        caused 97% of the live paper loss.
+
+        This version:
+          * refreshes once per UTC day (the 00:00 bar) so vol is not stale;
+          * for new listings with <30 daily bars, derives a daily-vol estimate
+            from hourly bars (hourly_vol * sqrt(24)) instead of skipping them;
+          * logs fetch failures instead of swallowing them, and leaves the
+            asset OUT of _vol_series so compute_vol_mult fails safe to the
+            clip floor and the next bar retries.
         """
+        force = bar_time.hour == 0 and bar_time.minute < 15
         for asset in universe:
-            if asset in self._vol_series:
-                continue  # Only fetch once per session (slow-moving)
+            if asset in self._vol_series and not force:
+                continue  # already have today's series
+
+            # Primary: 20-day rolling std of daily returns (matches backtest).
             try:
                 bars = await self._client.fetch_klines(f"{asset}USDT", "1d", 200)
-                if len(bars) >= 30:
-                    closes = pd.Series([b["close"] for b in bars])
-                    self._vol_series[asset] = closes.pct_change().rolling(20).std()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("vol fetch failed for %s (%s); will retry", asset, e)
+                continue
+
+            series: Optional[pd.Series] = None
+            if bars and len(bars) >= 30:
+                closes = pd.Series([b["close"] for b in bars])
+                series = closes.pct_change().rolling(20).std()
+            else:
+                # New listing — derive daily vol from hourly bars so the
+                # asset is still risk-scaled rather than sized at full size.
+                try:
+                    hbars = await self._client.fetch_klines(
+                        f"{asset}USDT", "1h", 720)
+                except Exception as e:
+                    logger.warning("hourly vol fallback failed for %s (%s)",
+                                   asset, e)
+                    hbars = None
+                if hbars and len(hbars) > 480:
+                    hcloses = pd.Series([b["close"] for b in hbars])
+                    hvol = hcloses.pct_change().rolling(480).std()
+                    series = hvol * float(np.sqrt(24.0))  # hourly -> daily
+
+            last = series.iloc[-1] if series is not None and len(series) else np.nan
+            if series is None or not np.isfinite(last):
+                logger.warning(
+                    "no usable vol series for %s; compute_vol_mult fails "
+                    "safe to floor (minimum size)", asset)
+                continue
+            self._vol_series[asset] = series
 
     async def _save_state(self) -> None:
         """Persist critical state to DB."""

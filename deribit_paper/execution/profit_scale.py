@@ -1,9 +1,7 @@
 """Empirical-Bayes profit-scale estimator for the live sizing chain.
 
-E.1.1 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 Mirrors :func:`vol_arb.backtester.run_backtest`'s ``use_profit_scaling``
-branch (lines 1966-1994). The V2 production preset turns this on, and
+branch (lines 1966-1994). The invalidated historical V2 preset turns this on, and
 the live engine has been carrying the *config field* without any
 behaviour. This module supplies the missing behaviour.
 

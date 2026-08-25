@@ -40,10 +40,8 @@ class PurgedKFold(BaseCrossValidator):
                       overrides ``pct_embargo`` so the embargo size is
                       independent of total observation count. Use this when the
                       caller has horizon-aware lookback information (e.g.,
-                      max(label_span, max_feature_lookback_bars)) — see plan
-                      starry-rolling-rabin.md Phase 1d. Default ``None``
-                      preserves the legacy ``pct_embargo`` behaviour
-                      byte-identically.
+                      max(label_span, max_feature_lookback_bars)). Default
+                      ``None`` retains percentage-based embargo behavior.
     """
 
     def __init__(

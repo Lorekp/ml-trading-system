@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """Compare pruned_svi_har_pd_v1 predictions vs pruned_svi_v1 baseline.
 
-Evaluates the certification gate for the HAR-PD augmentation (Session C
-conditional shortlist → full 50-month walk-forward):
+Evaluates three historical research thresholds for the HAR-PD augmentation:
 
   (1) avg ΔQLIKE ≤ -3% vs pruned_svi_v1 baseline
   (2) ≥ 25/50 months improved (Δ < 0)
@@ -54,8 +53,8 @@ def _qlike_per_row(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
     Equivalent to QLIKE(r) = r − log(r) − 1 with r = σ²_pred / σ²_true.
     This is the "overprediction-penalised" convention used throughout
     the vol_model code (training loss + eval metric) and the Session C
-    gauntlet. Using this exact formulation ensures the certification
-    gate comparison is apples-to-apples with both the walk-forward
+    gauntlet. Using this formulation keeps the threshold
+    comparison consistent with both the walk-forward
     training summary and the Session C spot-check numbers — any
     alternative convention (e.g., Patton 2011's r = σ²_true / σ²_pred)
     would give different Δ values despite comparing the same models.
@@ -190,9 +189,8 @@ def compare_predictions(
     return pd.DataFrame(rows)
 
 
-def certification_gate(table: pd.DataFrame) -> dict:
-    """Evaluate the three Session-C certification gates against a per-month
-    comparison table."""
+def evaluate_historical_thresholds(table: pd.DataFrame) -> dict:
+    """Evaluate the three historical thresholds against a monthly table."""
     table = table.dropna(subset=["delta_qlike_pct"])
     n_months = len(table)
 
@@ -212,14 +210,14 @@ def certification_gate(table: pd.DataFrame) -> dict:
         "gate1_avg_delta_le_-3pct": bool(gate1),
         "gate2_n_improved_ge_25": bool(gate2),
         "gate3_n_dm_sig_ge_15": bool(gate3),
-        "all_gates_pass": bool(gate1 and gate2 and gate3),
+        "all_thresholds_pass": bool(gate1 and gate2 and gate3),
     }
 
 
 def format_report(table: pd.DataFrame, gates: dict) -> str:
     lines = []
     lines.append("=" * 86)
-    lines.append("  Phase 5 HAR-PD certification — pruned_svi_har_pd_v1 vs pruned_svi_v1")
+    lines.append("  Historical HAR-PD comparison — pruned_svi_har_pd_v1 vs pruned_svi_v1")
     lines.append("=" * 86)
     lines.append("")
     lines.append(
@@ -239,7 +237,7 @@ def format_report(table: pd.DataFrame, gates: dict) -> str:
             f"{delta_str:>6}  {dm_str:>8}  {dmp_str:>8}  {rb:>7}  {rc:>7}"
         )
     lines.append("")
-    lines.append("Certification gate:")
+    lines.append("Historical threshold summary:")
     lines.append(
         f"  n months:          {gates['n_months']}"
     )
@@ -256,7 +254,11 @@ def format_report(table: pd.DataFrame, gates: dict) -> str:
         f"(gate3: ≥ 15 at p<0.01 → {'PASS' if gates['gate3_n_dm_sig_ge_15'] else 'FAIL'})"
     )
     lines.append("")
-    verdict = "SHIP — all gates pass" if gates["all_gates_pass"] else "DO NOT SHIP — gate(s) failed"
+    verdict = (
+        "HISTORICAL THRESHOLDS PASS — NOT PROMOTED"
+        if gates["all_thresholds_pass"]
+        else "HISTORICAL THRESHOLDS FAIL"
+    )
     lines.append(f"  Verdict: {verdict}")
     lines.append("=" * 86)
     return "\n".join(lines)
@@ -274,7 +276,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-csv",
-        default="vol_model/output/phase5_har_pd_cert_table.csv",
+        default="vol_model/output/phase5_har_pd_comparison_table.csv",
         help="Per-month comparison CSV (absolute path ok).",
     )
     args = parser.parse_args()
@@ -298,7 +300,7 @@ def main() -> None:
             raise KeyError(f"{label} missing columns: {missing}")
 
     table = compare_predictions(baseline_df, candidate_df)
-    gates = certification_gate(table)
+    gates = evaluate_historical_thresholds(table)
 
     print(format_report(table, gates))
 

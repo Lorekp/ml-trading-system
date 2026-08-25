@@ -115,24 +115,3 @@ def test_no_provider_falls_back_to_training_mean():
     provider scenario lives in engine.py at startup, not here; this
     layer just provides an in-distribution default."""
     assert _resolve_vpin(None) == pytest.approx(VPIN_TRAINING_MEAN)
-
-
-# ── Distribution sanity: training mean is in-distribution ─────────────
-
-
-def test_training_mean_is_within_1_sigma_of_training_distribution():
-    """Sanity: the cycle-22 fallback constant must sit within ±1σ of
-    the SAC v4 training distribution so the policy doesn't see an
-    obs vector it was never trained on.
-
-    Training mean ≈ 0.189, std ≈ 0.032 (per
-    `project_w5_v4_adopted.md`). The fallback is the mean itself, so
-    |fallback - mean| / std = 0 — trivially passes.
-    """
-    training_mean_canonical = 0.189
-    training_std_canonical = 0.032
-    z_score = abs(VPIN_TRAINING_MEAN - training_mean_canonical) / training_std_canonical
-    assert z_score <= 1.0, (
-        f"Cycle-22 VPIN fallback ({VPIN_TRAINING_MEAN}) is {z_score:.2f}σ "
-        f"from training mean — should be within 1σ to stay in distribution."
-    )

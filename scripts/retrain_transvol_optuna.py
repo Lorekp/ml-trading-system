@@ -87,12 +87,9 @@ def _backup_existing_checkpoints():
 def _train_one_month(
     X_tv: pd.DataFrame, cont: pd.Series, jump: pd.Series, month: str,
     optuna_best: dict, device: torch.device, max_epochs: int,
-    patience: int,
+    patience: int, ckpt_dir: Path, rehab: bool = False,
 ) -> tuple[float, float]:
     base = TransVolConfig()
-    train_ds, val_ds, normalizer = _make_per_month_datasets(
-        X_tv, cont, jump, pd.Timestamp(month, tz="UTC"), base.seq_len,
-    )
     cfg = replace(
         base,
         lr=optuna_best["lr"],
@@ -100,6 +97,24 @@ def _train_one_month(
         weight_decay=optuna_best["weight_decay"],
         n_features=X_tv.shape[1],
     )
+
+    if rehab:
+        # R1+R2+R6 clean build. _make_per_month_datasets returns the extra
+        # train-only-fit stats (winsor limits, time-normalizer, log-bias).
+        train_ds, val_ds, normalizer, prep = _make_per_month_datasets(
+            X_tv, cont, jump, pd.Timestamp(month, tz="UTC"), base.seq_len,
+            rehab=True,
+        )
+        # R2: tell the model to use the log-target head with a calibrated bias.
+        cfg = replace(
+            cfg, target_log=True, cont_log_bias=prep["cont_log_bias"],
+        )
+    else:
+        train_ds, val_ds, normalizer = _make_per_month_datasets(
+            X_tv, cont, jump, pd.Timestamp(month, tz="UTC"), base.seq_len,
+        )
+        prep = None
+
     t0 = time.time()
     model, val_q = _train_transvol(
         cfg, train_ds, val_ds, device,
@@ -107,11 +122,13 @@ def _train_one_month(
     )
     elapsed = time.time() - t0
 
-    # Save checkpoint in production format. Match the existing schema:
+    # Save checkpoint. Production schema:
     #   { model_state_dict, config, normalizer_mean, normalizer_std,
-    #     epoch, val_qlike }
-    out_path = CKPT_DIR / f"{month}_transvol.pt"
-    torch.save({
+    #     epoch, val_qlike }. Rehab adds the train-only-fit winsor limits,
+    #   the persisted time-normalizer (R6), and the log-target flag so
+    #   extraction reproduces the exact same prep with NO re-fit on test data.
+    out_path = ckpt_dir / f"{month}_transvol.pt"
+    payload = {
         "model_state_dict": model.state_dict(),
         "config": cfg,
         "normalizer_mean": normalizer.mean,
@@ -119,7 +136,24 @@ def _train_one_month(
         "epoch": -1,  # not tracked separately; max_epochs is in config
         "val_qlike": val_q,
         "optuna_best_params": optuna_best,  # provenance
-    }, str(out_path))
+    }
+    if rehab:
+        payload.update({
+            "rehab": True,
+            "rehab_recipe": "R6+R1+R2",
+            # R1: train-fit winsor clip bounds (applied BEFORE z-score).
+            "winsor_lo": prep["winsor_lo"],
+            "winsor_hi": prep["winsor_hi"],
+            "winsor_lo_q": prep["winsor_lo_q"],
+            "winsor_hi_q": prep["winsor_hi_q"],
+            # R6: persisted train-only time-normalizer (closes A2-M1 leak).
+            "time_normalizer_mean": prep["time_normalizer_mean"],
+            "time_normalizer_std": prep["time_normalizer_std"],
+            # R2: log-target head provenance (cfg already carries the flag).
+            "target_log": True,
+            "cont_log_bias": prep["cont_log_bias"],
+        })
+    torch.save(payload, str(out_path))
     return val_q, elapsed
 
 
@@ -145,10 +179,37 @@ def main() -> int:
         "--no-backup", action="store_true",
         help="Skip backing up existing checkpoints (use only after confirmation)",
     )
+    parser.add_argument(
+        "--rehab", action="store_true",
+        help="Apply the pre-committed R6+R1+R2 clean build (winsorize before "
+             "z-score, persisted train-only time-normalizer, log-target). "
+             "Implies --out-tag _clean_rehab unless overridden, so production "
+             "checkpoints in expanding_hybrid/ are NEVER touched.",
+    )
+    parser.add_argument(
+        "--out-tag", type=str, default="",
+        help="Suffix for the checkpoint dir: writes to "
+             "expanding_hybrid{out_tag}/ instead of the production dir. "
+             "Defaults to '_clean_rehab' when --rehab is set; production "
+             "(no tag) is unchanged.",
+    )
     args = parser.parse_args()
+
+    # Resolve the checkpoint output dir. Rehab writes to a tagged sibling dir
+    # so production stays intact unless the rehab WINS the gate.
+    out_tag = args.out_tag
+    if args.rehab and not out_tag:
+        out_tag = "_clean_rehab"
+    ckpt_dir = CKPT_DIR if not out_tag else CKPT_DIR.with_name(CKPT_DIR.name + out_tag)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
+    logger.info("Rehab mode: %s | checkpoint dir: %s", args.rehab, ckpt_dir)
+    if device.type == "cuda":
+        logger.info(
+            "GPU: %s (%.1f GB)", torch.cuda.get_device_name(0),
+            torch.cuda.get_device_properties(0).total_memory / 1e9,
+        )
 
     # Load Optuna-best params.
     best_path = (
@@ -174,9 +235,13 @@ def main() -> int:
     X_tv = _select_transvol_features(X)
     logger.info("TransVol input: %d rows, %d features", len(X_tv), X_tv.shape[1])
 
-    # Backup existing checkpoints.
-    if not args.no_backup:
+    # Backup existing checkpoints — ONLY when writing into the production dir.
+    # A tagged/rehab dir is fresh, so there is nothing to overwrite or back up.
+    if ckpt_dir == CKPT_DIR and not args.no_backup:
         _backup_existing_checkpoints()
+    elif ckpt_dir != CKPT_DIR:
+        logger.info("Tagged dir %s: production checkpoints untouched, no backup needed",
+                    ckpt_dir.name)
     else:
         logger.warning("--no-backup specified; skipping checkpoint backup")
 
@@ -188,12 +253,12 @@ def main() -> int:
     logger.info("Months to train: %d (%s..%s)",
                 len(months_str), months_str[0], months_str[-1])
 
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     t_global = time.time()
     summaries = []
 
     for i, month in enumerate(months_str):
-        ckpt_path = CKPT_DIR / f"{month}_transvol.pt"
+        ckpt_path = ckpt_dir / f"{month}_transvol.pt"
         if ckpt_path.exists() and not args.force_retrain:
             logger.info("[%d/%d] %s: cached, skipping", i + 1, len(months_str), month)
             continue
@@ -207,6 +272,7 @@ def main() -> int:
             val_q, elapsed = _train_one_month(
                 X_tv, cont, jump, month, optuna_best, device,
                 max_epochs=args.max_epochs, patience=args.patience,
+                ckpt_dir=ckpt_dir, rehab=args.rehab,
             )
         except (ValueError, RuntimeError) as e:
             logger.error("[%d/%d] %s SKIPPED: %s", i + 1, len(months_str), month, e)
@@ -220,9 +286,10 @@ def main() -> int:
             elapsed_global / 3600,
         )
 
-    # Summary.
+    # Summary (tagged so the rehab run never clobbers the production summary).
     df = pd.DataFrame(summaries)
-    out = REPO_ROOT / "vol_model" / "output" / "transvol_optuna_retrain_summary.csv"
+    summary_name = f"transvol_optuna_retrain_summary{out_tag}.csv"
+    out = REPO_ROOT / "vol_model" / "output" / summary_name
     df.to_csv(out, index=False)
     total_h = (time.time() - t_global) / 3600
     logger.info("Wrote %s", out)

@@ -44,7 +44,7 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = (BacktestConfig()
-           .with_btc_production_filters_v2()
+           .with_historical_btc_v2()
            .with_realistic_costs())
     cfg.kelly_mult_path = None        # draft pass: no Kelly amplification
     cfg.end_dt = args.end_dt

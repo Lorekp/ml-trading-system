@@ -1,6 +1,4 @@
-"""All 4 production IOC sites must pass ``tiered=True`` under V2 preset.
-
-E.1.6 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
+"""Historical V2 replay routes all four IOC sites through tiered mode.
 
 Pre-E.1.6 the 3-tier IOC ladder was implemented but unreachable from
 production because :meth:`StraddleFlow.execute` always used the
@@ -148,10 +146,10 @@ def test_all_four_ioc_sites_propagate_tiered_flag(
         assert c.get("tiered") == expected_tiered, c
 
 
-def test_v2_preset_flips_use_tiered_taker():
-    """Sanity: ``with_v2_preset`` activates the ladder; ``default`` does not."""
+def test_historical_v2_preset_flips_use_tiered_taker():
+    """Historical replay activates the ladder; the default does not."""
     default_cfg = PaperConfig()
-    v2_cfg = PaperConfig.with_v2_preset()
+    v2_cfg = PaperConfig.historical_v2_preset()
     assert default_cfg.use_tiered_taker is False
     assert v2_cfg.use_tiered_taker is True
 

@@ -25,10 +25,8 @@ Tier 5 ships a 15-min-grid implementation: rolling/EMA windows are
 scaled to the 15-min cadence (96=1d, 672=1w). This deviates from
 offline byte-identity when volume is bursty; it remains substantially
 better than baseline-frozen and is mathematically equivalent under
-constant-rate trading. For full byte-identity, future work would need
-to maintain a 1750-bar dollar-bar buffer (memory cost ~500 KB) and
-ffill TSRV onto it per handler call. Documented in the
-``vol_arb/output/PARITY_AUDIT_ROUND2.md`` synthesis.
+constant-rate trading. Exact offline parity would require maintaining a
+1750-bar dollar-bar buffer and forward-filling TSRV onto it per handler call.
 
 Caches the log-transformed vol_ann series + the rolling-1d series with
 dirty-bit invalidation tied to buffer length, so repeated handler calls

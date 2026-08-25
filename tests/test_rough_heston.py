@@ -339,6 +339,7 @@ def _synthetic_panel(
     return arr
 
 
+@pytest.mark.slow
 def test_calibration_at_truth_reproduces_truth_4p() -> None:
     """Sanity: if we init at truth AND the truth is 4-param-compatible
     (theta=V_0, kappa=2.0), the 4-param calibrator must not move from truth
@@ -363,6 +364,7 @@ def test_calibration_at_truth_reproduces_truth_4p() -> None:
     assert abs(fit.H - truth["H"]) < 1e-3
 
 
+@pytest.mark.slow
 def test_calibration_recovers_synthetic_noiseless_4param() -> None:
     """4-parameter calibration (V_0, H, eta, rho) with kappa + theta pinned.
 
@@ -424,6 +426,7 @@ def test_calibration_recovers_synthetic_noiseless_4param() -> None:
 # ── Session G — Differential Evolution regression tests ──────────────
 
 
+@pytest.mark.slow
 def test_de_cold_start_beats_nm_cold_start() -> None:
     """Session G gate: DE global search must not be worse than NM global
     search on a cold-start 4-param calibration problem.
@@ -464,6 +467,7 @@ def test_de_cold_start_beats_nm_cold_start() -> None:
     )
 
 
+@pytest.mark.slow
 def test_de_default_cold_start_recovers_synthetic() -> None:
     """Session G: from NO init (pure cold-start, data-driven V_0 only),
     the default DE+LM path must recover the synthetic truth within
@@ -564,6 +568,7 @@ def test_jit_fractional_riccati_matches_closure_version(
     )
 
 
+@pytest.mark.slow
 def test_warm_start_rescue_triggers_on_bad_init() -> None:
     """Session G warm-start rescue: if use_global_search=False and the
     warm-init is so far from truth that LM alone can't converge below the

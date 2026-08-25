@@ -35,7 +35,7 @@ def main() -> int:
     p.add_argument("--end", required=True)
     args = p.parse_args()
 
-    cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+    cfg = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
     cfg.predictions_path = args.predictions
     cfg.feature_trace_path = args.trace_out
     cfg.feature_trace_start = args.start

@@ -1,6 +1,6 @@
 """Synthetic-path + block-bootstrap evaluator for V2 candidate rules.
 
-Cycle 2 Phase A infrastructure (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 2 Phase A infrastructure.
 
 Two leakage-safe evaluation surfaces for a candidate sizing/path rule:
 
@@ -25,7 +25,7 @@ Anti-leakage guarantees:
 
 Anti-overfitting guarantees:
 - Selection metric is **10th-percentile** across reps/paths, not mean.
-- Block-bootstrap block-size is pre-committed (5 days; matches plan).
+- Block-bootstrap block size is frozen at five days for this comparison.
 - Adoption gate is loaded from caller; not negotiable in this module.
 """
 from __future__ import annotations

@@ -15,7 +15,7 @@ Pre-committed gate (verbatim from Cycle 1 Tier C-2 / Cycle 2 / Cycle 3):
   - All three required (conjunctive).
 
 Best-by-PSR-p10-(DSR-haircut) strategy that passes ALL three is the
-adoption candidate; if NONE pass, ship all 3 as opt-in only.
+best historical-threshold candidate. The result does not change a preset.
 
 Output: ``vol_arb/output/V4_SHORTFALL_OVERLAY.md``.
 
@@ -127,7 +127,7 @@ def _run_strategy(
 ) -> StrategyResult:
     logger.info("=" * 50)
     logger.info("[%s] (quantile=%.2f) sidecar: %s", tag, quantile, sidecar.name)
-    config = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+    config = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
     config.uncertainty_filter_path = str(sidecar)
 
     t0 = time.time()
@@ -183,7 +183,7 @@ def _run_strategy(
     )
     logger.info(
         f"[{tag}] gate: PSR={pass_psr}, OOS={pass_oos}, Sharpe={pass_sharpe} "
-        f"-> {'ADOPT' if gate_pass else 'REJECT'}"
+        f"-> {'PASS' if gate_pass else 'FAIL'}"
     )
 
     return StrategyResult(
@@ -268,7 +268,7 @@ def main() -> int:
         "",
         "## Per-strategy results",
         "",
-        "| Tag | Cut | NC PnL | ΔPnL | Fired | ΔSharpe(eval) | OOS cut | PSR p10 (haircut) | Adopt? |",
+        "| Tag | Cut | NC PnL | ΔPnL | Fired | ΔSharpe(eval) | OOS cut | PSR p10 (haircut) | Threshold |",
         "|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for r in results:
@@ -283,7 +283,7 @@ def main() -> int:
             f"{adopt_tag} |"
         )
 
-    lines += ["", "## Adoption decision", ""]
+    lines += ["", "## Historical threshold result", ""]
     passing = [r for r in results if r.gate_pass]
     if passing:
         passing.sort(
@@ -292,22 +292,22 @@ def main() -> int:
         )
         best = passing[0]
         lines += [
-            f"**ADOPT [{best.tag}] AS DEFAULT.** Best-passing strategy by "
+            f"**PASS [{best.tag}] HISTORICAL THRESHOLDS.** Best result by "
             f"DSR-haircut PSR p10 = {best.psr_delta_p10_haircut:+.4f}.",
             "",
             f"- Sharpe drop on eval: {best.sharpe_drop_eval:+.4f}",
             f"- OOS worst-day cut: ${best.oos_worst_cut:+,.0f}",
             f"- ΔPnL (full): ${best.pnl_delta:+,.0f}",
             "",
-            "All three pre-committed sub-gates passed.",
+            "All three historical sub-gates passed. This report does not "
+            "change a preset or validate the candidate for paper/testnet use.",
         ]
     else:
         lines += [
-            "**REJECT — ship all 3 as opt-in only.**",
+            "**FAIL — no strategy passed all historical thresholds.**",
             "",
             "No strategy passed the conjunctive triple-gate after DSR "
-            "haircut. Per Cycle 4 Phase C plan: the rule stays opt-in; "
-            "canonical V2 byte-identity preserved. Honest reject.",
+            "haircut. The historical V2 reference remains unchanged.",
             "",
             "Sub-gate failures by strategy:",
         ]
@@ -338,9 +338,9 @@ def main() -> int:
         )
     print("=" * 70)
     if passing:
-        print(f"  ADOPT [{passing[0].tag}] AS DEFAULT")
+        print(f"  PASS [{passing[0].tag}] HISTORICAL THRESHOLDS")
     else:
-        print("  REJECT -- ship 3 as opt-in")
+        print("  FAIL -- no candidate passed all historical thresholds")
     print("=" * 70)
     return 0
 

@@ -19,6 +19,37 @@ from vol_model.config import VolModelConfig
 logger = logging.getLogger(__name__)
 
 
+def detect_stamping(index: pd.DatetimeIndex, freq_s: int) -> str:
+    """Detect whether a bar parquet is START- or END-stamped from its first bar.
+
+    A bar covering the realised window ``[t, t+freq)`` is either keyed at its
+    window START (``t``, START-stamped) or its window END (``t+freq``,
+    END-stamped). For a series that begins at midnight UTC, the first bar's
+    offset-from-midnight is ``0`` when START-stamped and ``freq`` when
+    END-stamped.
+
+    This is the SSOT for the stamping-aware alignment fix (MF-2). The global
+    ``config.tsrv_end_stamped`` flag is NOT trusted: it is set ``True`` for
+    BTCUSDT but only ``BTCUSDT_tsrv_15m.parquet`` is actually END-stamped; all
+    other-horizon TSRV + HAR-PD sidecars remain START-stamped. Detecting the
+    true stamping per-file makes the alignment shift correct at every horizon
+    with a pure code change (no data re-stamp). The expected per-file
+    distinction is covered by ``tests/test_label_semantics.py``.
+
+    Returns ``"END"``, ``"START"``, or ``"OTHER"`` (anything else — caller
+    should treat as ambiguous).
+    """
+    if len(index) == 0:
+        return "OTHER"
+    first = index[0]
+    off_s = (first - first.normalize()).total_seconds()
+    if abs(off_s - freq_s) < 1e-6:
+        return "END"
+    if abs(off_s) < 1e-6:
+        return "START"
+    return "OTHER"
+
+
 def _load_iv_at_decision_time(asset: str, index: pd.Index, freq_s: int) -> pd.Series:
     """Load iv_used at the *decision* time for each label bar.
 
@@ -34,8 +65,8 @@ def _load_iv_at_decision_time(asset: str, index: pd.Index, freq_s: int) -> pd.Se
 
     ``freq_s`` is the bar size in seconds (= ``config.freq_s``); the shift
     must equal the label horizon, so callers MUST pass the same freq_s the
-    rest of the label pipeline uses. See horizon SSOT in
-    ``VolModelConfig.horizon_minutes`` (plan: starry-rolling-rabin.md).
+    rest of the label pipeline uses. The horizon source of truth is
+    ``VolModelConfig.horizon_minutes``.
     """
     ccy = CURRENCY_FOR_ASSET[asset]
     path = _vol_arb_path(ccy, svi=True)
@@ -86,17 +117,37 @@ def load_labels(
 
     # Normalize TSRV timestamp convention to START-stamped (Stage 18 semantics):
     # at any label key T, `result.ln_vol[T]` must equal `log(vol of [T, T+freq))`.
-    # The BTC TSRV parquet was migrated from START-stamped to END-stamped on
-    # 2026-04-11 (see .pre_end_stamp_bak backup + LABEL_SHIFT_AUDIT.md). Under
+    # The BTC 15m TSRV parquet was migrated from START-stamped to END-stamped on
+    # 2026-04-11. Under
     # END-stamp, bar at index T = vol of [T-freq, T); shifting the index by
     # -freq restores the START-stamp semantic assumed by align_features_labels'
     # iloc[1:] (one-bar-ahead forecast). Without this shift the label is a
     # *nowcast* of the already-closed bar — features trivially correlate with
-    # their own trade window's realized vol. Per-asset flag in config.
-    if getattr(config, "tsrv_end_stamped", False):
-        freq_td = pd.Timedelta(seconds=config.freq_s)
+    # their own trade window's realized vol.
+    #
+    # MF-2 STAMPING-AWARE FIX (2026-06-21): the global config flag
+    # `tsrv_end_stamped` is True for BTCUSDT but only the 15m TSRV parquet was
+    # actually migrated; all other horizons (5/30/60/240/480/1440m) remain
+    # START-stamped. Trusting the flag unconditionally shifted START-stamped
+    # labels one bar FORWARD -> the target became vol of [T+freq, T+2*freq)
+    # instead of [T, T+freq) (proven at h=60). We now DETECT the true stamping
+    # per-file and shift -freq ONLY when the parquet is genuinely END-stamped.
+    # h=15 (the only END-stamped file) stays byte-identical; every other
+    # horizon now correctly targets [T, T+freq). The config flag is retained as
+    # an opt-OUT safety belt: if a future migration end-stamps everything, set
+    # it False to suppress the shift; we never shift when it is False.
+    freq_td = pd.Timedelta(seconds=config.freq_s)
+    stamping = detect_stamping(tsrv.index, config.freq_s)
+    if getattr(config, "tsrv_end_stamped", False) and stamping == "END":
         tsrv = tsrv.copy()
         tsrv.index = tsrv.index - freq_td
+    elif getattr(config, "tsrv_end_stamped", False) and stamping != "END":
+        logger.info(
+            "[labels] config.tsrv_end_stamped=True but %s is %s-stamped "
+            "(freq=%ds) — NOT applying -freq shift (MF-2 stamping-aware). "
+            "Label target is [T, T+freq) as required.",
+            config.get_tsrv_path(), stamping, config.freq_s,
+        )
 
     # Drop zero-vol windows (ln(0) = -inf)
     valid = tsrv[tsrv["vol_ann"] > 0].copy()

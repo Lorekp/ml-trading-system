@@ -391,15 +391,24 @@ def run_backtest(config: SystemConfig, max_workers: int = 1) -> dict[str, Any]:
                     # NCO needs correlation matrix from past daily returns
                     past_ts = pd.to_datetime(past_signals["timestamp"])
                     assets_in_month = sorted(month_signals["asset"].unique())
+                    # NEW (B-027): apply exponential time decay to past_signals.
+                    # Recent year weighted more than year 1; prevents NCO from
+                    # over-emphasizing stale assets in regime change.
+                    # Decay: weight = exp(-months_ago / 12)
+                    _months_ago = ((month - past_ts.dt.to_period("M"))
+                                   .apply(lambda x: x.n)).astype(float)
+                    _decay = np.exp(-_months_ago / 12.0)
                     # Build per-asset daily return series from past signals
                     daily_rets = {}
                     for a in assets_in_month:
-                        a_past = past_signals[past_signals["asset"] == a]
+                        a_mask = past_signals["asset"] == a
+                        a_past = past_signals[a_mask]
                         if len(a_past) < 10:
                             continue
                         ts_a = pd.to_datetime(a_past["timestamp"])
                         rets = pd.Series(
-                            a_past["direction"].values * a_past["fwd_return"].values,
+                            a_past["direction"].values * a_past["fwd_return"].values
+                            * _decay[a_mask].values,
                             index=ts_a,
                         )
                         daily_rets[a] = rets.resample("D").sum()
@@ -411,7 +420,8 @@ def run_backtest(config: SystemConfig, max_workers: int = 1) -> dict[str, Any]:
                     names = list(ret_df.columns)
                     exp_r = np.array([
                         float((past_signals[past_signals["asset"] == a]["direction"]
-                               * past_signals[past_signals["asset"] == a]["fwd_return"]).mean())
+                               * past_signals[past_signals["asset"] == a]["fwd_return"]
+                               * _decay[past_signals["asset"] == a].values).mean())
                         if a in past_signals["asset"].values else 0.0
                         for a in names
                     ])
@@ -420,8 +430,10 @@ def run_backtest(config: SystemConfig, max_workers: int = 1) -> dict[str, Any]:
                         n_clusters=config.portfolio.nco_clusters,
                     )
                 else:
-                    # Kelly
-                    weights = compute_kelly_weights(past_signals)
+                    # NEW (B-027): apply time decay to Kelly's past_signals too.
+                    _kp = past_signals.copy()
+                    _kp["fwd_return"] = _kp["fwd_return"] * _decay.values
+                    weights = compute_kelly_weights(_kp)
 
                 month_copy = month_signals.copy()
                 month_copy["signal_strength"] = month_copy.apply(

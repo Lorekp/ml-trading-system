@@ -1,6 +1,6 @@
 """Calibrate the bivariate OU on BTC 1-minute (log-IV, log-RV) and freeze.
 
-Phase A artifact (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Phase A calibration artifact.
 
 Inputs:
 - ``vol_arb/output/minute_atm_iv.parquet`` → log-IV (median_iv / 100, log-decimal)

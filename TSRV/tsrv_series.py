@@ -22,6 +22,7 @@ from TSRV.jump_robust import (
 )
 from TSRV.sampling import _accumulate_bars
 from TSRV.signature_plot import find_knee, plot_signature
+from TSRV.windowing import timestamp_window_ids
 
 logger = logging.getLogger(__name__)
 
@@ -261,10 +262,8 @@ def _process_month_tsrv(
     prices = month_df["price"].values.astype(np.float64)
     dollar_vol = month_df["dollar_volume"].values.astype(np.float64)
 
-    # Integer window IDs via floor division on nanosecond timestamps — O(n)
-    ts_ns = month_df.index.values.astype("int64")
-    freq_ns = int(freq.value)  # nanoseconds per window
-    window_ids = ts_ns // freq_ns
+    # Integer window IDs via floor division on normalized nanosecond timestamps.
+    window_ids, freq_ns = timestamp_window_ids(month_df.index, freq)
 
     # Find contiguous block boundaries — O(n)
     change_idx = np.where(np.diff(window_ids) != 0)[0] + 1

@@ -1,7 +1,5 @@
 """Kelly K1 application in :class:`StraddleFlow.size_position`.
 
-C3 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Three contracts under test:
 
 1. **Default kelly_mult=1.0**: behaviour byte-id with the pre-C3 chain.

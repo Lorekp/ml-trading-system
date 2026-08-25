@@ -519,33 +519,38 @@ def build_close_decision_examples(
     feat = decision_features.reindex(decision_idx)[feature_cols]
     feat_vals = feat.to_numpy(dtype=np.float32)
     feature_tensor = feat_vals[clipped_idx]
-    regime_sets = dict(regime_feature_sets or {})
+    regime_sets: dict[str, pd.DataFrame | None] = dict(regime_feature_sets or {})
     if regime_features is not None and "1h" not in regime_sets:
         regime_sets["1h"] = regime_features
     if not regime_sets:
-        regime_sets["1h"] = pd.DataFrame(
-            0.0,
-            index=decision_idx,
-            columns=feature_cols,
-        )
+        # Keep the historical 1h schema, but take the zero-tensor branch below.
+        # A synthetic zero DataFrame would be shifted like real completed-bar
+        # features, turning its first row into NaN and silently dropping the
+        # first otherwise-valid close decision.
+        regime_sets["1h"] = None
+    regime_cols = list(
+        dict.fromkeys(list(feature_cols) + EXTRA_REGIME_ONLY_FEATURE_COLUMNS)
+    )
     regime_tensors: dict[str, np.ndarray] = {}
     for regime_tf, frame in regime_sets.items():
         if frame is not None and len(frame) > 0:
-            cols = list(dict.fromkeys(list(feature_cols) + EXTRA_REGIME_ONLY_FEATURE_COLUMNS))
             # Shift by 1 so we only see the COMPLETED previous bar.
             # Without shift, the bar labelled 10:00 contains close at
             # 10:59 — future data relative to any 15-min decision bar
             # inside the 10:00-10:59 window.
             regime_frame = frame.shift(1).reindex(decision_idx, method="ffill")
-            for col in cols:
+            for col in regime_cols:
                 if col not in regime_frame.columns:
                     regime_frame[col] = 0.0
-            regime_frame = regime_frame[cols]
+            # At the start of a series no prior completed regime bar exists.
+            # Use the same neutral representation as an absent regime source;
+            # never backfill from the first future-completed bar.
+            regime_frame = regime_frame[regime_cols].fillna(0.0)
             regime_vals = regime_frame.to_numpy(dtype=np.float32)
             regime_tensors[regime_tf] = regime_vals[clipped_idx]
         else:
             zeros = np.zeros(
-                (len(clipped_idx), len(feature_cols) + len(EXTRA_REGIME_ONLY_FEATURE_COLUMNS)),
+                (*clipped_idx.shape, len(regime_cols)),
                 dtype=np.float32,
             )
             regime_tensors[regime_tf] = zeros
@@ -618,7 +623,6 @@ def build_close_decision_examples(
 
     repeated = lambda arr: np.repeat(arr, max_steps)
     tiled_steps = np.tile(offsets + 1, n_trades)
-    regime_cols = list(dict.fromkeys(list(feature_cols) + EXTRA_REGIME_ONLY_FEATURE_COLUMNS))
     out = pd.DataFrame(
         {
             "trade_id": repeated(np.arange(n_trades, dtype=np.int64))[flat_valid],

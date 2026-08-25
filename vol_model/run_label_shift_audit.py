@@ -6,7 +6,7 @@ Writes per-row deltas to ``vol_model/output/label_shift_per_row.csv`` and prints
 all diagnostic stats to stdout.
 
 Usage:
-    cd C:\\Claude\\ml-trading-system
+    cd /path/to/ml-trading-system
     python -m vol_model.run_label_shift_audit
 """
 

@@ -1,0 +1,140 @@
+# Historical Binance-data / Bybit-demo profile
+# =============================================
+# Signals computed from Binance Futures OHLCV (matches training data).
+# Simulated/demo orders use the historical MkrTkr60 flow.
+#
+# Set BYBIT_API_KEY and BYBIT_API_SECRET in .env or environment.
+# This preserved profile must remain on demo/testnet.
+
+data:
+  name: "binance"
+  rate_limit_per_sec: 5
+  timeout_s: 10.0
+
+exchange:
+  name: "bybit"
+  demo: true                # required for this historical profile
+  base_url: "https://api.bybit.eu"  # EU endpoint (MiCA — required for EEA accounts)
+  api_key: ""               # injected from BYBIT_API_KEY env var
+  api_secret: ""            # injected from BYBIT_API_SECRET env var
+  rate_limit_per_sec: 10
+  timeout_s: 10.0
+  quote_currency: "USDT"
+
+capital: 200000
+model_dir: "data/live/models"
+leverage: 4
+
+full5:
+  - {tf: "15m", hold: 2,  resample: "15min", lookback: 200}
+  - {tf: "1h",  hold: 4,  resample: "1h",    lookback: 200}
+  - {tf: "3h",  hold: 16, resample: "3h",    lookback: 200}
+  - {tf: "4h",  hold: 6,  resample: "4h",    lookback: 200}
+  - {tf: "24h", hold: 12, resample: "1D",    lookback: 200}
+
+mkrtk60:
+  maker_wait_s: 60
+  poll_interval_s: 5.0
+  max_retries: 2
+
+breaker:
+  type: "pnl_ratio_symmetric"
+  window: 10
+  threshold: -0.01
+  floor: 0.10
+  up_threshold: 0.01
+  cap: 1.5
+
+portfolio:
+  max_dd: 0.10
+  delever_start: 0.05
+  max_exposure: 0.90
+  max_per_asset: 0.25
+  max_per_strategy: 0.50
+  max_positions_per_strategy: 20
+  base_sizing_pct: 0.300
+  max_signal_mult: 2.0
+  sizing_mode: "probability_edge"
+  regime_exposure_floor: 0.50
+  daily_dd_limit: 0.05
+  max_margin_pct: 0.25
+  max_notional_mult: 2.0
+
+s8:
+  core: [BTC, ETH, XRP, ADA, LINK, LTC, BNB, BCH, ETC]
+  max_total: 30
+  btc_vol_window: 20
+  rebalance_day: 1
+  prep_cache_path: "experiments/.cache/v2_prep_cache.pkl"
+
+scheduler:
+  bar_interval_m: 15
+  poll_offset_s: 5
+
+telegram:
+  enabled: true
+  notify_on: [trade, error, daily]
+
+db_path: "data/live/live_bybit.db"
+log_level: "INFO"
+
+strategies:
+  s8_sym15:
+    class: "live.strategies.s8_sym15.S8Sym15Strategy"
+    enabled: true
+    model_dir: "data/live/models"
+    timeframes: ["15m", "1h", "3h", "4h", "24h"]
+    holds: [2, 4, 16, 6, 12]
+    breaker:
+      type: "pnl_ratio_symmetric"
+      window: 10
+      threshold: -0.01
+      floor: 0.10
+      up_threshold: 0.01
+      cap: 1.5
+    s8:
+      core: [BTC, ETH, XRP, ADA, LINK, LTC, BNB, BCH, ETC]
+      max_total: 30
+      btc_vol_window: 20
+      prep_cache_path: "experiments/.cache/v2_prep_cache.pkl"
+    portfolio:
+      base_sizing_pct: 0.300
+      max_signal_mult: 2.0
+      max_dd: 0.10
+      delever_start: 0.05
+      max_per_asset: 0.25
+      max_exposure: 0.90
+      regime_exposure_floor: 0.50
+    quote_currency: "USDT"
+    vol_overlay:
+      target_vol: 0.025
+      floor: 0.3
+      cap: 1.5
+    signal_generator:
+      conf_threshold: 0.08
+      regime_ema_span: 20
+
+max_signals_per_bar: 20
+max_risk_per_trade: 0.03
+sl_cap: 0.75
+
+monitor:
+  expected_maker_fill_rate: 0.77
+  expected_spread_bps: 1.22
+  expected_avg_cost_bps: 3.9
+  fill_rate_drift_threshold: 0.10
+  slippage_alert_bps: 5.0
+  latency_p95_alert_ms: 65000
+
+reconciler:
+  stale_order_age_minutes: 5
+
+data_validator:
+  max_staleness_factor: 3.0
+  max_gap_factor: 3.0
+  min_bars: 30
+
+vol_overlay:
+  target_vol: 0.025
+  floor: 0.3
+  cap: 1.5

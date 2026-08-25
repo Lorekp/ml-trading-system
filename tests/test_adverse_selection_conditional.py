@@ -150,7 +150,7 @@ def test_maker_adverse_selection_default_unchanged():
 
 
 def test_v2_preset_inherits_penalty_param():
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.maker_adverse_selection_iv == 0.5
 
 

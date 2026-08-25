@@ -271,5 +271,5 @@ class TestBacktesterIntegration:
 
     def test_v2_preset_does_not_auto_enable(self):
         from vol_arb.backtester import BacktestConfig
-        cfg = BacktestConfig().with_btc_production_filters_v2()
+        cfg = BacktestConfig().with_historical_btc_v2()
         assert cfg.uncertainty_filter_path is None

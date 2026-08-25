@@ -6,8 +6,7 @@
 # - 5-min stop-loss timeout
 # - Higher confidence threshold
 #
-# Use alongside live_mexc.yaml or live_paper.yaml:
-#   The engine merges risk overrides at startup.
+# Historical paper-risk override for live_paper.yaml.
 
 risk:
   max_positions: 4

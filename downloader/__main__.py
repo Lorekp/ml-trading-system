@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 
 from downloader.config import DownloadConfig
@@ -30,8 +31,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Download everything (BTC+ETH, all endpoints)
-  python -m downloader --client-id XXX --client-secret YYY
+  # Download everything (authenticated endpoints read DERIBIT_API_KEY and
+  # DERIBIT_API_SECRET from the environment)
+  python -m downloader
 
   # Just DVOL at 5-min resolution
   python -m downloader --endpoints dvol --resolution 5
@@ -57,8 +59,6 @@ Examples:
     parser.add_argument("--candle-resolution", default="5", help="Candle resolution in minutes")
     parser.add_argument("--output-dir", default="data/deribit")
     parser.add_argument("--max-workers", type=int, default=4)
-    parser.add_argument("--client-id", default="2kCTTPjV")
-    parser.add_argument("--client-secret", default="gQJjU-OOImmA-kbCCnLqjm0wTtN24WdboLW6q7tQjfI")
     parser.add_argument("--candle-instruments", nargs="+",
                         default=["BTC-PERPETUAL", "ETH-PERPETUAL"])
     parser.add_argument("--trades-sample-days", type=int, default=1,
@@ -82,8 +82,8 @@ Examples:
         candle_resolution=args.candle_resolution,
         output_dir=args.output_dir,
         max_workers=args.max_workers,
-        client_id=args.client_id,
-        client_secret=args.client_secret,
+        client_id=os.getenv("DERIBIT_API_KEY"),
+        client_secret=os.getenv("DERIBIT_API_SECRET"),
         candle_instruments=args.candle_instruments,
         trades_sample_days=args.trades_sample_days,
         trades_max_pages=args.trades_max_pages,

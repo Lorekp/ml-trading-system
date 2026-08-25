@@ -1,10 +1,8 @@
-"""Reproduction harness — Stage A: live vs V2-backtest per-trade diff.
-
-I4 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
+"""Historical replay harness: paper-engine versus V2 per-trade diff.
 
 Inputs:
   ``vol_arb/output/live_trades_harness.parquet``  (live engine, C6).
-  ``vol_arb/output/BTC_v2_trade_log.parquet``     (canonical V2 backtest).
+  ``vol_arb/output/BTC_v2_trade_log.parquet``     (invalidated historical V2 artifact).
 
 For each live trade, find the matching V2 trade-log row by
 ``started_at`` and compute per-column deltas. Aggregates into a
@@ -16,9 +14,8 @@ buckets:
 * **price drift**   — entry/exit prices differ
   (slippage model, strike rounding, fill-time differences).
 * **PnL residual**  — sign/magnitude of realized PnL difference.
-* **strike rounding** — known irreducible drift budget per the
-  ``03-research-sidecars-slippage.md`` quantification (~2-4 vol pts /
-  0.5-1% edge shrinkage on typical bars).
+* **strike rounding** — historical diagnostics observed roughly 2-4 vol
+  points / 0.5-1% edge shrinkage on typical bars.
 
 Output:
   ``vol_arb/output/h15_alignment/harness_stage_a.parquet``
@@ -31,7 +28,7 @@ limited information and is deliberately deferred.
 
 Usage::
 
-    cd C:/Claude/ml-trading-system
+    # from the repository root
     PYTHONPATH=. python scripts/h15_alignment_harness.py
 """
 from __future__ import annotations

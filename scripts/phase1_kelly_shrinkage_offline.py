@@ -1,7 +1,7 @@
-"""Phase 1 offline evaluation of long-side Kelly-shrinkage sizing boost.
+"""Historical offline evaluation of long-side Kelly-shrinkage sizing.
 
-Plan: C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md
-Project memory reference: project_kelly_sizing_2026_04_21.md (to be written).
+This script consumes the invalidated historical V2 trade log. Its output is
+for forensic reproduction and cannot validate a sizing rule or trading result.
 
 Purpose
 -------
@@ -493,8 +493,6 @@ def format_report(results_primary: list[dict], results_baseline: list[dict]) -> 
     lines.append("# Phase 1: Long-side Kelly-shrinkage sizing — offline evaluation")
     lines.append("")
     lines.append("**Run date**: 2026-04-21. **Seed**: 42. **N_bootstrap**: 1000. **N_permutation**: 1000.")
-    lines.append("")
-    lines.append("Plan: `C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md`")
     lines.append("")
     lines.append("## Phase 0 verdict — profit_scaling is orthogonal, not redundant")
     lines.append("")

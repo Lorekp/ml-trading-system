@@ -1,7 +1,5 @@
 """Tests for the aligner β* staleness alert at engine startup.
 
-E.2.3 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 Three contracts under test:
 
 1. **Stale ≥ 2 months under V2 preset** → ``RuntimeError`` (refuse to start).

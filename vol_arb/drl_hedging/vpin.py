@@ -54,9 +54,8 @@ def compute_option_vpin_15m(
     The "15m" suffix in the function name is legacy — the implementation
     is horizon-aware via ``tf_str`` (default ``"15min"`` preserves legacy
     byte-identical output). Pass ``tf_str="5min"``/``"30min"``/``"60min"``
-    for other horizons. See horizon SSOT in
-    ``vol_model.config.VolModelConfig.tf_str`` and plan
-    ``starry-rolling-rabin.md`` Phase 2h5.0b.
+    for other horizons. The horizon source of truth is
+    ``vol_model.config.VolModelConfig.tf_str``.
 
     Parameters
     ----------

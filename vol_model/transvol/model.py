@@ -37,6 +37,35 @@ def qlike_ratio_loss(c_true: torch.Tensor, c_pred_raw: torch.Tensor) -> torch.Te
     return torch.mean(ratio - torch.log(ratio) - 1.0)
 
 
+def log_mse_loss(
+    logc_true: torch.Tensor, logc_pred: torch.Tensor,
+) -> torch.Tensor:
+    """R2 (TransVol rehab): plain MSE in log-variance space.
+
+    With a log-target the prediction error is linear-in-log across all
+    regimes, so a Gaussian-NLL with fixed unit variance reduces to MSE and
+    is a *proper* loss (minimised in expectation at E[log c | x]). No
+    softplus, no ratio clamp, no bias=-11 hack. ``logc_pred`` is the raw
+    head output interpreted directly as predicted log(continuous_var).
+    """
+    return F.mse_loss(logc_pred, logc_true)
+
+
+def qlike_ratio_from_log(
+    c_true: torch.Tensor, logc_pred: torch.Tensor,
+) -> torch.Tensor:
+    """Patton QLIKE metric in VARIANCE space, given a log-variance prediction.
+
+    Used ONLY for validation reporting in log-target (R2) mode so val_qlike
+    is on the same scale as the production ratio-form QLIKE and the two runs
+    are directly comparable. ``c_true`` is RAW variance; ``logc_pred`` is the
+    head's log prediction. c_hat = exp(logc_pred).
+    """
+    c_hat = torch.exp(logc_pred.clamp(max=20.0)) + 1e-12
+    ratio = (c_true / c_hat).clamp(max=100.0)
+    return torch.mean(ratio - torch.log(ratio) - 1.0)
+
+
 def huber_jump_loss(
     j_true: torch.Tensor, j_pred_raw: torch.Tensor, delta: float = 0.01,
 ) -> torch.Tensor:
@@ -140,11 +169,18 @@ class TransVolEncoder(nn.Module):
 
         self._init_weights()
 
-        # Initialize output biases so softplus starts near target means
-        # continuous_var ~ 1.6e-5, softplus(x) ≈ x for x >> 0, so init bias ≈ log(exp(1.6e-5) - 1) ≈ -11
-        # jump_var is normalized to mean=1.0, softplus(0) = 0.69, close enough
+        # Initialize output biases so the head starts near the target mean.
         with torch.no_grad():
-            self.head_continuous[-1].bias.fill_(-11.0)
+            if getattr(config, "target_log", False):
+                # R2 (rehab): head predicts log(continuous_var) directly (no
+                # softplus). Init the bias to the train-mean of the log-target
+                # so the model starts calibrated. Removes the -11 softplus hack.
+                self.head_continuous[-1].bias.fill_(float(config.cont_log_bias))
+            else:
+                # PRODUCTION: softplus link. continuous_var ~ 1.6e-5,
+                # softplus(x) ≈ x for x >> 0, so init bias ≈ log(exp(1.6e-5)-1) ≈ -11.
+                self.head_continuous[-1].bias.fill_(-11.0)
+            # jump_var is normalized to mean=1.0, softplus(0) = 0.69, close enough
             self.head_jump[-1].bias.fill_(0.0)
 
     def _init_weights(self):
@@ -212,18 +248,52 @@ class TransVolEncoder(nn.Module):
         outputs: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        """MTL loss with fixed weights. QLIKE dominates (0.8), jump regularizes (0.2)."""
-        loss_qlike = qlike_ratio_loss(
-            targets["continuous_var"], outputs["continuous_var_raw"],
-        )
+        """MTL loss with fixed weights. QLIKE dominates (0.8), jump regularizes (0.2).
+
+        Two modes for the continuous-variance head:
+          * PRODUCTION (``target_log=False``): ratio-form QLIKE on raw
+            variance with a softplus link. ``targets['continuous_var']`` is
+            RAW variance. ``total`` and ``qlike`` are identical to the
+            deployed model — byte-for-byte unchanged.
+          * R2 REHAB (``target_log=True``): MSE in log space; the training
+            ``total`` uses that MSE, while the reported ``qlike`` is the true
+            Patton QLIKE in variance space (computed from the log prediction)
+            so val_qlike stays comparable across modes.
+            ``targets['continuous_var']`` is the LOG target;
+            ``targets['continuous_var_raw_for_metric']`` (when supplied) is
+            the raw variance used only for the QLIKE metric.
+        """
         loss_jump = huber_jump_loss(
             targets["jump_var"], outputs["jump_var_raw"],
             delta=self.config.huber_delta,
         )
 
+        if getattr(self.config, "target_log", False):
+            # continuous_var target is in LOG space here.
+            train_loss = log_mse_loss(
+                targets["continuous_var"], outputs["continuous_var_raw"],
+            )
+            # QLIKE metric (variance space) for reporting/early-stopping parity.
+            c_raw = targets.get(
+                "continuous_var_raw_for_metric", targets["continuous_var"],
+            )
+            qlike_metric = qlike_ratio_from_log(
+                c_raw, outputs["continuous_var_raw"],
+            )
+            total = (self.config.loss_weight_qlike * train_loss
+                     + self.config.loss_weight_jump * loss_jump)
+            return {
+                "total": total,
+                "qlike": qlike_metric,
+                "log_mse": train_loss,
+                "huber_jump": loss_jump,
+            }
+
+        loss_qlike = qlike_ratio_loss(
+            targets["continuous_var"], outputs["continuous_var_raw"],
+        )
         total = (self.config.loss_weight_qlike * loss_qlike
                  + self.config.loss_weight_jump * loss_jump)
-
         return {
             "total": total,
             "qlike": loss_qlike,

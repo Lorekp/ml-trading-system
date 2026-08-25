@@ -1,6 +1,6 @@
-"""S-1b (parity-r3 cycle 5 — 2026-05-08) latest-month training verification.
+"""Latest-month research-bundle structural verification.
 
-Asserts that the production model bundle for the latest-trained month
+Asserts that the historical model bundle for the latest-trained month
 loads cleanly and passes basic health gates:
 
 1. ``expanding_pruned_svi_v1/{latest}.txt`` + features.json present.
@@ -10,8 +10,8 @@ loads cleanly and passes basic health gates:
 5. ``load_model_bundle()`` returns a bundle for the latest month and
    the encoder's smoke inference produces a valid 16-dim embedding.
 
-Exits non-zero on any gate failure so an operator catches a stalled
-training run before it propagates to live deployments.
+Exits non-zero on any gate failure so a stalled research run is visible. A
+pass is a bundle-health check, not model or deployment validation.
 
 Usage::
 
@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO_ROOT))
 LGBM_DIR = REPO_ROOT / "vol_model" / "output" / "models" / "expanding_pruned_svi_v1"
 TRANSVOL_DIR = REPO_ROOT / "vol_model" / "output" / "models" / "expanding_hybrid"
 
-QLIKE_GATE = 0.7  # below typical baseline (0.76+); any month above this is suspect
+QLIKE_GATE = 0.7  # Historical health threshold; not a promotion gate.
 
 
 def _latest_dated_file(directory: Path, pattern: str) -> tuple[str, Path] | None:
@@ -164,7 +164,8 @@ def main() -> int:
     )
 
     print("=" * 70)
-    print(f"  PASS — {month} bundle is healthy and production-ready")
+    print(f"  PASS — {month} bundle passed structural and smoke checks")
+    print("  This does not establish model validity or deployment readiness.")
     print("=" * 70)
     return 0
 

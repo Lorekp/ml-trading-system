@@ -39,6 +39,7 @@ import pandas as pd
 
 from TSRV.data_loader import available_months, load_trades
 from TSRV.sampling import _accumulate_bars
+from TSRV.windowing import timestamp_window_ids
 
 
 logging.basicConfig(
@@ -96,11 +97,11 @@ def process_month_rq(
     if n < 10:
         return pd.DataFrame(columns=["rq", "n_sub_bars"])
 
-    freq_ns = int(pd.Timedelta(seconds=slow_tf_s).value)
     prices = month_df["price"].values.astype(np.float64)
     dollar_vol = month_df["dollar_volume"].values.astype(np.float64)
-    ts_ns = month_df.index.values.astype("int64")
-    window_ids = ts_ns // freq_ns
+    window_ids, freq_ns = timestamp_window_ids(
+        month_df.index, pd.Timedelta(seconds=slow_tf_s),
+    )
 
     change_idx = np.where(np.diff(window_ids) != 0)[0] + 1
     block_starts = np.empty(len(change_idx) + 1, dtype=np.int64)

@@ -1,8 +1,8 @@
 """PatchTST encoder -- drop-in replacement candidate for TransVol.
 
 See ``vol_model/patchtst/encoder.py`` for the model.
-See ``vol_model/patchtst/train.py`` for the training driver (training
-itself is deferred to an explicit user-approved run; see SIGNAL_RESEARCH_NOTES.md).
+See ``vol_model/patchtst/train.py`` for the research training driver. No
+PatchTST result is promoted in the current validation ledger.
 
 Reference:
     Nie, Nguyen, Sinthong, Kalagnanam. "A Time Series is Worth 64 Words:

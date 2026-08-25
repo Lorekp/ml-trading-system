@@ -1,7 +1,5 @@
 """Tests for ``deribit_paper/execution/slippage_calc.py::live_slippage_pct``.
 
-C4 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Three contracts under test:
 
 1. **Sidecar-only path**: with no observed spread, the function converts
@@ -194,4 +192,3 @@ def test_v2_impact_formula_only_when_both_args():
     )
     # Legacy: 100 * 10 / 60K = 0.0167%
     assert pct == pytest.approx(0.01667, abs=1e-3)
-

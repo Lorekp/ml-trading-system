@@ -10,7 +10,7 @@ OOS predictions into a single parquet for the backtester to consume.
 The output file is compatible with ``BacktestConfig.predictions_path`` —
 same ``y_pred`` column name, same DatetimeIndex — so comparing pruned+SVI+HAR-PD
 vs pruned+SVI is just two ``run_backtest`` invocations with different
-``--predictions-path`` overrides, or (preferred for certification) a QLIKE/DM
+``--predictions-path`` overrides, or (preferred for research comparison) a QLIKE/DM
 comparison via ``vol_model/compare_pruned_svi_har_pd_vs_baseline.py``.
 
 Usage:
@@ -35,17 +35,21 @@ from vol_arb.paths import (
 )
 from vol_model.config import VolModelConfig
 from vol_model.pipeline import build_dataset
-from vol_model.run_walkforward_hybrid import _extract_compact_embeddings
-from vol_model.run_walkforward_pruned_svi import (
-    ADD_SVI_FEATURES,
-    DROP_FEATURES,
-)
-# Load both helpers from the HAR-PD walk-forward variant — that one
-# accepts ``horizon_minutes`` (Phase 1 horizon-parametrization), the
-# pruned_svi-only variant does not. Functionally identical at h=15
-# and supports h=5/30/60 cleanly.
+# NOTE: _extract_compact_embeddings (imports torch + the transvol package at
+# module top) is imported LAZILY inside the TransVol branch only, so the
+# --no-transvol path used by the AWS-spot horizon sweep stays torch-free.
+#
+# ALL feature-list constants + loaders come from the HAR-PD walk-forward variant
+# (run_walkforward_pruned_svi_har_pd), which is torch-free and carries the same
+# ADD_SVI_FEATURES / DROP_FEATURES values as the pruned_svi-only variant. We
+# deliberately do NOT import from run_walkforward_pruned_svi here — that module
+# does `import torch` at top, which would re-introduce the torch dependency on
+# the --no-transvol box. The har_pd variant also accepts ``horizon_minutes``
+# (Phase-1 horizon-parametrization) so it supports h=5/30/60/240/1440 cleanly.
 from vol_model.run_walkforward_pruned_svi_har_pd import (
     ADD_HAR_PD_FEATURES,
+    ADD_SVI_FEATURES,
+    DROP_FEATURES,
     _load_har_pd,
     _load_svi_atm_1d,
 )
@@ -92,12 +96,14 @@ def _emit_trace_rows(
             return 0
         X_w = X.loc[idx]
         preds_w = preds[X.index.isin(idx)]
-        emb_w = emb_df.loc[emb_df.index.isin(idx)]
+        emb_w = emb_df.loc[emb_df.index.isin(idx)] if emb_df is not None else None
     else:
         X_w = X
         preds_w = preds
         emb_w = emb_df
 
+    # In --no-transvol mode there are no tv_* columns, so the embedding block
+    # below is naturally skipped (emit-trace is a debug-only opt-in anyway).
     tv_cols = [c for c in X_w.columns if c.startswith("tv_")]
 
     n_written = 0
@@ -122,7 +128,7 @@ def _emit_trace_rows(
             # C5: tv embedding (extracted from the same X row to guarantee
             # it's the exact vector LGBM saw, not the un-aligned emb_df).
             tv_vals = [row_feats.get(c) for c in tv_cols]
-            if all(v is not None and pd.notna(v) for v in tv_vals):
+            if tv_cols and all(v is not None and pd.notna(v) for v in tv_vals):
                 row["transvol_embedding"] = [float(v) for v in tv_vals]
                 row["transvol_status"] = "computed"
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -155,6 +161,18 @@ def main() -> None:
                         help="Timeframe in seconds (default 900 = 15m)")
     parser.add_argument("--tag", type=str, default="",
                         help="Optional model dir suffix tag")
+    parser.add_argument("--transvol-dir", type=str, default="",
+                        help="Override the TransVol checkpoint dir (else the "
+                             "per-asset/per-horizon resolver). Point at the rehab "
+                             "checkpoints to extract the clean-rehab tv_* "
+                             "predictions without touching production.")
+    parser.add_argument("--no-transvol", action="store_true",
+                        help="Mirror the walk-forward's --no-transvol training: skip the "
+                             "TransVol .pt checkpoint lookup and embedding extraction "
+                             "entirely (no torch import). REQUIRED on the AWS-spot box, "
+                             "where .pt checkpoints are never staged. The LGBM feature "
+                             "manifest produced by a --no-transvol walk-forward carries no "
+                             "tv_* columns, so predictions reproduce exactly.")
     parser.add_argument("--predict-excess-logvol", action="store_true",
                         help="Match the excess-logvol training target: build "
                              "the same reparam'd label so test-time QLIKE/RankIC "
@@ -191,7 +209,10 @@ def main() -> None:
     # TransVol checkpoint dir must match the active horizon (see
     # foundation-fix invariant: model horizon == feature horizon ==
     # TransVol horizon). Legacy h=15 returns the unsuffixed BTC path.
-    hybrid_dir = transvol_dir(args.asset, horizon_minutes=args.tf // 60)
+    hybrid_dir = (
+        Path(args.transvol_dir) if args.transvol_dir
+        else transvol_dir(args.asset, horizon_minutes=args.tf // 60)
+    )
 
     # Resolve model dir — default mirrors the HAR-PD walk-forward's output dir.
     if args.model_dir:
@@ -369,50 +390,50 @@ def main() -> None:
                         i + 1, len(months), month_str, used_month)
 
         # TransVol checkpoint — also fall back to the most recent
-        # existing one for the partial-month case.
-        tv_path = hybrid_dir / f"{month_str}_transvol.pt"
-        if not tv_path.exists():
-            # Try the fallback used_month's TransVol
-            fallback_tv = hybrid_dir / f"{used_month}_transvol.pt"
-            if fallback_tv.exists():
-                tv_path = fallback_tv
-                logger.info("[%d/%d] %s: using fallback TransVol %s",
-                            i + 1, len(months), month_str, used_month)
-            else:
-                logger.warning("[%d/%d] %s: TransVol checkpoint missing", i + 1, len(months), month_str)
-                n_skip += 1
-                continue
-
+        # existing one for the partial-month case. Skipped entirely in
+        # --no-transvol mode (the AWS-spot box never stages .pt files).
         test_end = M + pd.DateOffset(months=1)
         # Cap test_end at end_date_partial if it's earlier (partial-month case)
         if end_date_partial is not None and test_end > end_date_partial:
             test_end = end_date_partial
         V = max(M - pd.DateOffset(months=4), data_start + pd.DateOffset(months=12))
 
-        # Extract TransVol embeddings (same as training)
-        try:
-            emb_df = _extract_compact_embeddings(tv_path, X_tv, labels, test_end)
-        except Exception:  # noqa: BLE001
-            logger.exception("[%d/%d] %s: TransVol extraction failed", i + 1, len(months), month_str)
-            n_skip += 1
-            continue
+        emb_df = None
+        if not args.no_transvol:
+            tv_path = hybrid_dir / f"{month_str}_transvol.pt"
+            if not tv_path.exists():
+                # Try the fallback used_month's TransVol
+                fallback_tv = hybrid_dir / f"{used_month}_transvol.pt"
+                if fallback_tv.exists():
+                    tv_path = fallback_tv
+                    logger.info("[%d/%d] %s: using fallback TransVol %s",
+                                i + 1, len(months), month_str, used_month)
+                else:
+                    logger.warning("[%d/%d] %s: TransVol checkpoint missing", i + 1, len(months), month_str)
+                    n_skip += 1
+                    continue
+            # Lazy import: pulls torch + transvol. Only on the TransVol path.
+            from vol_model.run_walkforward_hybrid import _extract_compact_embeddings
+            try:
+                emb_df = _extract_compact_embeddings(tv_path, X_tv, labels, test_end)
+            except Exception:  # noqa: BLE001
+                logger.exception("[%d/%d] %s: TransVol extraction failed", i + 1, len(months), month_str)
+                n_skip += 1
+                continue
 
-        # Build X_month — exactly the same concat as training
+        # Build X_month — exactly the same concat as training. In --no-transvol
+        # mode emb_df is None and is omitted (the manifest carries no tv_* cols).
         common = (
             X_pruned.index
-            .intersection(emb_df.index)
             .intersection(svi_add.index)
             .intersection(har_pd_add.index)
         )
-        X_month = pd.concat(
-            [
-                emb_df.loc[common],
-                X_pruned.loc[common],
-                svi_add.loc[common],
-                har_pd_add.loc[common],
-            ],
-            axis=1,
-        )
+        if emb_df is not None:
+            common = common.intersection(emb_df.index)
+        frames = [X_pruned.loc[common], svi_add.loc[common], har_pd_add.loc[common]]
+        if emb_df is not None:
+            frames.insert(0, emb_df.loc[common])
+        X_month = pd.concat(frames, axis=1)
         common_y = X_month.index.intersection(y.index)
         X_month = X_month.loc[common_y]
         y_month = y.loc[common_y]

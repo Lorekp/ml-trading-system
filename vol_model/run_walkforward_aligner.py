@@ -191,9 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("  |β̃| ≈ 0 → raw model is well-centered; little to correct.")
     if qlike_rel_delta_pct < -1.0:
-        logger.info("  QLIKE improved by >1%% → worth shipping as a sidecar.")
+        logger.info("  QLIKE improved by >1%% in this historical diagnostic.")
     elif qlike_rel_delta_pct < -0.1:
-        logger.info("  QLIKE improved marginally — below production-ship threshold.")
+        logger.info("  QLIKE improved marginally in this historical diagnostic.")
     else:
         logger.info("  QLIKE did not meaningfully improve — aligner unhelpful here.")
 

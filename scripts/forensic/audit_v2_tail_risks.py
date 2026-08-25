@@ -20,8 +20,7 @@ Methodology grounded in:
 * Deribit Portfolio Margin Engine: IM = 1.3 × MM, liquidation at 100%
   MM usage, main table ±17.5% spot shock for BTC.
 
-Pre-committed parameters (locked in plan
-``C:\\Users\\laure\\.claude\\plans\\now-check-empirically-from-eager-bird.md``):
+Historical audit parameters:
 
 * Materiality: $ exposure ≥ 1.0% of cumulative V2 NC PnL ($9,596) OR
   worst-day exposure ≥ 5× median daily NC PnL ($3,200).

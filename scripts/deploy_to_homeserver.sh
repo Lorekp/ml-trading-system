@@ -200,9 +200,7 @@ MODEL_FILES=(
 DATA_FILES=(
     "vol_model/output/aligner_betas_by_month.json"     # ~2KB
     "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"      # ~1.3MB (kept as fallback)
-    # Cycle-11 (2026-05-10): K1 + walk-forward term_slope amplifier;
-    # shipped as V2 preset default. +$33K NC PnL, Sharpe -0.031, MDD
-    # unchanged. See vol_arb/output/PHASE2_LONG_SIZING.md.
+    # Historical V2 K1 + term-slope sidecar; retained only for replay parity.
     "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet" # ~1.3MB (cycle-11)
     "vol_arb/output/bar_execution_quality.parquet"     # ~5.5MB
     # Cycle-10 parity audit (2026-05-10): both gated by 45-day staleness
@@ -312,9 +310,9 @@ sac_size = os.path.getsize(sac_zip)
 assert sac_size > 1_000_000, \"SAC zip suspiciously small\"
 print(\"SAC v4 zip: OK (\" + str(sac_size) + \" bytes; load-test deferred)\")
 
-# V2 preset wires all E.1+E.2 invariants + cycle-10
+# Historical V2 reconstruction is retained only for forensic replay.
 from deribit_paper.config import PaperConfig
-v2 = PaperConfig.with_v2_preset()
+v2 = PaperConfig.historical_v2_preset()
 assert v2.use_profit_scaling is True              # E.1.1
 assert v2.use_tiered_taker is True                # E.1.6
 assert v2.entry_threshold_long == 12.0
@@ -332,7 +330,7 @@ assert v2.sizing_liq_cap == 1.5                    # cycle-17 KEPT: Sharpe-bound
 assert v2.kill_switch_daily_dd_pct == 5.0          # cycle-18: live-only halt threshold
 assert v2.base_spread_iv == 2.0                    # parity-r3 c2 + cycle-20 revert
 assert v2.max_gross_notional_usd == 200_000.0      # cycle-10: gross notional cap
-print(\"V2 preset: OK (cycles 10-18 invariants + cycle-21 hardening)\")
+print(\"Historical V2 replay preset: OK (invalidated; not deployable)\")
 
 # CLI imports (incl --allow-stale-aligner flag)
 from deribit_paper.cli import _parse_args, main as _cli_main
@@ -382,9 +380,9 @@ echo "To restart paper trader (mainnet quotes, simulated fills, auto-restart):"
 echo "  ssh $HOST \"tmux kill-session -t deribit 2>/dev/null; \\"
 echo "    tmux new-session -d -s deribit -c $REMOTE_DIR \\"
 echo "    'PYTHONPATH=. bash deribit_paper/scripts/run_engine.sh \\"
-echo "       --paper --config-preset v2 --duration-minutes 0 \\"
+echo "       --paper --duration-minutes 0 \\"
 echo "       --log-level INFO \\"
-echo "       2>&1 | tee deribit_paper/logs/paper_v2_\$(date +%Y%m%d_%H%M).log'\""
+echo "       2>&1 | tee deribit_paper/logs/paper_default_\$(date +%Y%m%d_%H%M).log'\""
 echo ""
 echo "(run_engine.sh auto-restarts on crash with exponential backoff and"
 echo "stops cleanly on rc=0 or rc=42. Use --allow-stale-aligner if the"

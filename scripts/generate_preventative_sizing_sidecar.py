@@ -1,6 +1,6 @@
 """Generate the per-bar preventative-sizing multiplier sidecar.
 
-Phase P artifact (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Phase P artifact generator.
 
 Reads:
   - ``vol_arb/output/BTC_v2_trade_log.parquet``: canonical V2 bars with

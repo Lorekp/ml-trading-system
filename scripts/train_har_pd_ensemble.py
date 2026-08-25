@@ -1,8 +1,8 @@
 """Train the K=10 deep-ensemble HAR-PD and freeze per-bar uncertainty.
 
-Phase A artifact (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Phase A artifact generator.
 
-Builds the production HAR-PD feature matrix via ``vol_model.pipeline.
+Builds the historical HAR-PD feature matrix via ``vol_model.pipeline.
 build_dataset`` and trains K independent LightGBM members under purged
 K-fold CV. Per-member OOF predictions form an ``(K, n_bars)`` matrix;
 per-bar variance across members is the epistemic-uncertainty estimate.

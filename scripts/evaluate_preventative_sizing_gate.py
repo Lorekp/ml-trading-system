@@ -1,6 +1,6 @@
 """Evaluate the preventative-sizing rule against the pre-committed gate.
 
-Phase P gate runner (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Phase P gate runner.
 
 Inputs:
   - ``vol_arb/output/BTC_v2_trade_log.parquet``: canonical V2 baseline.
@@ -231,7 +231,7 @@ def main() -> int:
     lines = [
         "# V2 Preventative Sizing — Gate Evaluation",
         "",
-        "Cycle 2 Phase P (plan: `now-check-empirically-from-eager-bird.md`).",
+        "Historical Cycle 2 Phase P comparison.",
         "",
         "## Pre-committed external anchors (locked, NOT tuned)",
         "",
@@ -306,9 +306,9 @@ def main() -> int:
         f"(gate >= +{GATE_PSR_P10_DELTA:.2f}) "
         f"{'PASS' if pass_psr else 'FAIL'}",
         "",
-        "## Adoption decision",
+        "## Historical threshold result",
         "",
-        f"**{'ADOPT AS DEFAULT' if gate_pass else 'REJECT — ship as opt-in only'}**",
+        f"**{'PASS' if gate_pass else 'FAIL'} HISTORICAL THRESHOLDS**",
         "",
     ]
     if not gate_pass:
@@ -319,12 +319,11 @@ def main() -> int:
         lines += [
             f"Failed sub-gates: {', '.join(failed)}.",
             "",
-            "Per Cycle 2 Phase P plan: failure on ANY sub-gate keeps the rule "
-            "opt-in only. Canonical V2 unchanged. The candidate sidecar "
-            "remains available via `--preventative-sizing` opt-in. Honest "
+            "Failure on any frozen sub-gate leaves the candidate as research "
+            "output only. The historical V2 reference is unchanged. Honest "
             "reject under pre-committed methodology — lowering the gate to "
             "match observed numbers would be exactly the storytelling-bias "
-            "failure mode the plan codified.",
+            "failure mode the protocol guards against.",
         ]
         # Structural diagnostic: did the rule actually bind on fired trades?
         lines += [
@@ -377,9 +376,8 @@ def main() -> int:
         ]
     else:
         lines += [
-            "All three sub-gates passed. The rule is adopted as default and "
-            "the V2 preset will load the sidecar automatically (mirrors the "
-            "Kelly K1 adoption pattern from 2026-04-21).",
+            "All three historical sub-gates passed. This report does not "
+            "change a preset or validate the candidate for paper/testnet use.",
         ]
     lines.append("")
 
@@ -401,7 +399,7 @@ def main() -> int:
     print(f"  NC Sharpe drop:   {eval_sharpe_drop:+.4f}  "
           f"(gate <= +{GATE_NC_SHARPE_DROP_MAX:.2f}) "
           f"{'PASS' if pass_sharpe else 'FAIL'}")
-    print(f"  --> {'ADOPT AS DEFAULT' if gate_pass else 'REJECT (ship opt-in)'}")
+    print(f"  --> {'PASS' if gate_pass else 'FAIL'} HISTORICAL THRESHOLDS")
     print("=" * 70)
     return 0
 

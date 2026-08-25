@@ -39,11 +39,15 @@ def _build_synthetic_market(n_bars: int = 200) -> MarketDataView:
         "T_years": np.full(n_bars, 7.0 / 365.25),
     }, index=idx)
 
+    # Mirror MarketDataView.__init__: the environment must simulate from
+    # information available before the sampled bar, never the bar's own RV.
+    df["vol_ann_lagged"] = df["vol_ann"].shift(1)
+
     # Bypass __init__ — construct an instance manually
     data = MarketDataView.__new__(MarketDataView)
     data.period = ("2024-01-01", "2024-01-05")
     data.df = df
-    data.active_idx = df.index
+    data.active_idx = df.index[df["vol_ann_lagged"].notna()]
     data.sample_weights = None
     # Single synthetic SVI slice covering every bar
     svi_params = pd.DataFrame({

@@ -77,7 +77,7 @@ def build_amped_sidecar(thr: float, mult: float) -> Path:
 
 
 def run_with_sidecar(sidecar_path: Path) -> tuple[pd.DataFrame, dict]:
-    cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+    cfg = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
     cfg.kelly_mult_path = str(sidecar_path)
     print(f"[validate] Running V2 backtest with sidecar: {sidecar_path.name}")
     t0 = time.time()

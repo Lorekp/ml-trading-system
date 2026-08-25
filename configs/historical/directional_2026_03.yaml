@@ -1,0 +1,47 @@
+# Historical directional profile (2026-03)
+# Preserved for research provenance. Its earlier performance claims are not
+# validated under docs/VALIDATION.md and it is not an execution profile.
+
+model:
+  type: logreg_l1
+  C: 0.01
+  solver: saga
+  max_iter: 1000
+  random_state: 42
+  features: all_18
+  lookback_months: 14
+  fwd_bars: 4
+  retrain: monthly
+
+signal:
+  confidence_threshold: 0.14
+  confidence_mode: absolute
+  vol_filter_quantile: 0.50
+  step_size: 0.1
+
+close:
+  rule: decay_T3
+  # Historical rule: at T+3 (45 min), close if unrealized return is negative;
+  # otherwise hold to T+4 (1 hour).
+
+universe:
+  method: volume_top_n
+  top_n: 30
+  volume_window: 30  # days, rolling median
+  spike_ratio: 5.0   # 30d/90d median ratio threshold
+  min_history_days: 90
+  rebalance: monthly
+
+portfolio:
+  starting_capital: 10000.0
+  base_sizing_pct: 0.04
+  max_signal_mult: 2.0
+  max_exposure: 0.90
+  max_per_asset: 0.05
+  slippage: 0.0001
+  max_dd: 0.10
+  delever_start: 0.08
+
+risk:
+  daily_loss_halt_pct: 4.0
+  total_dd_reduce_pct: 8.0

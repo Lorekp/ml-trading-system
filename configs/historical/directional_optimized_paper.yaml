@@ -1,0 +1,178 @@
+# Historical optimized paper profile
+# ===================================
+# Preserved from a 2026-03 strategy sweep. The parameters and former
+# performance claims are not validated under docs/VALIDATION.md.
+# Historical choices:
+#   - Confidence filter >= 0.08 (|prob - 0.5|)
+#   - 13 features (18 tested, hurt performance)
+#   - C=0.1 (C sweep: 0.01-0.5 all equivalent)
+#   - 4% base sizing with conf filter
+#   - Fixed T4 hold (decay_T3 and all exit rules tested, all worse)
+#   - Strategy-based mode (not legacy signal_generator)
+# Secrets from env: MEXC_API_KEY, MEXC_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+signal:
+  model:
+    C: 0.1
+    penalty: "l1"
+    solver: "saga"
+    max_iter: 1000
+    seed: 42
+    fwd_bars: 4
+
+  features:
+    feature_list:
+      - ret_1
+      - ret_3
+      - ret_7
+      - ret_14
+      - bar_range
+      - vol_zscore
+      - rsi_14
+      - stoch_rsi
+      - macd_hist
+      - bb_pct_b
+      - atr_14
+      - dist_swing_high
+      - dist_swing_low
+    winsor_lo: 0.01
+    winsor_hi: 0.99
+    vol_filter_quantile: 0.50
+    vol_zscore_window: 30
+    swing_lookback: 20
+
+  portfolio:
+    starting_capital: 10000.0
+    max_dd: 0.15
+    delever_start: 0.075
+    slippage: 0.0001
+    max_exposure: 0.90
+    max_per_asset: 0.06
+    base_sizing_pct: 0.04
+    max_signal_mult: 2.0
+
+  regime_filter:
+    enabled: false
+    timeframe: "4h"
+    ema_span: 20
+
+  confidence_filter:
+    mode: "absolute"
+    threshold: 0.08
+
+  signal:
+    step_size: 0.1
+
+  data:
+    data_dirs:
+      - "data/binance-1m"
+      - "data/homeserver-mirror/binance-1m"
+    timeframe: "15min"
+    regime_timeframe: "4h"
+
+exchange:
+  name: "mexc"
+  base_url: "https://futures.mexc.com"
+  ws_url: "wss://contract.mexc.com/edge"
+  rate_limit_per_sec: 10      # Reduced from 20 to avoid rate limiting
+  timeout_s: 10.0
+
+telegram:
+  enabled: true
+  notify_on:
+    - signal
+    - trade
+    - error
+    - daily
+    - startup
+
+paper:
+  slippage_bps: 5.0
+  starting_capital: 10000.0
+
+scheduler:
+  bar_interval_m: 15
+  poll_offset_s: 5
+  retry_count: 3
+  retry_delay_s: 2.0
+
+risk:
+  max_positions: 10
+  max_per_asset_pct: 0.06
+  max_total_exposure_pct: 0.90
+  daily_dd_halt_pct: 0.05
+  confidence_threshold: 0.08
+  hold_bars: 4
+  base_sizing_pct: 0.04
+  max_signal_mult: 2.0
+  leverage: 1
+  stop_loss_pct: 0.0
+
+live_mode:
+  enabled: false
+
+circuit_breakers:
+  drawdown_halt_pct: 0.10
+  api_error_limit: 10
+  api_error_window_m: 10
+  api_error_recovery_m: 30
+  position_mismatch_pct: 0.10
+  kill_switch_path: "KILL"
+  reconcile_interval_bars: 4
+  rolling_sharpe_window_days: 20
+  rolling_sharpe_alert_threshold: 1.0
+  rolling_sharpe_halt_threshold: 0.0
+
+db_path: "data/live/paper_state.db"
+log_level: "INFO"
+
+# 27 assets (removed BNX, FIL, FTM — no MEXC data)
+assets:
+  BTC: "BTCUSDT"
+  ETH: "ETHUSDT"
+  SOL: "SOLUSDT"
+  XRP: "XRPUSDT"
+  BNB: "BNBUSDT"
+  ADA: "ADAUSDT"
+  AVAX: "AVAXUSDT"
+  LINK: "LINKUSDT"
+  DOT: "DOTUSDT"
+  SUI: "SUIUSDT"
+  NEAR: "NEARUSDT"
+  LTC: "LTCUSDT"
+  BCH: "BCHUSDT"
+  UNI: "UNIUSDT"
+  AAVE: "AAVEUSDT"
+  APT: "APTUSDT"
+  FET: "FETUSDT"
+  TAO: "TAOUSDT"
+  ENA: "ENAUSDT"
+  HBAR: "HBARUSDT"
+  XLM: "XLMUSDT"
+  TRX: "TRXUSDT"
+  WLD: "WLDUSDT"
+  ZEC: "ZECUSDT"
+  ENJ: "ENJUSDT"
+  ANKR: "ANKRUSDT"
+  SXP: "SXPUSDT"
+
+# === STRATEGY MODE (not legacy signal_generator) ===
+strategies:
+  logreg_15m:
+    class: "live.strategies.logreg.LogRegStrategy"
+    enabled: true
+    timeframes: ["15m"]
+    max_positions: 8
+    max_exposure_pct: 0.60
+    base_sizing_pct: 0.04
+    max_signal_mult: 2.0
+    hold_bars: 4
+    stop_loss_pct: 0.0
+    # Optimized params from backtest (2026-03-28)
+    C: 0.1                        # C sweep proved 0.01-0.5 equivalent; 0.1 is baseline
+    confidence_threshold: 0.08    # |prob - 0.5| >= 0.08, cuts 79% marginal trades
+    vol_filter_quantile: 0.50
+    lookback_months: 14           # walk-forward lookback
+    close_rule: "fixed"           # fixed T4 hold (decay_T3 tested, worse)
+    fwd_bars: 4                   # 1-hour hold
+    model_dir: "data/live/model"

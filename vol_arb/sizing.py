@@ -9,7 +9,7 @@ applying a multiplicative scale factor:
     N = min(N, participation_cap)
 
 Strategies:
-    baseline      — scale = 1.0 (current production)
+    baseline      — scale = 1.0 (historical reference)
     edge          — scale proportional to |edge| / rolling_median_edge
     vega_risk     — scale = target_risk / (vega_dollar * vol_of_iv)
     kelly         — scale from quarter-Kelly formula
@@ -19,8 +19,8 @@ Strategies:
     cost_edge     — scale by net edge after execution cost
     composite_v2  — edge_scale * dd_scale * liq_scale
 
-All rolling statistics use only past data (no lookahead). Parameters
-are fixed ex-ante — no in-sample optimization.
+Rolling statistics use past data only. Parameter-selection validity is a
+separate evaluation concern and is not established by this module.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def size_baseline(
     equity: float, spot: float, signal: int,
     dynamic_margin: float, dynamic_btc_cap: float, cfg, **kwargs,
 ) -> float:
-    """S0: Current production sizing — flat margin fraction."""
+    """S0: Historical baseline sizing — flat margin fraction."""
     return _base_size(
         equity, spot, signal, dynamic_margin, dynamic_btc_cap,
         cfg.im_fraction, cfg.short_sizing_penalty,

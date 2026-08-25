@@ -1,7 +1,5 @@
 """Tests for ``deribit_paper/monitoring/harness_writer.py``.
 
-C6 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Three contracts under test:
 
 1. **Schema fidelity**: a fully-populated TradeOutcome → row matching the

@@ -1,6 +1,6 @@
 """5 pre-committed trade overlays driven by epistemic uncertainty.
 
-Cycle 3 Phase P (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 3 Phase P protocol.
 
 Mirrors the DFL Head Stage 28 pattern: 5 pre-committed strategies, ONE
 backtest run, gated. All filter quantile cuts and scaler reference scalars
@@ -29,7 +29,7 @@ Anti-leakage:
   ``vol_model.uncertainty.train_har_pd_ensemble``.
 
 Anti-overfitting:
-- 5 strategies, locked in plan; do NOT add a 6th.
+- The five strategies are frozen for this comparison; do not add a sixth.
 - F1/F2/F3 quantiles locked at {0.99, 0.95, 0.90}; do NOT sweep.
 - S1, S2 functional forms have NO free parameters.
 - f_min = 0.10 matches preventative-sizing floor (Cycle 2).

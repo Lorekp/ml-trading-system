@@ -1,7 +1,7 @@
-"""Pre-registered drawdown hypothesis tests for BTC v2 production.
+"""Historical drawdown hypothesis tests for invalidated BTC V2 research.
 
-Loads the saved v2 trade log and executes the five hypothesis tests from
-``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
+Loads the saved V2 trade log and executes five exploratory hypothesis tests.
+Because that trade log was invalidated, the output is forensic only.
 
 Decision rule per hypothesis (bucket-based, NOT DD-period-filtered so
 this is not curve-fitting):

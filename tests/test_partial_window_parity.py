@@ -44,7 +44,7 @@ DETERMINISTIC_COLUMNS = [
 def _run(start_dt: str, end_dt: str | None) -> pd.DataFrame:
     """Run V2 backtester with the given window, return the trade log."""
     cfg = (BacktestConfig()
-           .with_btc_production_filters_v2()
+           .with_historical_btc_v2()
            .with_realistic_costs())
     cfg.start_dt = start_dt
     cfg.end_dt = end_dt

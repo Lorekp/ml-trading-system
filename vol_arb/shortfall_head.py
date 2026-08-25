@@ -1,6 +1,6 @@
 """Conditional-shortfall classifier on the DFL decision panel + σ²_epi.
 
-Cycle 4 Phase A.1 / B core (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 4 Phase A.1/B core.
 
 Question Cycle 4 answers
 ------------------------
@@ -120,7 +120,7 @@ def build_shortfall_features(
     predictions : matching index, must contain ``y_pred`` and ``y_true``.
     walkforward_uncertainty : indexed by bar timestamp, must contain
         ``sigma_epi`` (standard deviation across K members; we square it).
-    horizon_minutes : bar size (default 15 = production V2).
+    horizon_minutes : bar size (default 15 for the historical V2 replay).
 
     Returns
     -------

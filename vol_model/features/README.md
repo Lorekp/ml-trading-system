@@ -1,18 +1,17 @@
-# vol_model/features — new-feature checklist
+# Feature contribution contract
 
 Every new feature family in this directory must satisfy the checklist below
-**before** it enters a walk-forward training run. The user's 2026-04-18
-directive is unambiguous: "zero data leakage, the single biggest danger
-that might invalidate any finding." A feature that skips the checklist is
-not allowed to produce QLIKE numbers anyone should trust.
+**before** it enters a walk-forward training run. A feature that skips the
+causality and provenance checks must not support a promoted QLIKE result.
 
 ## 1. Implementation checklist
 
 - [ ] Pure function `compute_<family>_features(raw_df) -> pd.DataFrame` that
       is deterministic and has no I/O side effects (loads live in the
       per-asset loader, not the compute).
-- [ ] Causal by construction. All rolling/EMA windows are left-aligned and
-      any "current-bar" usage is documented with a rationale.
+- [ ] Causal by construction. Rolling/EMA windows are trailing and use no
+      row later than the decision timestamp; any current-bar usage is
+      documented with a rationale.
 - [ ] Output DataFrame has a `DatetimeIndex` matching the expected stamp
       convention of the downstream pipeline (END-stamped bars for TSRV-
       derived features; see `vol_model/labels.py`).
@@ -66,7 +65,7 @@ you could legally use, but the feature is not leaky.
 
 ## 3. Documentation checklist
 
-Add a section to this README (or a sidecar `<family>.md`) covering:
+Add a section to this README covering:
 
 - **Raw source** — which parquet(s) the feature reads from, and the stamp
   convention of each source.
@@ -97,10 +96,12 @@ To make the family available to the walk-forward trainer:
 |---|---|---|---|---|
 | HAR-PD | `har_pd.py::compute_har_pd_features` | `run_walkforward_pruned_svi_har_pd.py::_load_har_pd` | -15m | `test_walkforward_pruned_svi_har_pd.py::test_no_lookahead_after_shift` |
 | SVI-ATM | (sidecar) | `run_walkforward_pruned_svi.py::_load_svi_atm_1d` | +15m | `tests/test_svi_spot_feature.py` |
-| Microstructure (OFI etc.) | `microstructure.py` | `engineer.py` | 0 | `tests/test_microstructure.py` |
+| Microstructure (OFI etc.) | `microstructure.py` | `engineer.py` | 0 | **Not yet covered by the required causal probe** |
 
-Session E candidates to be added here as they land:
+Candidate implementations currently present but not promoted:
 
-- [ ] SVI surface PCA (`svi_surface.py`)
-- [ ] Hawkes-OFI branching ratio (`hawkes_ofi.py`)
-- [ ] Rough-Heston spot volatility (`rough_heston.py`)
+- SVI surface PCA (`svi_surface.py`)
+- Hawkes-OFI branching ratio (`hawkes_ofi.py`)
+- Rough-Heston spot volatility (`rough_heston.py`)
+
+Their presence in the package is not evidence that they passed the contract.

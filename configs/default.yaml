@@ -63,7 +63,7 @@ confidence_filter:
 close_model:
   enabled: false
   decision_timeframes: ["5min", "10min", "15min"]
-  production_decision_timeframe: "15min"
+  reference_decision_timeframe: "15min"
   research_decision_timeframes: ["5min", "10min", "15min"]
   max_hold_minutes: 60
   min_hold_minutes: 15

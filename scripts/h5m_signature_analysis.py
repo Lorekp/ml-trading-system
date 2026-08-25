@@ -169,9 +169,8 @@ def main() -> int:
     # proxy for n (since at very small threshold, almost every tick is its
     # own bar). More accurate: require the user to measure n separately.
     #
-    # For BTC perp at h=5m: memory says ~3,478 median ticks per 5-min window
-    # (from the TSRV parquet inspection earlier today). Compute optimal K:
-    n_ticks_median = 3478.0  # from TSRV parquet at h=5
+    # Historical BTC h=5 diagnostic reference; recompute for a new artifact.
+    n_ticks_median = 3478.0
     K_star = n_ticks_median ** (2.0 / 3.0)
     print()
     print(f"Asymptotic Zhang (2006) K* = n^(2/3) = "

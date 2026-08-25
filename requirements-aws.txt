@@ -1,0 +1,28 @@
+# AWS-spot worker dependencies for the per-horizon vol-forecast sweep (--no-transvol).
+# Referenced by scripts/aws/launch_volmodel_spot.py user_data bootstrap.
+#
+# Lean worker environment: the local requirements minus visualization and
+# optional neural dependencies that the --no-transvol path never imports.
+#
+# IMPORTANT: torch is intentionally ABSENT. TransVol is the only torch user, and the
+# walk-forward + extract scripts now import torch LAZILY (only on the TransVol branch),
+# so the --no-transvol path runs torch-free. Adding torch would bloat the box image
+# (~800MB+ CPU wheel) for zero benefit on this sweep. Do NOT add it.
+
+# --- Data / numerics (same as requirements.txt) ---
+numpy>=2.0
+pandas>=2.0
+pyarrow>=15.0
+scipy>=1.12
+
+# --- ML used by the --no-transvol walk-forward + downstream backtest ---
+scikit-learn>=1.4          # feature utils + metrics used across the pipeline
+statsmodels>=0.14          # HAR / time-series helpers
+lightgbm>=4.0              # the forecast model (vol_model/model.py, extract_*)
+optuna>=3.0               # walk-forward hyperparameter search (run_walkforward_*)
+
+# --- Config / validation (pydantic models in vol_model, vol_arb, TSRV configs) ---
+pydantic>=2.0
+
+# --- AWS SDK (S3 result-shard upload + idempotent skip checks on the box) ---
+boto3>=1.34

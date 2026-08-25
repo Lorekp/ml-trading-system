@@ -508,8 +508,8 @@ def write_report(
 
 {smoke_tag}.  Committed NC PnL = ${nc_pnl_committed:,.0f}, n_trades = {n_trades:,}.
 
-Methodology: `vol_arb/output/CAPACITY_METHODOLOGY_2026_05_11.md`.  Prior
-analysis (2026-05-07, against $959K pre-cycle-10 log) is superseded.
+This historical analysis uses the committed notional and trade-count inputs
+shown above. It is not current capacity validation.
 
 ## Headline
 
@@ -532,7 +532,7 @@ K = 1 represents this distribution of per-trade vega exposure:
 {cohort_tbl}
 
 - Full-sample mean deployed vega: **${full_dep_vega:.1f}/vp**
-- Last-12m mean deployed vega:   **${last12_dep_vega:.1f}/vp** ← operative for vault deployment
+- Last-12m mean historical vega: **${last12_dep_vega:.1f}/vp** ← recent research cohort
 
 Deployed vega has grown ~2× since 2022 (BTC price level + cycle-11 long
 amplifier).  Capacity scaling K is per current cohort.
@@ -555,7 +555,7 @@ K = 0 is the no-impact identity; reproduces committed NC PnL to fp.
 
 Y_vol is the dominant calibration uncertainty (Donier-Bouchaud-Mastromatteo
 2015, [arxiv:1602.03043](https://arxiv.org/abs/1602.03043)).  Y = 1.0
-is the conservative bound the vault-deployment decision should rest on.
+is the conservative sensitivity bound for this historical analysis.
 
 ## Sign stratification — long vs short
 
@@ -573,8 +573,7 @@ Long-side η is higher per trade → long-side impact may bind first.
 
 ## Last-12m cohort (Y = 0.5)
 
-Operative for vault deployment — the recent profile carries the cycle-11
-sizing.
+Recent research cohort — this profile carries the invalidated cycle-11 sizing.
 
 {last12_tbl}
 
@@ -623,7 +622,7 @@ At today's typical concurrent notional ~$15-30K/trade × ~5 in-flight
 |---|---:|---:|---|
 | Today | 1 | $75K-150K | Cycle-11 canonical |
 | Cautious scale | 10 | $750K-1.5M | Within all-curve hard knee |
-| Vault-deposit (Y=1.0) | hard-knee Y=1.0 → see headline | scaled accordingly | Conservative bound |
+| Historical stress case (Y=1.0) | hard-knee Y=1.0 → see headline | scaled accordingly | Not a validated limit |
 
 ## Limitations (unchanged from methodology doc)
 

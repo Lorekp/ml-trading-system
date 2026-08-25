@@ -1,18 +1,15 @@
 """Regression locks for BacktestConfig preset invariants.
 
-Added 2026-04-17 foundation fix: prevent accidental drift of the V2 production
-hold config back to 30m. The 15m hold was chosen to match the model's
-``[D, D+15m]`` prediction horizon; see
-``vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md``.
+The historical V2 hold remains locked to the model horizon. These tests
+preserve forensic configuration parity; they do not validate V2 performance.
 
-Generalised 2026-04-21 (Phase 1g of starry-rolling-rabin.md) to cover
+Generalised 2026-04-21 to cover
 per-horizon presets — the parametrized invariant
 ``test_v2_preset_horizon_matches_holding_minutes`` lifts the original
 "hold == 15" lock to "hold == prediction horizon" for any horizon the
-plan adds. The legacy literal-15 test
-(``test_production_v2_holding_minutes_is_15``) is kept verbatim because
-it is the byte-identity guarantee for the existing h=15 production
-default.
+configuration supports. The literal-15 test
+(``test_historical_v2_holding_minutes_is_15``) is kept verbatim because
+it is the regression guarantee for the historical h=15 default.
 """
 from __future__ import annotations
 
@@ -23,29 +20,28 @@ from vol_arb.backtester import BacktestConfig, deribit_option_fees_btc
 from vol_arb.paths import har_pd_predictions_path, kelly_sidecar_path
 
 
-def test_production_v2_holding_minutes_is_15():
-    """V2 production hold must stay aligned with prediction horizon.
+def test_historical_v2_holding_minutes_is_15():
+    """Historical V2 hold must stay aligned with prediction horizon.
 
     Prediction target: ln(vol_ann over [D, D+15m]). A 30-min hold would cover
     [D, D+30m] — first half signal-aligned, second half un-forecast theta
     carry. Locked at 15 min as of the foundation fix.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.holding_minutes == 15, (
         f"V2 holding_minutes must be 15 to match the model's "
         f"[D, D+15m] prediction window; got {cfg.holding_minutes}. "
-        f"Reverting to 30 re-introduces the foundation misalignment — "
-        f"see vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md."
+        f"A different hold would re-introduce model/position misalignment."
     )
 
 
-def test_production_v2_core_filters_preserved():
+def test_historical_v2_core_filters_preserved():
     """Sanity check: other V2 filters we rely on are still set as expected.
 
     Foundation-fix Step 6 should have ONLY touched holding_minutes. Any other
     field drifting here is a sign of an accidental edit.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.use_drl_hedging is True
     assert cfg.use_profit_scaling is True
     assert cfg.profit_scaling_floor == 0.3
@@ -54,120 +50,49 @@ def test_production_v2_core_filters_preserved():
     assert cfg.skip_long_if_term_slope_gt == 0.0
 
 
-def test_production_v1_holding_minutes_is_15():
+def test_historical_v1_holding_minutes_is_15():
     """V1 hold was already 15m pre-fix — confirm we didn't break it."""
-    cfg = BacktestConfig().with_btc_production_filters()
+    cfg = BacktestConfig().with_historical_btc_v1()
     assert cfg.holding_minutes == 15
 
 
 def test_default_predictions_path_is_aligned_bias():
-    """Production default adopts the walk-forward QLIKE-optimal bias-
-    aligned predictions (2026-04-20).
-
-    The underlying predictor is pruned_svi_har_pd_v1 (certified). The
-    aligned_bias parquet additionally applies a per-month scalar shift
-    β* = 0.5·log(mean(exp(2·residual))) fit on trailing 3-month OOS
-    residuals (strictly non-leaking, leakage-tested in
-    tests/test_prediction_aligner.py).
-
-    Adopted as an ACCEPTED Sharpe-for-PnL tradeoff: -0.42 NC Sharpe
-    (the honest signal-quality metric per feedback_noncompound_truth.md)
-    in exchange for +$30K NC PnL (+3.7%). Not a Sharpe win — a dollar
-    win at a per-trade-Sharpe cost.
-
-    Override via --predictions-path or BacktestConfig(predictions_path=...)
-    to reproduce pre-aligner results.
-    """
+    """The historical default retains its aligned-bias sidecar path."""
     cfg = BacktestConfig()
     assert cfg.predictions_path.endswith("aligned_bias.parquet"), (
         f"Default predictions_path should point at the aligned_bias "
-        f"parquet (walk-forward QLIKE-optimal scalar bias correction). "
-        f"Got: {cfg.predictions_path}. Reverting to the raw predictor "
-        f"would undo the +6.4% compound PnL adoption decision — see "
-        f"memory/project_prediction_aligner_2026_04_20.md."
+        f"parquet used by the historical configuration. "
+        f"Got: {cfg.predictions_path}."
     )
 
 
 def test_v2_jump_fraction_breaker_disabled():
-    """Cycle-12 (2026-05-11): V2 preset disables the legacy
-    jump-fraction-for-shorts circuit breaker by setting it to 1.0
-    (= can never trip; jump_fraction is in [0, 1] by construction).
-
-    Walk-forward gate result (JUMP_FILTER_WALKFORWARD_2026_05_11.md):
-    TRAIN dPnL +$219K, OOS dPnL +$130K, OOS daily Sharpe +1.65,
-    OOS MDD +$56 (essentially flat), 5/5 pre-committed gates pass.
-
-    The bare ``BacktestConfig()`` default stays at 0.15 — the legacy
-    rule-based-hedger guard. The V2 preset (which uses SAC v4 DRL
-    hedger) flips it to 1.0. Reverting forfeits +$130K OOS PnL.
-    """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    """Historical V2 disables the breaker; the generic default does not."""
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.max_jump_fraction_for_shorts == 1.0, (
         f"V2 preset must set max_jump_fraction_for_shorts=1.0; "
-        f"got {cfg.max_jump_fraction_for_shorts}. The cycle-12 "
-        f"walk-forward gate (see project_jump_filter_cycle12_2026_05_11.md) "
-        f"locked this as the OOS-validated value."
+        f"got {cfg.max_jump_fraction_for_shorts}."
     )
     # Bare default preserves legacy value for non-V2 callers.
     assert BacktestConfig().max_jump_fraction_for_shorts == 0.15
 
 
 def test_v2_spread_jump_k_disabled():
-    """Cycle-15 (2026-05-11, stale-defense S2): V2 preset deactivates
-    the exponential half-spread widening on jumps (sets it to 0.0).
-
-    half_spread = base_spread_iv * exp(spread_jump_k * jump_fraction)
-
-    At k=0 the jump_fraction term collapses out — implied widening on
-    jumps drops to zero. The widening was punitive for the pre-DRL-
-    hedger era; SAC v4 now handles jumps adaptively (same architectural
-    story as cycle-12 jump-fraction breaker + cycle-13 short-sizing
-    penalty + cycle-14 skew filter). Walk-forward gate result
-    (STALE_DEFENSE_S2_spread_jump_k_WALKFORWARD_2026_05_11.md):
-    TRAIN dPnL +$25K, OOS dPnL +$64K (+8.6%), OOS daily Sharpe +0.41
-    (9.21 -> 9.62), OOS MDD essentially unchanged (-1.69% -> -1.75%),
-    OOS trade count +283 (276 short, 7 long). 5/5 gates pass.
-
-    The bare ``BacktestConfig()`` default stays at 3.0 — legacy
-    rule-based-hedger guard. The V2 preset (which uses SAC v4 DRL
-    hedger) flips it to 0.0.
-    """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    """Historical V2 removes jump widening; the generic default retains it."""
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.spread_jump_k == 0.0, (
-        f"V2 preset must set spread_jump_k=0.0; got {cfg.spread_jump_k}. "
-        f"The cycle-15 walk-forward gate (see "
-        f"project_cycle15_spread_jump_k_2026_05_11.md) locked this as "
-        f"the OOS-validated value."
+        f"V2 preset must set spread_jump_k=0.0; got {cfg.spread_jump_k}."
     )
     # Bare default preserves legacy value for non-V2 callers.
     assert BacktestConfig().spread_jump_k == 3.0
 
 
 def test_v2_short_sizing_penalty_disabled():
-    """Cycle-13 (2026-05-11): V2 preset deactivates the legacy
-    short-sizing penalty (sets it to 1.0 = no penalty).
-
-    The 0.5 default was a blanket "halve N for short straddles (tail
-    risk)" rule from before the SAC v4 DRL hedger. The hedger now
-    handles short-side gamma adaptively (same architectural story as
-    the cycle-12 jump-fraction breaker deactivation). Walk-forward
-    gate result (STALE_DEFENSE_S1_short_sizing_penalty_WALKFORWARD_2026_05_11.md):
-    TRAIN dPnL +$559K, OOS dPnL +$269K (+56%), OOS daily Sharpe +0.61
-    (8.60 -> 9.21). G3 (OOS MDD widen) fails by $165 vs the cycle-12
-    $2K gate — accepted Sharpe-for-MDD tradeoff (per Kelly K1 adoption
-    precedent 2026-04-21). Reverting forfeits +$269K OOS PnL and
-    -0.61 OOS Sharpe.
-
-    The bare ``BacktestConfig()`` default stays at 0.5 — the legacy
-    rule-based-hedger guard. The V2 preset (which uses SAC v4 DRL
-    hedger) flips it to 1.0.
-    """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    """Historical V2 disables the penalty; the generic default retains it."""
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.short_sizing_penalty == 1.0, (
         f"V2 preset must set short_sizing_penalty=1.0; "
-        f"got {cfg.short_sizing_penalty}. The cycle-13 walk-forward "
-        f"gate (see project_cycle13_short_sizing_penalty_2026_05_11.md) "
-        f"locked this as the OOS-validated value."
+        f"got {cfg.short_sizing_penalty}."
     )
     # Bare default preserves legacy value for non-V2 callers.
     assert BacktestConfig().short_sizing_penalty == 0.5
@@ -177,17 +102,10 @@ def test_v2_sizing_edge_cap_is_100():
     """Cycle-17 (2026-05-11, stale-defense L6): V2 preset deactivates
     ``sizing_edge_cap`` by raising it from 3.0 to 100.0 (effectively off).
 
-    The 3.0 cap was no-op at the current edge distribution: under V2,
-    `|pred_edge| / rolling_median_edge` rarely exceeds 1.5, so the cap
-    at 3.0 was structurally non-binding. The full 0..100 sweep
-    confirmed NC PnL stays flat across [1, 100]. Cycle-17 removes
-    the no-op cap to simplify the sizing pipeline.
-
-    See ``project_cycle17_sizing_caps_2026_05_11.md`` for the campaign
-    context (L6 trio: edge_cap deactivated, dd_floor deactivated,
-    liq_cap KEPT for Sharpe-bounding).
+    This is a regression lock for invalidated historical settings, not an
+    endorsement of the tuning decision.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.sizing_edge_cap == 100.0, (
         f"V2 preset must set sizing_edge_cap=100.0 (cycle-17); "
         f"got {cfg.sizing_edge_cap}."
@@ -202,7 +120,7 @@ def test_v2_sizing_dd_floor_is_1():
     in results across [0, 0.75] — it never bound under V2 because the
     composite_v2 strategy already clamps dd_scale before this floor.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.sizing_dd_floor == 1.0, (
         f"V2 preset must set sizing_dd_floor=1.0 (cycle-17); "
         f"got {cfg.sizing_dd_floor}."
@@ -210,32 +128,25 @@ def test_v2_sizing_dd_floor_is_1():
 
 
 def test_v2_sizing_liq_cap_is_1_5():
-    """Cycle-17 KEPT: ``sizing_liq_cap`` stays at 1.5 (the bare default).
-
-    Unlike its trio-mates edge_cap and dd_floor, removing this cap
-    drops NC Sharpe by ~0.30 by allowing unbounded upscaling on
-    very-low-slip bars. KEPT as a Sharpe-bounding rule.
-    """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    """Historical V2 retains ``sizing_liq_cap=1.5``."""
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.sizing_liq_cap == 1.5, (
-        f"V2 preset must keep sizing_liq_cap=1.5 (cycle-17 KEPT); "
-        f"got {cfg.sizing_liq_cap}. Removing this cap drops NC "
-        f"Sharpe ~0.30."
+        f"V2 preset must keep sizing_liq_cap=1.5; got {cfg.sizing_liq_cap}."
     )
 
 
 def test_v2_base_spread_iv_under_realistic_costs_is_2():
-    """Parity-r3 cycle-2 (2026-05-08): the canonical V2 recipe is
-    ``BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()``,
+    """Parity-r3 cycle-2 (2026-05-08): the historical V2 recipe is
+    ``BacktestConfig().with_historical_btc_v2().with_realistic_costs()``,
     where ``with_realistic_costs()`` sets ``base_spread_iv = 2.0``.
 
     Live's V2 preset bakes this in directly; this test locks the
     backtester side to the same value when the realistic-costs
-    composition is applied (which the canonical regen script does).
+    composition is applied by the historical regeneration script.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+    cfg = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
     assert cfg.base_spread_iv == 2.0, (
-        f"Canonical V2 recipe must yield base_spread_iv=2.0; "
+        f"Historical V2 recipe must yield base_spread_iv=2.0; "
         f"got {cfg.base_spread_iv}. NOTE: this is the FULL spread; "
         f"the backtester pipeline halves it at "
         f"backtester.py:3189-3190 before generate_signals. Live "
@@ -265,31 +176,13 @@ def test_kelly_mult_bare_default_is_off():
     assert cfg.kelly_mult_path is None
 
 
-def test_production_v2_kelly_default_is_K1_slope():
-    """V2 preset MUST default to the K1+slope Kelly sidecar (cycle-11).
-
-    Adopted 2026-04-21 as a deliberate Sharpe-for-PnL tradeoff:
-    +$114K NC PnL (+13.5%) and +$2.84M compound PnL (+17.9%) in
-    exchange for -0.94 NC Sharpe (the honest signal-quality metric
-    per feedback_noncompound_truth.md) and -0.20 compound Sharpe.
-    Compound MDD actually IMPROVED 0.62pp.
-
-    Reverting the default to None reproduces V2-pre-Kelly baseline:
-    NC PnL $845K, NC Sharpe 7.23, NC MDD -$8,288. See
-    ``vol_arb/output/KELLY_SHRINKAGE_PHASE2_REPORT.md`` and
-    ``memory/project_kelly_sizing_2026_04_21.md`` for the full
-    decision record. Plan:
-    ``C:/Users/laure/.claude/plans/starry-rolling-rabin.md``.
-    """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+def test_historical_v2_kelly_default_is_K1_slope():
+    """Historical V2 retains the K1+slope sidecar for forensic parity."""
+    cfg = BacktestConfig().with_historical_btc_v2()
     expected = "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
     assert cfg.kelly_mult_path == expected, (
         f"V2 preset must auto-load the cycle-11 K1+slope Kelly sidecar "
-        f"at {expected!r}; got {cfg.kelly_mult_path!r}. Reverting "
-        f"to vanilla K1 forfeits the +$33K NC PnL / 5/5 per-year "
-        f"strict / Sharpe-essentially-unchanged improvement — see "
-        f"vol_arb/output/PHASE2_LONG_SIZING.md and "
-        f"memory/project_phase2_long_sizing_2026_05_10.md."
+        f"at {expected!r}; got {cfg.kelly_mult_path!r}."
     )
 
 
@@ -305,15 +198,14 @@ def test_v2_preset_horizon_matches_holding_minutes(horizon_minutes):
     ``predictions_path`` (and its ``kelly_mult_path``).
 
     Construction pattern under test (see ``BacktestConfig`` Phase 1f):
-      - h=15: ``with_btc_production_filters_v2()`` (legacy entry point)
-      - h≠15: ``with_btc_production_for_horizon(N)`` /
-              ``with_btc_production_h{N}m()``
+      - h=15: ``with_historical_btc_v2()`` (historical entry point)
+      - h≠15: ``with_historical_btc_v2_for_horizon(N)`` /
+              ``with_historical_btc_v2_h{N}m()``
 
     The invariant catches the foundation-fix failure mode in any future
     horizon: pairing a 60-min predictions parquet with a 15-min hold
     silently throws away half the information, just as 30-min hold on
-    15-min predictions did before 2026-04-17. See
-    ``project_foundation_fix_2026_04_17.md``.
+    15-min predictions did before 2026-04-17.
 
     NOTE: This test does NOT load the predictions parquet (which may
     not exist for new horizons until Phase 2); it asserts the
@@ -321,9 +213,9 @@ def test_v2_preset_horizon_matches_holding_minutes(horizon_minutes):
     backtester opens the file in Phase 3.
     """
     if horizon_minutes == 15:
-        cfg = BacktestConfig().with_btc_production_filters_v2()
+        cfg = BacktestConfig().with_historical_btc_v2()
     else:
-        cfg = BacktestConfig.with_btc_production_for_horizon(horizon_minutes)
+        cfg = BacktestConfig.with_historical_btc_v2_for_horizon(horizon_minutes)
     assert cfg.holding_minutes == horizon_minutes, (
         f"V2 preset at h={horizon_minutes}m has "
         f"holding_minutes={cfg.holding_minutes}; this re-introduces the "
@@ -339,7 +231,7 @@ def test_v2_preset_horizon_matches_holding_minutes(horizon_minutes):
         f"open a wrong-horizon predictions file silently."
     )
     if horizon_minutes == 15:
-        # Cycle-11 (2026-05-10): production V2 at h=15 uses the K1+slope
+        # Cycle-11 (2026-05-10): historical V2 at h=15 uses the K1+slope
         # sidecar (walk-forward K1 × 1.25 on long bars at extreme
         # backwardation). Other horizons keep vanilla K1 because the
         # slope-amp sidecar has not been regenerated for those.
@@ -357,8 +249,7 @@ def test_v2_preset_horizon_matches_holding_minutes(horizon_minutes):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 2026-05-07 Deribit per-fill fee cap (Part 1 of plan
-# c-claude-ml-trading-system-tsrv-pipelin-glistening-bunny.md).
+# 2026-05-07 Deribit per-fill fee-cap regressions.
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -462,3 +353,93 @@ def test_fee_cap_zero_T_safe():
     # At T=0 the cap binds aggressively — fee should be tiny, not negative.
     assert np.all(fees >= 0.0)
     assert np.all(fees < 4 * 0.0003 * 100_000.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MF-3: per-horizon factory predictions-passthrough (eval plumbing fix)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Before MF-3, ``with_historical_btc_v2_for_horizon(H)`` HARDCODED
+# predictions_path = aligned_bias(H) and silently dropped any
+# caller-supplied path, so the downstream V2 backtest at h!=15 scored the
+# WRONG (stale h15-tuned) predictions or crashed-then-swallowed where the
+# aligned_bias file is missing. The fix adds a ``**overrides`` passthrough
+# applied LAST via model_copy. These tests lock it for the full fleet.
+
+# Historical fleet horizons (120m was excluded). The h=15 path uses the named
+# historical preset, but this factory must still honor an h=15 override.
+_FLEET_HORIZONS = [5, 15, 30, 60, 240, 480, 1440]
+
+
+@pytest.mark.parametrize("h", _FLEET_HORIZONS)
+def test_for_horizon_predictions_override_wins(h):
+    """A caller-supplied predictions_path MUST survive into the final
+    config at every fleet horizon (MF-3). This is the core regression:
+    config.predictions_path == override for all 7 horizons."""
+    override = f"vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_h{h}m_no_tv.parquet"
+    cfg = BacktestConfig.with_historical_btc_v2_for_horizon(
+        h, predictions_path=override,
+    )
+    assert cfg.predictions_path == override, (
+        f"h={h}: predictions override dropped — got {cfg.predictions_path!r}, "
+        f"expected {override!r}. The MF-3 discard bug has regressed: the "
+        f"per-horizon factory must apply **overrides LAST via model_copy."
+    )
+
+
+@pytest.mark.parametrize("h", _FLEET_HORIZONS)
+def test_for_horizon_kelly_off_override(h):
+    """``kelly_mult_path=None`` must propagate (None is a meaningful value:
+    it disables the h15-tuned Kelly overlay for the bare V2 comparison
+    stack). The horizon-aware default would otherwise point at a K1 sidecar
+    that the cross-horizon job does NOT regenerate per horizon."""
+    cfg = BacktestConfig.with_historical_btc_v2_for_horizon(
+        h, kelly_mult_path=None,
+    )
+    assert cfg.kelly_mult_path is None, (
+        f"h={h}: kelly_mult_path=None override dropped — got "
+        f"{cfg.kelly_mult_path!r}. The bare V2 comparison stack requires "
+        f"Kelly OFF; a falsey-filtering passthrough would silently keep the "
+        f"K1 default."
+    )
+
+
+def test_for_horizon_no_override_preserves_horizon_defaults():
+    """Without overrides the factory still composes the horizon-aware
+    aligned_bias predictions + K1 kelly defaults (byte-identity for the
+    pre-MF-3 callers / the named per-horizon presets)."""
+    h = 30
+    cfg = BacktestConfig.with_historical_btc_v2_for_horizon(h)
+    expected_preds = har_pd_predictions_path(
+        "BTCUSDT", h, aligned_bias=True,
+    ).as_posix()
+    expected_kelly = kelly_sidecar_path("BTC", h, variant="K1").as_posix()
+    assert cfg.predictions_path == expected_preds
+    assert cfg.kelly_mult_path == expected_kelly
+
+
+def test_for_horizon_combined_bare_v2_comparison_stack():
+    """The exact stack run_horizon_job.score_downstream builds for the
+    cross-horizon comparison: fresh _no_tv predictions + Kelly OFF, at a
+    non-15m horizon. Both overrides must land together."""
+    h = 240
+    preds = f"vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_h{h}m_no_tv.parquet"
+    cfg = BacktestConfig.with_historical_btc_v2_for_horizon(
+        h, predictions_path=preds, kelly_mult_path=None,
+    )
+    assert cfg.predictions_path == preds
+    assert cfg.kelly_mult_path is None
+    # V2 horizon invariants must still come along.
+    assert cfg.use_drl_hedging is True
+    assert cfg.holding_minutes == h
+
+
+def test_for_horizon_h15_named_preset_byte_identity_unchanged():
+    """h=15 sacrosanct: the named legacy preset (what run_backtest.py uses
+    at h=15) is untouched by the MF-3 factory change — still aligned_bias
+    + K1_slope. The factory passthrough is additive only."""
+    cfg = BacktestConfig().with_historical_btc_v2()
+    assert cfg.predictions_path == (
+        "vol_model/output/BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"
+    )
+    assert cfg.kelly_mult_path == "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"

@@ -1,7 +1,5 @@
 """Tests for ``scripts/refresh_live_sidecars.py``.
 
-I6 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Two contracts under test:
 
 1. **Bootstrap path**: when no live trade log exists, the script logs

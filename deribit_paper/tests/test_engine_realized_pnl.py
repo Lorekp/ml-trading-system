@@ -1,7 +1,5 @@
 """Tests for the realized-PnL recipe in :meth:`TradingEngine._execute_and_persist`.
 
-E.1.10 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 The recipe must mirror V2 backtester's ``net_pnl_nc`` term:
     net = option_pnl + hedge_pnl - option_fees - hedge_fees
 

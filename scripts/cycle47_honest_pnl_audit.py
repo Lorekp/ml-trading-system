@@ -111,7 +111,7 @@ def main() -> int:
     try:
         from vol_arb.backtester import BacktestConfig, VolArbBacktester
         cfg = (BacktestConfig()
-               .with_btc_production_filters_v2()
+               .with_historical_btc_v2()
                .with_realistic_costs())
         cfg.use_pinned_exit_iv = True
         cfg.kelly_mult_path = None  # match a clean draft pass

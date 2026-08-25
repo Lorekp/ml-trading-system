@@ -1,12 +1,11 @@
-"""S-8 (parity-r3 cycle 2 — 2026-05-08) regression test.
+"""Historical V2 replay must preserve ``base_spread_iv=2.0``.
 
 The canonical V2 trade log is generated via
-``BacktestConfig.with_btc_production_filters_v2().with_realistic_costs()``,
+``BacktestConfig.with_historical_btc_v2().with_realistic_costs()``,
 where ``with_realistic_costs()`` flips ``base_spread_iv 1.5 → 2.0``
-(``vol_arb/backtester.py:464``). Pre-fix the live engine's
-``PaperConfig.with_v2_preset()`` did NOT flip ``base_spread_iv`` —
-operators calling the live preset got 1.5 (the default), producing a
-tighter half-spread than V2 canon.
+(``vol_arb/backtester.py:464``). An earlier reconstruction omitted that
+override and produced a tighter half-spread. This is forensic parity,
+not evidence that the historical results are valid.
 
 This test locks the cross-engine alignment.
 """
@@ -18,10 +17,10 @@ import pytest
 from deribit_paper.config import PaperConfig
 
 
-def test_with_v2_preset_sets_base_spread_iv_to_2():
-    cfg = PaperConfig.with_v2_preset()
+def test_historical_v2_preset_sets_base_spread_iv_to_2():
+    cfg = PaperConfig.historical_v2_preset()
     assert cfg.base_spread_iv == pytest.approx(2.0), (
-        "S-8 regression: with_v2_preset must set base_spread_iv=2.0 to "
+        "Historical V2 replay must set base_spread_iv=2.0 to "
         "match BacktestConfig.with_realistic_costs() (the trade-log "
         "generator's path)."
     )
@@ -35,11 +34,10 @@ def test_default_preset_keeps_base_spread_iv_at_1_5():
 
 
 def test_v2_and_realistic_costs_agree_on_base_spread_iv():
-    """Cross-engine sanity: the live V2 preset agrees with the
-    backtester's realistic-costs leg of the V2 trade-log generator."""
+    """The historical reconstruction matches the archived generator."""
     from vol_arb.backtester import BacktestConfig
-    bt_cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
-    paper_cfg = PaperConfig.with_v2_preset()
+    bt_cfg = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
+    paper_cfg = PaperConfig.historical_v2_preset()
     assert paper_cfg.base_spread_iv == pytest.approx(bt_cfg.base_spread_iv), (
         f"base_spread_iv mismatch: paper={paper_cfg.base_spread_iv} "
         f"vs backtest={bt_cfg.base_spread_iv}"

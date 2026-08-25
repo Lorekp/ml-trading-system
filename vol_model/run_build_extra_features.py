@@ -20,8 +20,7 @@ Causal safety invariants (mirror engineer.py ETH/RQ blocks):
 - BTC TSRV (END-stamped): at parquet-index T, value = vol of [T-freq, T).
   shift(1) gives value from T-freq at new-index T, i.e. vol of [T-2·freq, T-freq).
   ffill + reindex: feature at 15m-index T uses info strictly from [..., T-freq).
-  No look-ahead. ✓ (Slightly staler under END than under START — documented
-  in LABEL_SHIFT_AUDIT.md as an optional Option-B follow-up fix.)
+  No look-ahead. ✓ It is slightly staler under END than under START.
 
 Usage:
     python -m vol_model.run_build_extra_features --asset BTCUSDT

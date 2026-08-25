@@ -55,7 +55,7 @@ def _per_year_nc(tl: pd.DataFrame) -> dict[int, float]:
 def _run_one(param: str, value, label: str) -> dict:
     """Run V2 backtest with ``param`` overridden to ``value``."""
     cfg = (BacktestConfig()
-           .with_btc_production_filters_v2()
+           .with_historical_btc_v2()
            .with_realistic_costs())
     if not hasattr(cfg, param):
         raise ValueError(
@@ -225,7 +225,7 @@ def main() -> int:
                  f"across {len(grid)} points: {grid}.")
     lines.append("")
     lines.append("V2 backtester full sample (2022-02 -> 2026-04, canonical trade log).")
-    lines.append("`BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()` "
+    lines.append("`BacktestConfig().with_historical_btc_v2().with_realistic_costs()` "
                  f"with `{args.param}` overridden.")
     lines.append("")
     lines.append("## Headline")

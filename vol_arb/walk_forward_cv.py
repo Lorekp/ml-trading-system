@@ -66,8 +66,7 @@ def _sharpe(returns: np.ndarray) -> float:
 
 
 def _fold_boundaries(n_bars: int, n_folds: int = N_FOLDS) -> list[tuple[int, int]]:
-    """Return (start, end) bar-index pairs for each fold. Follows the repo's
-    convention in vol_arb/dashboard/etl/stats.py (eval-time split)."""
+    """Return equal eval-time ``(start, end)`` bar-index folds."""
     return [(i * n_bars // n_folds, (i + 1) * n_bars // n_folds) for i in range(n_folds)]
 
 
@@ -121,7 +120,7 @@ def _run_or_load_backtest(min_ratio: float, output_dir: Path) -> pd.DataFrame:
         return pd.read_parquet(path)
     cfg = (
         BacktestConfig()
-        .with_btc_production_filters_v2()
+        .with_historical_btc_v2()
         .model_copy(update=dict(profit_filter_min_ratio=min_ratio))
     )
     bt = VolArbBacktester(cfg)
@@ -154,7 +153,7 @@ def _run_or_load_threshold_backtest(
         return pd.read_parquet(path)
     cfg = (
         BacktestConfig()
-        .with_btc_production_filters_v2()
+        .with_historical_btc_v2()
         .model_copy(update=dict(
             entry_threshold_long=thr_long,
             entry_threshold=thr_short,

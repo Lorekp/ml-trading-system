@@ -190,7 +190,7 @@ class CloseModelConfig(BaseModel):
     decision_timeframes: list[str] = Field(
         default_factory=lambda: ["5min", "10min", "15min"]
     )
-    production_decision_timeframe: str = "15min"
+    reference_decision_timeframe: str = "15min"
     research_decision_timeframes: list[str] = Field(
         default_factory=lambda: ["5min", "10min", "15min"]
     )

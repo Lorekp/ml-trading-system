@@ -1,7 +1,5 @@
 """Phase 1 regression locks for the horizon-parametrized pipeline.
 
-See plan: ``C:/Users/laure/.claude/plans/starry-rolling-rabin.md`` Phase 1g.
-
 These tests guarantee that the horizon SSOT introduced in Phase 1
 preserves byte-identity at h=15 (current production) AND that future
 edits cannot reintroduce the hardcoded-15 anti-pattern that the
@@ -9,7 +7,7 @@ refactor systematically eliminated.
 
 What "byte-identity at h=15" means in practice:
 
-- Plain ``BacktestConfig().with_btc_production_filters_v2()`` returns
+- Plain ``BacktestConfig().with_historical_btc_v2()`` returns
   the same field values it did pre-refactor (holding_minutes=15,
   predictions_path = legacy aligned-bias parquet, kelly_mult_path =
   legacy K1 sidecar).
@@ -228,16 +226,16 @@ def test_vol_arb_path_default_kwarg_is_h15():
 
 
 def test_v2_h15_preset_byte_identity():
-    """``with_btc_production_filters_v2()`` (the legacy h=15 entry point)
+    """``with_historical_btc_v2()`` (the historical h=15 entry point)
     preserves every production field exactly (regression lock).
 
     Refactor in Phase 1 factored shared invariants into
-    ``_v2_horizon_invariants()`` and added per-horizon factories. The
+    ``_historical_v2_horizon_settings()`` and added per-horizon factories. The
     h=15 named entry point MUST remain byte-identical to its
     pre-refactor state — otherwise downstream sidecar generators
     silently drift.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.holding_minutes == 15
     assert cfg.use_drl_hedging is True
     assert cfg.use_profit_scaling is True
@@ -256,9 +254,9 @@ def test_v2_h15_preset_byte_identity():
 
 
 @pytest.mark.parametrize("preset_method,expected_h", [
-    ("with_btc_production_h5m",  5),
-    ("with_btc_production_h30m", 30),
-    ("with_btc_production_h60m", 60),
+    ("with_historical_btc_v2_h5m",  5),
+    ("with_historical_btc_v2_h30m", 30),
+    ("with_historical_btc_v2_h60m", 60),
 ])
 def test_per_horizon_preset_pairs_holding_minutes_with_paths(
     preset_method, expected_h,
@@ -267,9 +265,8 @@ def test_per_horizon_preset_pairs_holding_minutes_with_paths(
     horizon-tagged predictions_path AND kelly_mult_path.
 
     This is the LIFTED foundation-fix invariant: "model horizon ==
-    backtester hold == sidecar horizon". A drift here re-introduces
-    the failure mode of `project_foundation_fix_2026_04_17.md` (the
-    $150K phantom-PnL bug from holding 30m on 15m predictions).
+    backtester hold == sidecar horizon". A drift here re-introduces the
+    model/position horizon mismatch.
     """
     cfg = getattr(BacktestConfig, preset_method)()
     assert cfg.holding_minutes == expected_h, preset_method
@@ -305,14 +302,14 @@ def test_per_horizon_preset_pairs_holding_minutes_with_paths(
 
 
 @pytest.mark.parametrize("h", [5, 30, 60])
-def test_with_btc_production_for_horizon_dispatch_matches_named(h):
+def test_with_historical_btc_v2_for_horizon_dispatch_matches_named(h):
     """The generic factory and the named per-horizon presets must agree."""
     named = {
-        5: BacktestConfig.with_btc_production_h5m,
-        30: BacktestConfig.with_btc_production_h30m,
-        60: BacktestConfig.with_btc_production_h60m,
+        5: BacktestConfig.with_historical_btc_v2_h5m,
+        30: BacktestConfig.with_historical_btc_v2_h30m,
+        60: BacktestConfig.with_historical_btc_v2_h60m,
     }[h]()
-    generic = BacktestConfig.with_btc_production_for_horizon(h)
+    generic = BacktestConfig.with_historical_btc_v2_for_horizon(h)
     assert named.holding_minutes == generic.holding_minutes
     assert named.predictions_path == generic.predictions_path
     assert named.kelly_mult_path == generic.kelly_mult_path
@@ -320,11 +317,11 @@ def test_with_btc_production_for_horizon_dispatch_matches_named(h):
     assert named.vrp_min_periods == generic.vrp_min_periods
 
 
-def test_with_btc_production_for_horizon_rejects_non_divisor_of_1440():
+def test_with_historical_btc_v2_for_horizon_rejects_non_divisor_of_1440():
     """Catch caller errors at build time, not at runtime."""
     for bad_h in (7, 13, 27, 100, 1000):
         with pytest.raises(ValueError, match="does not divide 1440"):
-            BacktestConfig.with_btc_production_for_horizon(bad_h)
+            BacktestConfig.with_historical_btc_v2_for_horizon(bad_h)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -339,7 +336,7 @@ def test_with_btc_production_for_horizon_rejects_non_divisor_of_1440():
 #  - Default-value annotations like `horizon_minutes: int = 15`.
 #  - Path components like `"_15m"` ARE allowed in path helpers because
 #    the legacy disk layout is what they encode.
-#  - The `with_btc_production_filters_v2()` h=15 named entry point
+#  - The `with_historical_btc_v2()` h=15 named entry point
 #    explicitly hard-codes `holding_minutes=15` to lock the invariant —
 #    that is INTENDED (it's the named "h=15" preset).
 

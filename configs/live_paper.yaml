@@ -1,5 +1,5 @@
-# Live Paper Trading Configuration
-# ===============================
+# Paper Trading Configuration
+# ===========================
 # Mirrors signal engine defaults from configs/default.yaml
 # with absolute confidence mode for live filtering.
 #
@@ -47,13 +47,13 @@ signal:
     max_signal_mult: 2.0
 
   regime_filter:
-    enabled: false           # Regime filter DISABLED — validated improvement
-    timeframe: "4h"          # (kept for reference, not used)
+    enabled: false           # Historical paper-profile choice.
+    timeframe: "4h"          # Kept for reference; not used while disabled.
     ema_span: 20
 
   confidence_filter:
     mode: "absolute"
-    threshold: 0.08          # Raised from 0.04 — validated +0.77 Sharpe improvement
+    threshold: 0.08          # Historical paper-profile value.
 
   signal:
     step_size: 0.1
@@ -92,7 +92,7 @@ telegram:
     - startup
 
 paper:
-  slippage_bps: 5.0  # Conservative: 5 bps (was 1 bps — closer to live limit orders)
+  slippage_bps: 5.0  # Explicit paper-fill assumption.
   starting_capital: 10000.0
 
 scheduler:
@@ -108,18 +108,14 @@ risk:
   daily_dd_halt_pct: 0.05
   confidence_threshold: 0.08    # Matches signal.confidence_filter.threshold
   hold_bars: 4
-  base_sizing_pct: 0.04         # Conservative prop firm sizing (backtest: 82 days to 10%, 3.3% max daily DD)
+  base_sizing_pct: 0.04         # Historical paper-profile sizing.
   max_signal_mult: 2.0
   leverage: 1                   # No exchange leverage needed — position sizing handles it
 
 db_path: "data/live/paper_state.db"
 log_level: "INFO"
 
-# 30 assets selected by VOLUME RANK (not backtest Sharpe — avoids overfitting).
-# Criteria: 12+ months on Binance futures, >$30M 24h volume, no meme coins.
-# Meme coins (DOGE, PEPE, BONK, SHIB) excluded for prop firm safety —
-# flash crash risk outweighs 9% PnL contribution.
-# Rolling Sharpe circuit breaker drops underperformers automatically.
+# Historical 30-asset paper universe selected by volume rank.
 assets:
   BTC: "BTCUSDT"
   ETH: "ETHUSDT"

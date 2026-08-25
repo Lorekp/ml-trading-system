@@ -44,6 +44,36 @@ class FeatureNormalizer:
         return self
 
 
+class FeatureWinsorizer:
+    """Per-feature winsorization with limits fit on TRAINING data only.
+
+    R1 (TransVol rehab, 2026-06-22): the LGBM walk-forward pipeline already
+    winsorizes its inputs (``vol_model/pipeline.py:winsorize`` at p1/p99 on
+    the train slice) but the TransVol encoder is the lone consumer that fed
+    un-clipped, z-scored features straight into a transformer — producing
+    extreme post-normalization tails that can collapse scaled-dot-product
+    attention. This fits clip bounds at ``lo``/``hi``
+    quantiles on the train slice ONLY, then clips every slice (train + val +
+    extraction) to those frozen bounds BEFORE z-scoring. Strictly train-only
+    fit => zero added leakage.
+    """
+
+    def __init__(self, lo_q: float = 0.005, hi_q: float = 0.995):
+        self.lo_q = float(lo_q)
+        self.hi_q = float(hi_q)
+        self.lo: np.ndarray | None = None
+        self.hi: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray) -> "FeatureWinsorizer":
+        # Per-column quantiles on the train slice only.
+        self.lo = np.quantile(X, self.lo_q, axis=0).astype(np.float32)
+        self.hi = np.quantile(X, self.hi_q, axis=0).astype(np.float32)
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return np.clip(X, self.lo, self.hi).astype(np.float32)
+
+
 class TransVolDataset(Dataset):
     """Sliding window dataset for TransVol encoder.
 
@@ -56,22 +86,27 @@ class TransVolDataset(Dataset):
         self,
         features: np.ndarray,          # (N, F) float32, z-normalized
         time_features: np.ndarray,     # (N, 2) float32
-        continuous_var: np.ndarray,    # (N,) float32 — raw variance
+        continuous_var: np.ndarray,    # (N,) float32 — raw variance (or log in R2)
         jump_var: np.ndarray,          # (N,) float32 — raw variance
         seq_len: int = 32,
+        continuous_var_metric: np.ndarray | None = None,  # raw var for QLIKE metric (R2)
     ):
         self.features = features
         self.time_features = time_features
         self.continuous_var = continuous_var
         self.jump_var = jump_var
         self.seq_len = seq_len
+        # R2 (rehab): when continuous_var is the LOG target, this carries the
+        # RAW variance used only for the validation QLIKE metric. None in
+        # production => key omitted from the batch (loss falls back gracefully).
+        self.continuous_var_metric = continuous_var_metric
 
     def __len__(self) -> int:
         return len(self.features) - self.seq_len + 1
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         end = idx + self.seq_len
-        return {
+        item = {
             "features": torch.from_numpy(self.features[idx:end]),
             "time_features": torch.from_numpy(self.time_features[idx:end]),
             "continuous_var": torch.tensor(
@@ -81,6 +116,11 @@ class TransVolDataset(Dataset):
                 self.jump_var[end - 1], dtype=torch.float32
             ),
         }
+        if self.continuous_var_metric is not None:
+            item["continuous_var_raw_for_metric"] = torch.tensor(
+                self.continuous_var_metric[end - 1], dtype=torch.float32
+            )
+        return item
 
 
 def build_transvol_datasets(

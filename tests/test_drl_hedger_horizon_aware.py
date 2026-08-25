@@ -29,12 +29,12 @@ from vol_arb.backtester import BacktestConfig
 
 
 def test_drl_horizon_mismatch_warning_is_emitted_at_h5(caplog):
-    """At ``with_btc_production_h5m()`` (DRL on, holding=5min, policy
+    """At ``with_historical_btc_v2_h5m()`` (DRL on, holding=5min, policy
     trained at bar_minutes=15), the backtester must log a warning that
     mentions both cadences. Mock-load only — we don't need the real
     policy file present, the warning fires before that step.
     """
-    cfg = BacktestConfig.with_btc_production_h5m()
+    cfg = BacktestConfig.with_historical_btc_v2_h5m()
     assert cfg.use_drl_hedging is True
     assert cfg.holding_minutes == 5
 
@@ -53,8 +53,8 @@ def test_drl_horizon_mismatch_warning_is_emitted_at_h5(caplog):
                 "DRL hedger horizon mismatch: policy trained at "
                 "bar_minutes=15 but backtester holding_minutes=%d. "
                 "Hedge actions are off-distribution; consider "
-                "use_drl_hedging=False for this horizon. See plan "
-                "starry-rolling-rabin.md Phase 2h5.7.B.",
+                "use_drl_hedging=False unless the policy manifest matches "
+                "this horizon.",
                 cfg.holding_minutes,
             )
 
@@ -71,7 +71,7 @@ def test_drl_horizon_no_warning_at_h15():
     edits that fire the warning unconditionally — a silent regression
     that would noise up every h=15 backtest.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.use_drl_hedging is True
     assert cfg.holding_minutes == 15
     # At h=15 the warning condition is False — exercise that branch
@@ -85,7 +85,7 @@ def test_drl_horizon_warning_fires_for_all_non_15_horizons(horizon_minutes):
     Catches the "if h == 5" foot-shotgun where someone special-cases a
     single horizon and forgets the others.
     """
-    cfg = BacktestConfig.with_btc_production_for_horizon(horizon_minutes)
+    cfg = BacktestConfig.with_historical_btc_v2_for_horizon(horizon_minutes)
     assert cfg.holding_minutes == horizon_minutes
     # The warning condition in backtester.py is `holding_minutes != 15`.
     # That dominates per-horizon regardless of the value.

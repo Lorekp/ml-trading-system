@@ -1,7 +1,5 @@
 """Tests for trade-task drain on engine shutdown.
 
-E.1.4 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 Pre-E.1.4, ``engine.shutdown()`` only cancelled the four named services
 (WS dispatch, bar clock, telegram flush, heartbeat). Fire-and-forget
 trade tasks spawned in ``process_bar`` were left untracked — on

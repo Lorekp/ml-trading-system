@@ -107,7 +107,8 @@ def run_collector(coins):
     n_total = 0
 
     async def collect():
-        nonlocal buffer, current_date, last_flush, n_total, running
+        global running
+        nonlocal buffer, current_date, last_flush, n_total
 
         reconnect_delay = 1.0
         while running:

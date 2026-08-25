@@ -42,8 +42,8 @@ def test_shrinkage_tau_default_is_200():
 
 
 def test_v2_preset_inherits_shrinkage_tau():
-    """V2 production preset must carry the shrinkage parameter forward."""
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    """The invalidated historical V2 preset carries the shrinkage parameter."""
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.profit_filter_shrinkage_tau == 200.0
 
 

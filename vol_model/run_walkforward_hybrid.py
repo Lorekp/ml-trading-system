@@ -318,7 +318,13 @@ def _extract_compact_embeddings(
     mask = feats.index <= end_ts
     feats = feats[mask]
 
-    feat_norm = normalizer.transform(feats.values.astype(np.float32))
+    feat_vals = feats.values.astype(np.float32)
+    # R1 (rehab): apply the PERSISTED train-only winsor limits BEFORE z-score,
+    # exactly mirroring training. Production checkpoints lack these keys, so
+    # this branch is skipped and behaviour is byte-identical there.
+    if "winsor_lo" in ckpt and "winsor_hi" in ckpt:
+        feat_vals = np.clip(feat_vals, ckpt["winsor_lo"], ckpt["winsor_hi"]).astype(np.float32)
+    feat_norm = normalizer.transform(feat_vals)
     time_norm_vals = feats[TIME_COLS].values.astype(np.float32)
     time_mean, time_std = _resolve_time_normalizer(
         ckpt, time_norm_vals, ckpt_name=ckpt_path.name,
@@ -366,9 +372,8 @@ def main():
                              "Per-horizon TransVol checkpoints land in a "
                              "horizon-tagged directory via "
                              "vol_arb.paths.transvol_dir so existing h=15 "
-                             "production checkpoints are never overwritten. "
-                             "Must divide 1440 (e.g., 15, 30, 60). See "
-                             "plan starry-rolling-rabin.md Phase 2c.")
+                             "historical checkpoints are never overwritten. "
+                             "Must divide 1440 (e.g., 15, 30, 60).")
     args = parser.parse_args()
     if 1440 % args.horizon_minutes != 0:
         parser.error(

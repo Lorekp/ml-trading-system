@@ -1,4 +1,4 @@
-"""Tests for the Phase 5 HAR-PD certification comparison harness.
+"""Tests for the historical Phase 5 HAR-PD comparison harness.
 
 These are pure-logic tests — no real model predictions are loaded. They
 pin the QLIKE arithmetic, Diebold-Mariano arithmetic, and gate decisions
@@ -13,7 +13,7 @@ import pytest
 from vol_model.compare_pruned_svi_har_pd_vs_baseline import (
     _diebold_mariano_pvalue,
     _qlike_per_row,
-    certification_gate,
+    evaluate_historical_thresholds,
     compare_predictions,
 )
 
@@ -41,7 +41,7 @@ def test_qlike_penalizes_overprediction_more_than_underprediction():
     """The training QLIKE (code convention, vol_model.model.qlike_metric) has
     r = σ²_pred / σ²_true, so r > 1 (OVER-prediction of variance) is
     penalised more than r < 1. This is the opposite asymmetry of Patton
-    2011 but matches the production training loss.
+    2011 but matches the historical training implementation.
 
     If this test is flipped back to Patton convention, also update
     _qlike_per_row to use r = σ²_true / σ²_pred — but that would break
@@ -95,7 +95,7 @@ def test_dm_short_series_returns_nan():
     assert np.isnan(dm) and np.isnan(p)
 
 
-# ── 3. Certification gate logic ─────────────────────────────────────
+# ── 3. Historical threshold logic ───────────────────────────────────
 
 
 def _build_table(
@@ -148,8 +148,8 @@ def test_gate_passes_on_strong_candidate():
     table = _build_table(
         n_total=50, improved_delta_pct=-6.0, n_improved=30, n_dm_sig_of_improved=20,
     )
-    gates = certification_gate(table)
-    assert gates["all_gates_pass"] is True, gates
+    gates = evaluate_historical_thresholds(table)
+    assert gates["all_thresholds_pass"] is True, gates
 
 
 def test_gate_fails_on_avg_delta_above_threshold():
@@ -157,9 +157,9 @@ def test_gate_fails_on_avg_delta_above_threshold():
     table = _build_table(
         n_total=50, improved_delta_pct=-3.0, n_improved=30, n_dm_sig_of_improved=20,
     )
-    gates = certification_gate(table)
+    gates = evaluate_historical_thresholds(table)
     assert gates["gate1_avg_delta_le_-3pct"] is False
-    assert gates["all_gates_pass"] is False
+    assert gates["all_thresholds_pass"] is False
 
 
 def test_gate_fails_on_insufficient_improvements():
@@ -167,7 +167,7 @@ def test_gate_fails_on_insufficient_improvements():
     table = _build_table(
         n_total=50, improved_delta_pct=-10.0, n_improved=20, n_dm_sig_of_improved=18,
     )
-    gates = certification_gate(table)
+    gates = evaluate_historical_thresholds(table)
     assert gates["gate2_n_improved_ge_25"] is False
 
 
@@ -176,7 +176,7 @@ def test_gate_fails_on_insufficient_dm_sig():
     table = _build_table(
         n_total=50, improved_delta_pct=-6.0, n_improved=30, n_dm_sig_of_improved=10,
     )
-    gates = certification_gate(table)
+    gates = evaluate_historical_thresholds(table)
     assert gates["gate3_n_dm_sig_ge_15"] is False
 
 

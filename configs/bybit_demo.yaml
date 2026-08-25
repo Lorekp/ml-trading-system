@@ -1,10 +1,6 @@
-# Bybit Demo Paper Trader — Modular Configuration
-# =================================================
-# S8+Sym1.5 winning config: Sharpe 4.97, $1.24M PnL
-# Strategy-agnostic engine loads strategies from 'strategies' section.
-#
-# Secrets from env: BYBIT_API_KEY, BYBIT_API_SECRET,
-#                   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Bybit demo paper trader
+# Credentials are read from BYBIT_API_KEY, BYBIT_API_SECRET,
+# TELEGRAM_BOT_TOKEN, and TELEGRAM_CHAT_ID. Never put them in this file.
 
 exchange:
   name: "bybit"
@@ -12,7 +8,6 @@ exchange:
   base_url: "https://api-demo.bybit.com"
   ws_private_url: "wss://stream-demo.bybit.com/v5/private"
   ws_public_url: "wss://stream.bybit.com/v5/public/linear"
-  api_key: "REMOVED_HISTORICAL_CREDENTIAL"
   private_key_path: "data/live/bybit_private.pem"
   rate_limit_per_sec: 10
   timeout_s: 10.0
@@ -22,7 +17,7 @@ capital: 250000
 model_dir: "data/live/models"
 leverage: 1
 
-# Global TF config (used by old engine, kept for compatibility)
+# Shared timeframe defaults.
 full5:
   - {tf: "15m", hold: 2,  resample: "15min", lookback: 200}
   - {tf: "1h",  hold: 4,  resample: "1h",    lookback: 100}
@@ -30,13 +25,11 @@ full5:
   - {tf: "4h",  hold: 6,  resample: "4h",    lookback: 200}
   - {tf: "24h", hold: 12, resample: "1D",    lookback: 200}
 
-# Execution algorithm
 mkrtk60:
   maker_wait_s: 60
   poll_interval_s: 5.0
   max_retries: 2
 
-# Global breaker (used by old engine, kept for compatibility)
 breaker:
   type: "pnl_ratio_symmetric"
   window: 10
@@ -45,7 +38,6 @@ breaker:
   up_threshold: 0.01
   cap: 1.5
 
-# Global portfolio (used by old engine, kept for compatibility)
 portfolio:
   max_dd: 0.10
   delever_start: 0.05
@@ -58,7 +50,6 @@ portfolio:
   sizing_mode: "probability_edge"
   regime_exposure_floor: 0.50
 
-# Global S8 config (used by old engine, kept for compatibility)
 s8:
   core: [BTC, ETH, XRP, ADA, LINK, LTC, BNB, BCH, ETC]
   max_total: 30
@@ -76,7 +67,6 @@ telegram:
 db_path: "data/live/paper_state.db"
 log_level: "INFO"
 
-# ── Strategies (modular, loaded dynamically) ──
 strategies:
   s8_sym15:
     class: "live.strategies.s8_sym15.S8Sym15Strategy"
@@ -111,18 +101,14 @@ strategies:
     signal_generator:
       conf_threshold: 0.08
       regime_ema_span: 20
-    # CT90: cut sizing 50% when >90% of recent signals agree on direction
     correlation_throttle:
       threshold: 0.90
       direction: "both"
       scale: 0.5
       window: 20
 
-# Portfolio-level: max signals executed per bar (strongest first)
-# From left_tail_reduction.py: CT90 + maxSig15 is optimal
 max_signals_per_bar: 15
 
-# Execution quality monitoring baselines
 monitor:
   expected_maker_fill_rate: 0.77
   expected_spread_bps: 1.22
@@ -131,24 +117,19 @@ monitor:
   slippage_alert_bps: 5.0
   latency_p95_alert_ms: 65000
 
-# Startup reconciliation
 reconciler:
   stale_order_age_minutes: 5
 
-# Data validation
 data_validator:
   max_staleness_factor: 3.0
   max_gap_factor: 3.0
   min_bars: 30
 
-# Volatility overlay (global default, can be overridden per-strategy)
 vol_overlay:
   target_vol: 0.025
   floor: 0.3
   cap: 1.5
 
-# HyroTrader compliance: dynamic SL (widest per trade within 3% risk rule)
-# sl_pct = min(0.03 * equity / position_size, 0.75)
-# Small trades get wide SLs, large trades get tighter SLs — all within 3% risk
+# HyroTrader-style dynamic stop-loss cap.
 max_risk_per_trade: 0.03
 sl_cap: 0.75

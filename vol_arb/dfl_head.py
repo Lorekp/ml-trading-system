@@ -13,7 +13,7 @@ found:
   Hessian is identically zero)
 - DFF is the only DFL paper with explicit GBDT experiments
 - Fine-tuning a head is far cheaper than full retrain
-- Keeping HAR-PD frozen preserves all certified production behavior
+- Keeping HAR-PD frozen preserves the historical base-model behavior
 
 **Leakage discipline**:
 - Walk-forward training: year-by-year, never uses test-year data
@@ -71,7 +71,7 @@ def build_head_features(
     horizon_minutes :
         Bar size in minutes. Drives the wall-clock-equivalent of the
         24h / 6h / 2h rolling windows below. Default 15 preserves
-        byte-identity with the production V2 (h=15) sidecar; per-
+        byte-identity with the historical V2 (h=15) sidecar; per-
         horizon callers MUST pass the active config's horizon (see
         SSOT in ``VolModelConfig.horizon_minutes``).
 

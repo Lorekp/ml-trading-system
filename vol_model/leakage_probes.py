@@ -4,13 +4,9 @@ Hard gate: runs BEFORE each candidate's spot-check. Any probe failure
 is an automatic rejection -- a candidate that fails leakage hygiene is
 not allowed to produce QLIKE numbers the user might otherwise trust.
 
-Design principle: these probes are VERIFICATION, not audit. The codebase
-already has strong leakage guards (align_features_labels 1-bar lag,
-+15-min SVI shift, DVOL +1h shift, END-stamping convention, PurgedKFold).
-Prior audits (project_leakage_audit.md) cleared TSRV/vol_model/vol_arb
-with one micro-leak fixed in slippage surface. We TRUST those guards;
-the probes here catch regressions introduced by new code added in this
-session -- not re-audit the existing pipeline.
+These are targeted regression probes, not a complete leakage audit. They cover
+the named lag, shift, timestamp, and purged-fold mechanisms only. Passing them
+does not certify the wider pipeline or any result.
 
 Probes:
     A. Shuffle-label: permute y in training, expect QLIKE near HAR baseline

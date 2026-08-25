@@ -1,14 +1,14 @@
 """Shared sidecar loaders for backtest and live engines.
 
-The V2 production stack consumes three walk-forward-fit sidecars at signal /
+The historical V2 stack consumes three walk-forward-fit sidecars at signal /
 sizing / execution time:
 
 * Kelly K1 multiplier (`BTC_v2_kelly_mult_K1.parquet`) — per-15min-bar
-  upside-only sizing boost on long straddles, fit on trailing 12m of the
-  V2 trade log per memory/project_kelly_sizing_2026_04_21.md.
+  upside-only sizing boost on long straddles, fit on the invalidated historical
+  V2 trade log. It is retained for forensic parity, not validation.
 * realistic_taker slippage (`bar_execution_quality.parquet`) — per-15min-bar
-  empirical USD/BTC cost to cross market on one option leg, derived from
-  the Deribit trade tape per memory/project_execution_model.md.
+  empirical USD/BTC cost to cross market on one option leg, derived from the
+  Deribit trade tape.
 * Aligner β* (per-month scalar bias on log-vol predictions) — historically
   baked into ``BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet``
   via ``y_pred = y_pred_raw + β*_month``. The live engine cannot consume

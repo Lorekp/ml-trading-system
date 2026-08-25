@@ -12,8 +12,8 @@ And reports per-policy:
   - Stddev of hedge cost per episode  (← the key metric — lower is better)
   - Sortino, Ulcer Index, CVaR(5%) over the per-episode return distribution
 
-These map onto the acceptance criteria in
-``C:\\Users\\laure\\.claude\\plans\\flickering-wandering-locket.md``.
+These are diagnostic metrics; they do not by themselves validate a hedger or
+trading result.
 
 Usage::
 

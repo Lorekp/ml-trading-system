@@ -1,28 +1,15 @@
-"""CLI entry point for the paper-trading engine.
+"""CLI entry point for the Deribit paper/testnet engine.
 
-Provides three sub-commands during Phase 1:
-
-- ``--test-auth``      Authenticate against Deribit testnet and print account info
-- ``--dry-run``        Run the engine in dry-run mode (no real orders)  [default]
-- ``--live``           Enable real orders (requires passphrase confirmation)
-
-More sub-commands will be added as later phases land:
-  ``--duration``, ``--venue``, ``--prod``, ``--replay``, etc.
-
-Safety: ``--live`` requires the user to type a passphrase interactively.
-The passphrase has to match a fixed string; there's no way to bypass
-this via env var or config file.  The intent is to make live-order
-enablement something that requires conscious keyboard input, not
-something that can happen by mistake.
+The command can authenticate or smoke-test against testnet, run the
+engine against testnet, or use public mainnet quotes with ``--paper``.
+Every CLI mode is a dry run; this module has no real-order route.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
 import logging
-import secrets
 import signal
 import sys
 
@@ -34,9 +21,6 @@ from deribit_paper.risk.dry_run import get_dry_run, set_dry_run
 EXIT_CLEAN = 0       # clean stop — wrapper should NOT restart
 EXIT_SHUTDOWN = 42   # operator-requested permanent shutdown
 # Any other non-zero exit → crash → wrapper should restart
-
-
-_LIVE_PASSPHRASE = "GO LIVE"  # must match exactly
 
 
 def _setup_logging(level: str = "INFO") -> None:
@@ -74,36 +58,6 @@ def _parse_args() -> argparse.Namespace:
         help="Stop the engine after this many minutes (0 = run forever)",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=True,
-        help="Run in dry-run mode (default; no real orders placed)",
-    )
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Enable real orders on Deribit (requires passphrase confirmation)",
-    )
-    parser.add_argument(
-        "--venue",
-        choices=["testnet", "prod"],
-        default="testnet",
-        help="Deribit venue (default: testnet)",
-    )
-    parser.add_argument(
-        "--config-preset",
-        choices=["default", "v2"],
-        default="default",
-        help=(
-            "Strategy preset. 'default' preserves the legacy live config "
-            "(byte-id with prior runs). 'v2' applies the production V2 "
-            "stack from BacktestConfig.with_btc_production_filters_v2: "
-            "entry_threshold_long=12, contango-long filter, "
-            "target_margin_utilization=0.15, profit_scaling on, β* + "
-            "Kelly K1 + realistic_taker slippage sidecars wired."
-        ),
-    )
-    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Python logging level (default: INFO)",
@@ -112,20 +66,20 @@ def _parse_args() -> argparse.Namespace:
         "--paper",
         action="store_true",
         help=(
-            "Paper-trade against Deribit MAINNET quotes. Implies --venue prod "
-            "and --dry-run; no real orders are submitted. No DERIBIT_PROD_* "
+            "Paper-trade against Deribit MAINNET quotes in forced dry-run "
+            "mode; no real orders are submitted. No DERIBIT_PROD_* "
             "credentials required (public WS only via 100ms trade aggregates "
             "+ public ticker / index price endpoints). Fills simulated via "
             "the existing 3-tier IOC ladder against real mainnet quotes; "
             "trades log to vol_arb/output/live_trades_harness.parquet plus "
-            "the SQLite store. Mutually exclusive with --live."
+            "the SQLite store."
         ),
     )
     parser.add_argument(
         "--allow-stale-aligner",
         action="store_true",
         help=(
-            "Override the V2 preset's startup refusal when the aligner "
+            "Override startup refusal when the aligner "
             "β* sidecar is ≥ 2 months stale. The lookup will fall back "
             "to the most-recent-prior month — predictions remain biased "
             "toward older regime, but the engine starts. Use only when "
@@ -164,31 +118,6 @@ def _parse_args() -> argparse.Namespace:
         help="Bypass SVI features parquet staleness gate (H9).",
     )
     return parser.parse_args()
-
-
-def _confirm_live() -> str:
-    """Interactively confirm the user wants to enable live trading.
-
-    Returns an opaque confirmation token (random bytes) that
-    :func:`set_dry_run` requires in order to flip the flag.  If the
-    user's passphrase doesn't match, we exit with an error and never
-    return a token.
-    """
-    print()
-    print("#" * 72)
-    print("#" + " " * 18 + "⚠  LIVE TRADING CONFIRMATION  ⚠" + " " * 19 + "#")
-    print("#" * 72)
-    print()
-    print("You are about to DISABLE dry-run mode.  This means every signal")
-    print("that fires will place REAL orders on Deribit, with REAL margin.")
-    print()
-    print(f"Type the following phrase exactly to proceed: {_LIVE_PASSPHRASE!r}")
-    print()
-    response = getpass.getpass("Passphrase: ")
-    if response.strip() != _LIVE_PASSPHRASE:
-        print("Passphrase mismatch — staying in dry-run mode and exiting.")
-        sys.exit(1)
-    return secrets.token_hex(16)
 
 
 async def _run_test_auth(cfg: PaperConfig) -> int:
@@ -237,11 +166,9 @@ def main() -> None:
     _setup_logging(args.log_level)
 
     cfg = PaperConfig.from_env()
-    if args.config_preset == "v2":
-        cfg = PaperConfig.with_v2_preset(base=cfg)
-        logging.getLogger("cli").info(
-            "Applied --config-preset=v2 (production parity stack)",
-        )
+    # CLI safety invariant: environment/config values cannot disable dry-run.
+    cfg.dry_run = True
+    set_dry_run(True)
     if args.allow_stale_aligner:
         cfg.allow_stale_aligner = True
         logging.getLogger("cli").warning(
@@ -278,40 +205,14 @@ def main() -> None:
             "--allow-stale-svi-features: bypassing SVI features "
             "parquet staleness check",
         )
-    if args.paper and args.live:
-        print(
-            "Error: --paper and --live are mutually exclusive. "
-            "--paper implies dry-run; --live submits real orders.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
     if args.paper:
-        # --paper is an umbrella flag: mainnet venue, dry-run safety belt,
-        # no credentials required. We honour --venue prod even when set
-        # explicitly, but ignore --venue testnet to avoid confusion (paper
-        # mode is fundamentally a "real data, no orders" run).
+        # --paper selects public mainnet quotes without authentication.
+        # Dry-run has already been forced above and cannot be disabled by CLI.
         cfg.switch_to_prod(paper_mode=True)
         logging.getLogger("cli").info(
             "Paper mode: mainnet quotes, simulated fills via IOC ladder, "
             "no credentials required",
         )
-    elif args.venue == "prod":
-        cfg.switch_to_prod()
-
-    if args.live:
-        # E.1.12 (2026-05-01): always require the passphrase, regardless of
-        # venue. Pre-E.1.12 testnet skipped the prompt — easy for an
-        # operator to forget the venue flag and accidentally enable live
-        # orders on production credentials. The passphrase is the
-        # ``--live`` invariant; venue is a ``--venue`` invariant. Coupling
-        # them lets one slip through the other.
-        token = _confirm_live()
-        set_dry_run(False, confirmation_token=token)
-        logging.getLogger("cli").warning("DRY_RUN disabled — live orders will be placed")
-    else:
-        # dry_run defaults to True in config, no-op here
-        pass
 
     logging.getLogger("cli").info(
         "Starting deribit_paper venue=%s paper_mode=%s dry_run=%s",

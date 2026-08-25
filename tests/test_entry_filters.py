@@ -1,4 +1,4 @@
-"""Correctness tests for production entry filters (W5.X).
+"""Correctness tests for the historical BTC entry-filter presets (W5.X).
 
 Tests verify:
 
@@ -9,7 +9,7 @@ Tests verify:
 3. ``skip_long_hours_utc`` mutes ONLY long signals at configured hours;
    shorts at the same hours are preserved.
 4. Both filters compose correctly when used together.
-5. ``with_btc_production_filters()`` preset applies the documented values.
+5. ``with_historical_btc_v1()`` preset applies the documented values.
 6. Filtered bars incur NO downstream fees/slippage (signal==0 propagates).
 
 Synthetic mini-DataFrame keeps the tests fast and hand-verifiable.
@@ -130,10 +130,10 @@ def test_filters_compose():
     assert np.array_equal(out, expected), f"got {out} expected {expected}"
 
 
-# ── Test 5: production preset contents ────────────────────────
+# ── Test 5: historical preset contents ────────────────────────
 
-def test_btc_production_filters_preset():
-    cfg = BacktestConfig.for_currency("BTC").with_btc_production_filters()
+def test_historical_btc_v1_preset():
+    cfg = BacktestConfig.for_currency("BTC").with_historical_btc_v1()
     assert cfg.entry_threshold == 22.0
     assert cfg.entry_threshold_long == 30.0
     assert cfg.min_dte_days == 5.0
@@ -142,14 +142,14 @@ def test_btc_production_filters_preset():
     assert cfg.use_sor is False
 
 
-def test_btc_production_composes_with_realistic_costs():
-    cfg = BacktestConfig.for_currency("BTC").with_realistic_costs().with_btc_production_filters()
+def test_historical_btc_v1_composes_with_realistic_costs():
+    cfg = BacktestConfig.for_currency("BTC").with_realistic_costs().with_historical_btc_v1()
     # Realistic-cost knobs survive
     assert cfg.perp_slippage_bps == 3.0
     assert cfg.base_spread_iv == 2.0
     assert cfg.maker_adverse_selection_iv == 0.75
     assert cfg.use_profit_filter is False
-    # Production filters applied
+    # Historical filters applied
     assert cfg.min_dte_days == 5.0
     assert cfg.skip_long_hours_utc == (14, 15, 16)
 
@@ -224,12 +224,12 @@ def test_term_slope_missing_column_warns_no_crash(caplog):
     assert any("svi_term_slope_1w_2w" in rec.message for rec in caplog.records)
 
 
-# ── Test 10: v2 production preset contents ────────────────────
+# Test 10: invalidated historical V2 preset contents
 
-def test_btc_production_v2_preset():
-    cfg = BacktestConfig.for_currency("BTC").with_btc_production_filters_v2()
-    # v1 filters inherited EXCEPT entry_threshold_long (v2 overrides)
-    assert cfg.entry_threshold == 22.0
+def test_historical_btc_v2_preset():
+    cfg = BacktestConfig.for_currency("BTC").with_historical_btc_v2()
+    # V1 filters inherited except the V2 short/long threshold overrides.
+    assert cfg.entry_threshold == 20.0
     # v2 lowers thr_L from 30 → 12: the contango filter already scrubbed
     # the bad-regime longs, so remaining longs can fire at lower edge.
     assert cfg.entry_threshold_long == 12.0
@@ -240,10 +240,9 @@ def test_btc_production_v2_preset():
     assert cfg.use_drl_hedging is True
     assert cfg.use_profit_scaling is True
     assert cfg.profit_scaling_floor == 0.3
-    assert cfg.target_margin_utilization == 0.15
+    assert cfg.target_margin_utilization == 0.10
     # Foundation fix 2026-04-17: hold aligned to prediction horizon [D, D+15m].
     # Previously 30m (collected un-forecast theta in 2nd bar); flipped to 15m.
-    # See vol_model/output/FOUNDATION_ALIGNMENT_AUDIT.md.
     assert cfg.holding_minutes == 15
     # sizing_model INTENTIONALLY unchanged at composite_v2 — Kelly
     # broke compound-mode scaling per Phase B.3 re-test.
@@ -252,7 +251,7 @@ def test_btc_production_v2_preset():
 
 
 def test_v2_composes_with_realistic_costs():
-    cfg = BacktestConfig.for_currency("BTC").with_realistic_costs().with_btc_production_filters_v2()
+    cfg = BacktestConfig.for_currency("BTC").with_realistic_costs().with_historical_btc_v2()
     # Realistic-cost knobs preserved
     assert cfg.perp_slippage_bps == 3.0
     assert cfg.base_spread_iv == 2.0

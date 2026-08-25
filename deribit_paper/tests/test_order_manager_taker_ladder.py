@@ -1,7 +1,5 @@
 """Tests for the 3-tier taker ladder in :class:`OrderManager`.
 
-I1 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Three contracts under test:
 
 1. **Full Tier-1 fill**: a fully-fillable order at tier-1 price exits

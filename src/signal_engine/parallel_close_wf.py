@@ -2,7 +2,7 @@
 
 Reimplements the core WF training loop from close_model.py with:
 - ProcessPoolExecutor across months (12 workers = 12 cores)
-- No grid search (uses validated defaults)
+- No grid search (uses the historical fixed defaults)
 - Numpy memmap for shared data (no copies)
 - n_jobs=1 per worker (avoids thread contention)
 

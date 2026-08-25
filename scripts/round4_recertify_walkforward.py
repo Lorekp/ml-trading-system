@@ -1,23 +1,21 @@
-"""Round-4 recertification: extend the walk-forward by 3-6 months.
+"""Historical round-4 walk-forward extension experiment.
 
-Closes the round-4 retrain item from `vol_arb/output/PARITY_AUDIT_ROUND2.md`.
 Runs the standard walk-forward (`vol_model.run_walkforward_pruned_svi_har_pd`)
 for the requested months and emits a per-month QLIKE / SHAP-stability
-report against pre-registered acceptance gates.
+report against its historical thresholds. The generated report is research
+output, not current certification; see `docs/VALIDATION.md`.
 
-The model itself was already trained on Binance Spot dollar-bar features
-(the same venue F3 + round-4 F6 now feed live), so this run is a
-*recertification*  --  verifying the model is stable on the post-F3 live
-distribution and absorbing newer market data  --  not a retrain to fix a
-distribution mismatch.
+The historical model was trained on Binance Spot dollar-bar features. This
+script extends that old experiment over newer months; it does not establish
+current replay parity, execution realism, or deployment readiness.
 
 Pre-registered gates:
 
 * **Pass**: every retrained month has QLIKE within trailing-3mo
   median +/-10%; SHAP top-5 features stable (Spearman >= 0.7 vs prior
   month); F3-feature parity within 1% rel.
-* **Conditional pass**: 1-2 months marginal but trend stable -> ship
-  with note.
+* **Conditional pass**: 1-2 months marginal but trend stable -> record for
+  further investigation.
 * **Fail**: any month QLIKE > +15% vs trailing baseline OR any F3
   feature > 5% live-vs-offline drift -> halt, investigate, file as
   round-5 finding.
@@ -72,12 +70,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger = logging.getLogger(__name__)
 
-# Pre-registered gates  --  empirically calibrated against the production
-# walk-forward's natural QLIKE noise. Initial draft (10% / 15%) was too
+# Historical research gates, calibrated against that walk-forward's natural
+# QLIKE noise. Initial draft (10% / 15%) was too
 # tight: the existing 50-month walk-forward shows +/-30% drift between
 # adjacent months simply from realised-vol regime swings (2025-12 vs
 # 2025-11 = +33%, 2026-02 vs 2026-01 = -28%). Those are HEALTHY months
-# the production model was certified on. Real degradation looks like
+# present in the historical reference. Real degradation looks like
 # >50% sustained drift over several months, NOT a single 30% spike.
 PASS_QLIKE_MAX_REL_DRIFT = 0.30           # <=30% vs trailing-3mo median
 FAIL_QLIKE_MAX_REL_DRIFT = 0.50           # >50% triggers a HARD FAIL
@@ -109,7 +107,7 @@ def _run_walkforward_subprocess(
 ) -> int:
     """Invoke the existing walk-forward script for the requested months.
 
-    The walk-forward script is the production training cadence
+    The walk-forward script is the historical research cadence
     (``vol_model/run_walkforward_pruned_svi_har_pd.py``). We delegate to
     it via subprocess so the orchestration stays decoupled  --  any script
     changes (Optuna config, feature pipeline, callbacks) come along
@@ -234,7 +232,7 @@ def _write_report(
     qlike_prior: dict,
     gates: dict,
 ) -> None:
-    """Render the markdown recertification report."""
+    """Render the markdown historical-threshold report."""
     n_pass = sum(1 for v in gates.values() if v["status"] == "PASS")
     n_cond = sum(1 for v in gates.values() if v["status"] == "CONDITIONAL")
     n_fail = sum(1 for v in gates.values() if v["status"] == "FAIL")
@@ -246,7 +244,7 @@ def _write_report(
         verdict = "PASS"
 
     lines = [
-        f"# Round-4 recertification report  --  {asset}",
+        f"# Round-4 historical-threshold report  --  {asset}",
         "",
         f"**Verdict**: **{verdict}** ({n_pass} pass / {n_cond} cond / {n_fail} fail)",
         "",
@@ -290,26 +288,22 @@ def _write_report(
     lines.append("")
     if verdict == "PASS":
         lines.append(
-            "All months pass. Model is certified stable on the post-F3 + "
-            "post-F6 live distribution. New checkpoints are usable; monthly "
-            "cadence simply continues forward."
+            "All months pass the historical drift thresholds. This diagnostic "
+            "does not validate the model or authorize deployment."
         )
     elif verdict == "CONDITIONAL_PASS":
         lines.append(
             f"Some months are marginal (drift in "
             f"({PASS_QLIKE_MAX_REL_DRIFT:.0%}, {FAIL_QLIKE_MAX_REL_DRIFT:.0%}]). "
-            "Trend likely still stable; ship with operator note. Inspect "
-            "SHAP stability for the marginal months before flipping any "
-            "default."
+            "Inspect SHAP stability and data provenance for the marginal "
+            "months; do not promote a result from this diagnostic alone."
         )
     else:
         lines.append(
             f"**Hard fail**: at least one month exceeded the "
-            f"{FAIL_QLIKE_MAX_REL_DRIFT:.0%} drift gate. DO NOT deploy. "
-            "File as round-5 finding; investigate whether this is a regime "
-            "shift, a data-pipeline drift, or a model capacity issue. "
-            "Consider rolling back to the previous month's checkpoint "
-            "until the cause is identified."
+            f"{FAIL_QLIKE_MAX_REL_DRIFT:.0%} drift threshold. Investigate "
+            "whether this is a regime shift, data-pipeline drift, or model "
+            "capacity issue before any further use."
         )
 
     # Round-4 context note: explain what this report does and doesn't
@@ -318,21 +312,17 @@ def _write_report(
     lines.append("## Note on round-4 interpretation")
     lines.append("")
     lines.append(
-        "This report measures the production model's QLIKE drift across "
-        "calendar months. F3+F6 change LIVE feature computation only  --  "
-        "they do not modify the offline training pipeline. So the QLIKE "
-        "drift here reflects natural market regime variation, NOT any "
-        "F3/F6 effect. The real F3/F6 certification is a live-vs-offline "
-        "feature parity test (planned next round); this run establishes "
-        "the baseline QLIKE cadence the live engine will be measured "
-        "against once new checkpoints land."
+        "This report measures historical QLIKE drift across calendar months. "
+        "F3+F6 change replay-time feature computation but do not modify the "
+        "offline training pipeline. The result therefore cannot validate "
+        "F3/F6; that requires a separate replay-vs-offline parity test."
     )
 
     out.parent.mkdir(parents=True, exist_ok=True)
     # Explicit UTF-8  --  the report uses <=/×/% chars and we run on Windows
     # where the default cp1252 codec barfs.
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    logger.info("Wrote recertification report to %s", out)
+    logger.info("Wrote historical-threshold report to %s", out)
 
 
 def main() -> int:
@@ -343,8 +333,8 @@ def main() -> int:
         default=["2025-11", "2025-12", "2026-01", "2026-02", "2026-03", "2026-04"],
         help=(
             "YYYY-MM months to (re)train. Default = the trailing 6 months "
-            "with full-coverage labels as of 2026-05-08 (model's most "
-            "recent production checkpoint = 2026-04)."
+            "with full-coverage labels as of 2026-05-08 (historical "
+            "reference checkpoint = 2026-04)."
         ),
     )
     parser.add_argument(
@@ -393,7 +383,7 @@ def main() -> int:
         skipped: list[str] = []
         to_train = list(requested)
         logger.warning(
-            "Recertification: --force in effect; OVERWRITING %d "
+            "Historical extension: --force in effect; OVERWRITING %d "
             "existing checkpoints under %s",
             len(_existing_checkpoints(args.model_dir)), args.model_dir,
         )
@@ -401,7 +391,7 @@ def main() -> int:
         skipped = [m for m in requested if m in _existing_checkpoints(args.model_dir)]
         to_train = _missing_months(args.model_dir, requested)
     logger.info(
-        "Recertification: requested=%d, already trained=%d, to train=%d",
+        "Historical extension: requested=%d, already trained=%d, to train=%d",
         len(requested), len(skipped), len(to_train),
     )
 

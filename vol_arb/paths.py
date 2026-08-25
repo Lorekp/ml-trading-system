@@ -213,14 +213,14 @@ def oof_predictions_path(asset: str = "BTCUSDT") -> Path:
 #
 # The convention lives ONLY here so any place that needs a
 # horizon-tagged file path goes through these helpers. The horizon
-# comes from `vol_model.config.VolModelConfig.horizon_minutes`
-# (the SSOT). See plan: starry-rolling-rabin.md Phase 1c.
+# comes from `vol_model.config.VolModelConfig.horizon_minutes`, the single
+# source of truth.
 
 def _suffix_horizon(stem: str, horizon_minutes: int) -> str:
     """Return ``stem`` with ``_h{N}m`` appended when N != 15.
 
-    At h=15 the stem is returned unchanged so production paths stay byte-
-    identical to the pre-horizon-SSOT layout.
+    At h=15 the stem is returned unchanged to retain the historical artifact
+    layout.
     """
     if horizon_minutes == 15:
         return stem

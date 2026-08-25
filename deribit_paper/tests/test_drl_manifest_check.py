@@ -1,7 +1,5 @@
 """Tests for the DRL manifest bar-minutes check.
 
-E.2.2 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 The engine reads a sibling ``<policy>.manifest.json`` at startup and
 WARNs when ``bar_minutes`` doesn't match ``cfg.bar_minutes``. This
 prevents the silent failure of running a 15m-trained SAC v4 policy on
@@ -29,8 +27,7 @@ def test_existing_v4_manifest_has_bar_minutes_15():
         pytest.skip(f"{manifest} not present in this checkout")
     data = json.loads(manifest.read_text(encoding="utf-8"))
     assert data["bar_minutes"] == 15, (
-        f"v4 SAC bundle was trained at 15m bars per "
-        f"memory:project_w5_v4_adopted; manifest has "
+        f"v4 SAC bundle was trained at 15m bars; manifest has "
         f"bar_minutes={data['bar_minutes']}. Either restore the manifest "
         f"or re-train + update."
     )

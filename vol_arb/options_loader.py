@@ -65,6 +65,52 @@ def load_option_trades(
     Rows with T <= 0 or iv <= 0 are dropped.
     """
     trade_dir = Path(trade_dir)
+    # Fast-path short-circuit built by scripts/_build_window_cache.py. If the
+    # frozen historical tape cache exists
+    # AND the requested date window is a subset of the cached window, return
+    # the cached frame filtered by timestamp range. ADD-ONLY: the slow path
+    # below is unchanged and is taken verbatim whenever the cache is absent
+    # or the window doesn't fit. The cached tape is pre-sorted by
+    # (strike, expiry_key, direction, timestamp) so the inner merge_asof in
+    # mark_trade_log_to_real_premium + _maker_fill_flags skips its
+    # sort_values step, and the pre-baked `expiry_key` (datetime64[D]) saves
+    # the ~180x strftime cast at every call site.
+    _tape_cache = trade_dir.parent.parent / "_tape_FROZEN.parquet"
+    if _tape_cache.exists():
+        try:
+            _cached = pd.read_parquet(_tape_cache)
+            # The cached frame already carries the same columns the slow path
+            # produces (timestamp, instrument_name, iv, index_price, price,
+            # mark_price, direction=aggressor, amount, trade_seq, strike,
+            # option_type, expiry_dt, T_years, dte_days, moneyness) PLUS the
+            # pre-baked `expiry_key` (datetime64[D]) that mark_trade_log_to_real_premium
+            # re-derives from expiry_dt. Drop expiry_key so the function's
+            # output schema is unchanged (the slow path doesn't expose it).
+            if "expiry_key" in _cached.columns:
+                _cached = _cached.drop(columns=["expiry_key"])
+            # Cheap date-window filter on the `timestamp` column. Use `.loc`
+            # with a boolean Series aligned to the frame index — `_ts` is
+            # computed from the cached `_cached` so its index matches, and
+            # `.loc[mask]` is unambiguous. The previous `_cached[_ts < ...]`
+            # form raised a `Boolean Series key will be reindexed to match
+            # DataFrame index` UserWarning in modern pandas and SILENTLY
+            # truncated results when the index didn't match — that's the
+            # root cause of the 9-trade cache-extension miss (the cache
+            # contained the data but the row-level filter dropped it).
+            if start_date or end_date:
+                _ts = pd.to_datetime(_cached["timestamp"], utc=True)
+                if start_date:
+                    _mask = _ts >= pd.Timestamp(start_date, tz="UTC")
+                    _cached = _cached.loc[_mask]
+                if end_date:
+                    # Add one day so the upper bound is inclusive of the last day.
+                    _mask = _ts < pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1)
+                    _cached = _cached.loc[_mask]
+            return _cached.reset_index(drop=True)
+        except Exception:
+            # Any cache miss / corruption -> fall through to slow path
+            # unchanged. The slow path is the source of truth.
+            pass
     files = sorted(trade_dir.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No parquet files in {trade_dir}")

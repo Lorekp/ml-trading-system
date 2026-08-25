@@ -17,8 +17,9 @@ import asyncio
 import json
 import time
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "C:\Claude\ml-trading-system")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from deribit_paper.features.vpin_live import _LiveBucketAccumulator
 
 import websockets

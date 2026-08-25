@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from experiments.ml_close_walkforward_report import (
+from signal_engine.research.close_walkforward import (
     apply_train_window_winsorization,
     canonical_prediction_de_risk_mode,
     close_strategy_overrides,
@@ -14,7 +14,7 @@ from experiments.ml_close_walkforward_report import (
     generate_asset_signals,
     get_pcfg,
     prediction_cache_path,
-    production_gate_from_holdout,
+    historical_holdout_gate,
     selected_trade_cache_path,
 )
 from signal_engine.config import CloseModelConfig, ConfidenceFilterConfig, PortfolioConfig
@@ -166,16 +166,16 @@ def test_filter_rows_by_period_splits_search_and_holdout() -> None:
     assert holdout["value"].tolist() == [2, 3]
 
 
-def test_production_gate_from_holdout_requires_holdout_and_dsr() -> None:
+def test_historical_holdout_gate_requires_holdout_and_dsr() -> None:
     baseline = {"status": "ok", "sharpe": 2.0, "max_dd_pct": 5.0}
     candidate = {"status": "ok", "sharpe": 2.1, "max_dd_pct": 6.0}
 
-    enabled, holdout_pass, dsr_pass = production_gate_from_holdout(candidate, baseline, 0.97)
+    enabled, holdout_pass, dsr_pass = historical_holdout_gate(candidate, baseline, 0.97)
     assert enabled is True
     assert holdout_pass is True
     assert dsr_pass is True
 
-    enabled, holdout_pass, dsr_pass = production_gate_from_holdout(candidate, baseline, 0.90)
+    enabled, holdout_pass, dsr_pass = historical_holdout_gate(candidate, baseline, 0.90)
     assert enabled is False
     assert holdout_pass is True
     assert dsr_pass is False
@@ -184,7 +184,9 @@ def test_production_gate_from_holdout_requires_holdout_and_dsr() -> None:
 def test_generate_asset_signals_uses_configured_confidence_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    idx = pd.date_range("2023-01-01", periods=4000, freq="15min", tz="UTC")
+    # Cover January through mid-March so the configured two-month lookback can
+    # train on January-February and exercise the March confidence filter.
+    idx = pd.date_range("2023-01-01", periods=7000, freq="15min", tz="UTC")
     close = 100 + np.sin(np.linspace(0, 50, len(idx))).cumsum()
     ohlcv = pd.DataFrame(
         {
@@ -218,7 +220,7 @@ def test_generate_asset_signals_uses_configured_confidence_filter(
         return signals
 
     monkeypatch.setattr(
-        "experiments.ml_close_walkforward_report.apply_confidence_filter",
+        "signal_engine.research.close_walkforward.apply_confidence_filter",
         fake_filter,
     )
 

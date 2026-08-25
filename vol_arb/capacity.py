@@ -136,7 +136,7 @@ def compute_vega_capacity(
         ΔIV_i(K)   = Y · σ_σ(i) · √(K · η_i)       [vol points]
         K_max(i)   = (|edge_i| · edge_fraction / (Y · σ_σ(i)))² / η_i
 
-    If ``use_deployed_vega=True`` (new default, 2026-05-11), Q_ν uses
+    If ``use_deployed_vega=True`` (the class default), Q_ν uses
     N_contracts_nc × vega — i.e. the deployed dollar-vega at canonical
     sizing. This makes K=1 correspond to "today's deployed scale", not
     "1 BTC of straddle". K=10 then means "10× the canonical per-trade
@@ -220,7 +220,7 @@ def compute_impact_adjusted_pnl_nc(
     and hedge costs are taken from the original trade log unchanged
     (they are not first-order functions of size scaling at this stage).
 
-    If ``use_deployed_vega=True`` (new default, 2026-05-11), η uses
+    If ``use_deployed_vega=True`` (the class default), η uses
     N_contracts_nc × vega, so K=1 = today's canonical deployed vega
     and K=10 = 10× the deployed sizing. Cycle-11 K1+slope is already
     baked into N_contracts_nc, so the K=1 baseline reflects the

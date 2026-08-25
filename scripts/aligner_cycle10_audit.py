@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path(r"C:\Claude\ml-trading-system")
+ROOT = Path(__file__).resolve().parents[1]
 C9_DIR = ROOT / "backups" / "2026-05-09_pre_transvol_optuna_retrain"
 C10_DIR = ROOT / "vol_model" / "output"
 
@@ -406,6 +406,5 @@ print(f"    median abs diff: {c10_check.json_minus_recompute.abs().median():.6f}
 print(f"\n  cycle-10 top-5 worst json-vs-recompute mismatch:")
 worst = c10_check.sort_values("json_minus_recompute", key=abs, ascending=False).head(5)
 print(worst[["month", "n_cal", "mu_cal", "sigma_cal", "beta_qlike", "json_beta", "json_minus_recompute"]].round(5).to_string(index=False))
-
 
 

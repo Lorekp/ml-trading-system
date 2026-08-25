@@ -1,9 +1,7 @@
-"""Per-trade row writer for the V2 reproduction harness.
-
-C6 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
+"""Per-trade row writer for the historical V2 reproduction harness.
 
 Each completed (or aborted) :class:`TradeOutcome` is consolidated into a
-single row matching the V2 backtest trade-log schema, then appended to
+single row matching the archived V2 backtest trade-log schema, then appended to
 ``vol_arb/output/live_trades_harness.parquet``. The reproduction harness
 (I4) replays the V2 backtester on the same bar window using these rows
 to attribute residual PnL gap to {config drift / feature drift / strike
@@ -62,7 +60,7 @@ _HARNESS_COLUMNS: list[str] = [
     "realized_pnl_usd",
     "hedge_ticks_executed",
     "index_price_at_entry",
-    "config_preset",          # "default" or "v2"
+    "config_preset",          # "v2" is a historical replay marker only
 ]
 
 

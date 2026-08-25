@@ -2,8 +2,7 @@
 
 Covers C2 (β* per-month aligner) and the contango filter (skip-long
 when ``svi_term_slope_1w_2w > threshold``) wired in
-``deribit_paper/signal/predictor.py``. Plan:
-``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
+``deribit_paper/signal/predictor.py``.
 
 Two contracts under test:
 

@@ -1,1 +1,1 @@
-"""Signal Engine — Production ML direction prediction pipeline."""
+"""Multi-asset direction-prediction research pipeline."""

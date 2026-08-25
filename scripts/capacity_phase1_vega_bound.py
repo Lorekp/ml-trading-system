@@ -1,8 +1,6 @@
 """Method 2 (analytic vega-absorption bound) + Method 6 quick-check
 (perp leg non-binding) for the V2 vol-arb capacity analysis.
 
-See plan: ``C:/Users/laure/.claude/plans/c-claude-ml-trading-system-tsrv-pipelin-glistening-bunny.md``.
-
 Outputs (when run without --smoke):
 - ``vol_arb/output/CAPACITY_PHASE1_VEGA_BOUND.md`` — methodology + result
 - ``vol_arb/output/BTC_v2_capacity_phase1.parquet`` — per-trade K_max,
@@ -46,7 +44,7 @@ def main(smoke: bool = False) -> None:
     print(f"  {len(df):,} bars, {(df['N_contracts_nc'] > 0).sum():,} executed trades")
 
     if smoke:
-        # 3-month sample per feedback_smoke_tests.md
+        # Bound smoke-test runtime to the latest three months.
         end = df.index.max()
         start = end - pd.Timedelta(days=90)
         df = df.loc[start:end]
@@ -168,8 +166,6 @@ def write_report(
     body = f"""# Capacity Analysis Phase 1 — Vega-Absorption Bound (Method 2)
 
 {smoke_tag}
-
-Plan: `C:/Users/laure/.claude/plans/c-claude-ml-trading-system-tsrv-pipelin-glistening-bunny.md`.
 
 ## Headline
 

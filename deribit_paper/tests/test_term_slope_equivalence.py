@@ -1,7 +1,5 @@
 """Numerical equivalence between live and offline term-slope computations.
 
-E.2.4 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 The live engine's ``Predictor._compute_term_slope_1w_2w`` calls
 ``LiveSVICalibrator.atm_vol_at_dte(7)`` minus ``atm_vol_at_dte(14)``.
 The offline ``vol_arb/svi.py::_constant_maturity_features`` computes

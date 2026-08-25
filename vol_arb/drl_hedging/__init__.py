@@ -17,7 +17,8 @@ Public entry points:
 - :class:`DRLHedger` — runtime adapter exposing the same signature as
   ``simulate_discrete_hedging`` so it drops into ``compute_pnl`` unchanged
 
-See ``TSRV/PIPELINE_DOCUMENTATION.md`` Stage 16 for the full protocol.
+This remains experimental infrastructure; see ``docs/VALIDATION.md`` before
+interpreting any result that enables it.
 """
 
 from vol_arb.drl_hedging.config import DRLHedgingConfig

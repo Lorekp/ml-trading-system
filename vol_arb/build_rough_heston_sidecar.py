@@ -69,7 +69,7 @@ BUCKET_FREQ = "1h"
 # reasons — it is NOT a half-width of a centered window. A centered ±30min
 # window around T would include trades at timestamps > T and would LEAK.
 #
-# DEFERRED (tracked in the Session G memory entry, not this cycle): widening
+# A future causal variant could widen
 # the window to ``[T - 1h, T)`` would use all trades in the preceding hour
 # instead of half of them (trades in ``[T - 60min, T - 30min)`` are
 # currently discarded by the sidecar but are strictly past relative to T,

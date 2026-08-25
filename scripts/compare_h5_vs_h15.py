@@ -1,10 +1,10 @@
-"""In-depth comparison of h=5 vs h=15 V2-stack backtests.
+"""Historical comparison of h=5 vs h=15 invalidated V2-stack backtests.
 
 Both runs share the full V2 stack: aligner-corrected predictions +
 Kelly K1 long-side boost. The horizon is the only intentional axis
 of difference. Caveats and known asymmetries:
 
-- h=15 is the production trade log (BTC_v2_trade_log.parquet); used the
+- h=15 is the historical trade log (BTC_v2_trade_log.parquet); used the
   legacy h=15 vol_arb_svi.parquet IV source.
 - h=5 (BTC_v2_trade_log_h5m.parquet) used the h=5 native-bucketed
   BTC_vol_arb_svi_h5m.parquet (SVI calibrated at 5-min cadence).
@@ -356,7 +356,7 @@ def main() -> int:
     df_pass = (nc_delta >= 150_000) and (sh_delta >= -0.3) and (mdd_delta >= -1_000)
     sp_pass = (nc_delta >= 50_000)  and (sh_delta >= -0.7) and (mdd_delta >= -3_000)
     print(f"  Default-flip gate (ΔNC≥+$150K, ΔSharpe≥-0.3, ΔMDD≥-$1K): {'PASS' if df_pass else 'FAIL'}")
-    print(f"  Ship-as-preset gate (ΔNC≥+$50K, ΔSharpe≥-0.7, ΔMDD≥-$3K): {'PASS' if sp_pass else 'FAIL'}")
+    print(f"  Historical secondary threshold (ΔNC≥+$50K, ΔSharpe≥-0.7, ΔMDD≥-$3K): {'PASS' if sp_pass else 'FAIL'}")
     if not df_pass:
         fails = []
         if nc_delta < 150_000: fails.append(f"NC PnL ${nc_delta:+,.0f} < +$150K")
@@ -368,10 +368,9 @@ def main() -> int:
         if nc_delta < 50_000: fails.append(f"NC PnL ${nc_delta:+,.0f} < +$50K")
         if sh_delta < -0.7: fails.append(f"Sharpe drop {-sh_delta:.2f} > 0.7")
         if mdd_delta < -3_000: fails.append(f"MDD worsens by ${-mdd_delta:,.0f} > $3K")
-        print(f"    Ship-as-preset fails on: {', '.join(fails)}")
+        print(f"    Historical secondary threshold fails on: {', '.join(fails)}")
     print()
-    print("  Note: Kelly K1 precedent (2026-04-21) accepted a similar Sharpe-for-PnL")
-    print("  tradeoff at ΔSharpe -0.94 / +$114K. h=5 is ΔSharpe %.2f / +$%dK." % (sh_delta, nc_delta/1000))
+    print("  These invalidated V2 comparisons cannot establish a deployable preset.")
     print("  $/Sharpe-pt ratio: $%dK (vs Kelly K1: $121K)" % (abs(nc_delta) / abs(sh_delta) / 1000))
 
     return 0

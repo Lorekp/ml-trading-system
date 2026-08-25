@@ -6,9 +6,8 @@ Why this exists
 Before H1, the engine's KillSwitch was in-memory only. ``store.open()``
 seeded a ``kill_switch_state`` row at engine boot but the engine never
 called ``get_kill_switch_state`` to restore it, nor wrote back via
-``set_kill_switch_state`` on a trip. The runbook (RUNBOOK_PAPER_V2.md
-line 206) literally instructed operators to "manually edit SQLite"
-before restart — design intent existed, wiring was missing.
+``set_kill_switch_state`` on a trip. State therefore disappeared across a
+restart even though the SQLite schema already represented it.
 
 These tests pin the contract added by H1:
 

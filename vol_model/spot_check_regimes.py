@@ -1,18 +1,18 @@
 """Regime-hardness substrate selection for signal-improvement spot-checks.
 
 Picks the set of months on which candidate signals must demonstrate
-improvement over production pruned_svi_v1. Selection is deterministic and
+improvement over the historical ``pruned_svi_v1`` reference. Selection is deterministic and
 reproducible from the existing walk-forward summary.json.
 
-Methodology (from plan at ~/.claude/plans/starry-rolling-rabin.md):
+Methodology:
 
   A. QLIKE-hardest: top-K months by absolute production QLIKE (harder = worse
      current performance, so a new signal has the most room to demonstrate
      real incremental skill).
 
-  B. Macro hand-picks: months associated with the top DD episodes from the
-     2026-04 drawdown investigation (BTC_dd_investigation.md) and Stage 18's
-     largest QLIKE drops. Ensures the substrate includes named regime shifts.
+  B. Macro hand-picks: months associated with the historical 2026-04 drawdown
+     investigation and the largest recorded QLIKE drops. This ensures the
+     substrate includes named regime shifts.
 
 Output is the UNION of A + B. Typical cardinality: 6-8 distinct months.
 """

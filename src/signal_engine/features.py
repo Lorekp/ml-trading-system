@@ -96,10 +96,12 @@ def compute_features(ohlcv: pd.DataFrame, config: FeatureConfig) -> pd.DataFrame
     vol_window = config.vol_zscore_window
     vol_mean = volume.rolling(vol_window, min_periods=10).mean()
     vol_std = volume.rolling(vol_window, min_periods=10).std()
-    if vol_std.max() > 0:
-        f["vol_zscore"] = (volume - vol_mean) / vol_std.replace(0, np.nan)
-    else:
-        f["vol_zscore"] = 0.0  # constant volume, no information
+    # NEW (B-024): always compute z-score, then fillna(0.0) for any NaN rows.
+    # The previous 'if vol_std.max() > 0' check short-circuited the WHOLE
+    # series to 0 even when only some windows had std=0; for assets with first
+    # 30 bars constant volume (std=0), late-variable windows got suppressed.
+    f["vol_zscore"] = (volume - vol_mean) / vol_std.replace(0, np.nan)
+    f["vol_zscore"] = f["vol_zscore"].fillna(0.0)
 
     # Technical indicators
     f["rsi_14"] = rsi(close, 14)

@@ -76,7 +76,7 @@ def load_iv_change_targets(feature_index: pd.DatetimeIndex) -> pd.Series:
     if not TRADE_LOG_PATH.exists():
         raise FileNotFoundError(
             f"Need {TRADE_LOG_PATH} — regenerate via `python -m vol_arb.run_backtest "
-            "--btc-production-v2 --output {path}`"
+            "--historical-btc-v2 --output {path}`"
         )
     tl = pd.read_parquet(TRADE_LOG_PATH)
     aligned = tl.reindex(feature_index)

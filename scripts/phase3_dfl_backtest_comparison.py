@@ -16,12 +16,15 @@ Pre-committed strategies:
 - B2 Binary-median: size *= 0.5 if P(win) < train_median else 1.0
 - B3 Normalized: size *= clip(P(win) / train_mean, 0.5, 2.0)
 
-Baseline: BTC_v2_trade_log_baseline.parquet (existing production V2).
+Baseline: BTC_v2_trade_log_baseline.parquet (invalidated historical V2 reference).
 
 Success criteria (pre-registered):
-- Ship as optional sidecar: NC Sharpe up, NC PnL within 10% of baseline
+- Retain as a historical research candidate: NC Sharpe up, NC PnL within 10% of baseline
 - Reject otherwise
 - If multiple strategies pass, pick the SIMPLEST (Occam)
+
+These gates compare candidates only within the invalidated V2 setup. They do
+not establish PnL realism or authorize deployment.
 """
 from __future__ import annotations
 import warnings; warnings.filterwarnings('ignore')
@@ -144,12 +147,12 @@ def main():
     df.to_csv('vol_arb/output/BTC_v2_dfl_comparison.csv')
     print(f"\nSaved comparison CSV: vol_arb/output/BTC_v2_dfl_comparison.csv")
 
-    # Pre-registered ship-decision
+    # Pre-registered within-model candidate decision
     print("\n" + "=" * 100)
-    print("SHIP DECISION (PRE-REGISTERED GATES)")
+    print("HISTORICAL CANDIDATE DECISION (PRE-REGISTERED GATES)")
     print("=" * 100)
-    print("Ship-as-sidecar gate: NC Sharpe >= baseline AND PnL >= 0.90 * baseline")
-    print("Ship-as-default gate: NC Sharpe >= baseline + 0.5 AND PnL >= baseline")
+    print("Sidecar-candidate gate: NC Sharpe >= baseline AND PnL >= 0.90 * baseline")
+    print("Preferred-candidate gate: NC Sharpe >= baseline + 0.5 AND PnL >= baseline")
     print()
     shipped = []
     for name, m in results.items():
@@ -158,10 +161,10 @@ def main():
         sharpe_ok_default = m['sharpe_daily'] >= base['sharpe_daily'] + 0.5
         pnl_ok_default = m['total_pnl'] >= base['total_pnl']
         if sharpe_ok_default and pnl_ok_default:
-            verdict = "SHIP AS DEFAULT"
+            verdict = "PREFERRED HISTORICAL CANDIDATE"
             shipped.append((name, verdict))
         elif sharpe_ok_sidecar and pnl_ok_sidecar:
-            verdict = "SHIP AS SIDECAR"
+            verdict = "OPTIONAL HISTORICAL CANDIDATE"
             shipped.append((name, verdict))
         else:
             verdict = "REJECT"
@@ -170,7 +173,7 @@ def main():
         print(f"  {name:<22} dSharpe={sharpe_diff:+.2f}  dPnL={pnl_pct:+.1f}%  -> {verdict}")
 
     if not shipped:
-        print("\nAll strategies rejected. Recommend: do not ship. Document as negative result.")
+        print("\nAll strategies rejected. Document this within-model comparison as a negative result.")
     else:
         print(f"\n{len(shipped)} strateg{'ies' if len(shipped)>1 else 'y'} passed gate:")
         for name, verdict in shipped:

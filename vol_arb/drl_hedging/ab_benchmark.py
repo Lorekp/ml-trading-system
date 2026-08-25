@@ -10,8 +10,7 @@ underlying vol_arb bar in both environments. Then reports:
 - Paired diff (v4 - v3) for reward, cost, std of each, with a
   bootstrap 90% CI on the mean difference.
 
-Adoption rule (from the W5 plan in
-``C:\\Users\\laure\\.claude\\plans\\flickering-wandering-locket.md``):
+Historical experiment rule:
 
     Adopt v4 only if Sortino improves AND hedge-cost std does not
     regress by more than 10%.

@@ -1,14 +1,14 @@
-"""Phase 1 — alternative structure backtests under cycle-10 V2.
+"""Historical Phase 1 alternative-structure tests under invalidated V2.
 
-The backtester ships with a pre-computed strangle infrastructure
+The backtester contains optional strangle infrastructure
 (``use_instrument_routing=True``) that selects between ATM straddle, bear
 strangle (ATM call + 25Δ OTM put), and bull strangle (25Δ OTM call + ATM
-put) based on a skew gate. Memory T2.2 / T2.2b found this routing was
-strictly worse than ATM under cycle-9, so V2 default is ``False``.
+put) based on a skew gate. Earlier cycle-9 runs found this routing strictly
+worse than ATM, so the historical V2 default is ``False``.
 
-Phase 0 (PHASE0_DECOMP.md) found that LONG-side edge concentrates 4-5×
-in extreme positive 1w 25-delta skew (>20). This justifies a fresh test
-of routing under cycle-10:
+An earlier decomposition suggested that long-side results concentrated in
+extreme positive 1w 25-delta skew (>20). This script preserves the subsequent
+historical routing comparison:
 
 * TransVol + LGBM retrained
 * skew>25 short filter active
@@ -77,8 +77,7 @@ CASES: list[ConfigCase] = [
 # All inverted variants also strictly lost vs ATM baseline (-$266K to
 # -$320K NC PnL, 0/5 per-year strict pass). The flag has been removed
 # since both routing directions are now ruled out under cycle-10.
-# Empirical evidence preserved in PHASE1_ALT_STRUCTURES.md and
-# PHASE1_ALT_STRUCTURES_TRADELOGS/S5..S7_*_trade_log.parquet.
+# The historical run rejected both routing directions under cycle-10.
 
 
 def df_to_md(df: pd.DataFrame) -> str:
@@ -155,7 +154,7 @@ def summarize_run(name: str, tl: pd.DataFrame) -> dict:
 
 
 def run_case(case: ConfigCase) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+    cfg = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
     cfg.use_instrument_routing = case.use_routing
     cfg.routing_mode = case.routing_mode
     cfg.svi_skew_threshold = case.svi_thresh
@@ -194,13 +193,13 @@ def main() -> int:
     # 3) Build markdown report
     md = []
     md.append("# Phase 1 - Alternative structure backtests (cycle-10 V2)\n")
-    md.append("Tests whether the pre-computed strangle routing infrastructure ")
+    md.append("Historical test of whether the strangle routing infrastructure ")
     md.append("(`use_instrument_routing=True`) wins under cycle-10's V2 ")
     md.append("(TransVol + LGBM retrain + skew>25 short filter + thr_S=20). ")
-    md.append("Memory T2.2/T2.2b said routing was strictly worse under cycle-9; ")
+    md.append("Earlier cycle-9 runs found routing strictly worse; ")
     md.append("Phase 0 finding that long-side edge concentrates 4-5x at skew>20 ")
     md.append("motivates a re-test.\n")
-    md.append("Baseline (S0) is the canonical V2 trade log on disk; ")
+    md.append("Baseline (S0) is the invalidated historical V2 trade log on disk; ")
     md.append("alternatives are fresh runs with `use_instrument_routing` and the ")
     md.append("specified gating.\n")
 

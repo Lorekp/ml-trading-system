@@ -1,7 +1,6 @@
 """Evaluate the Cycle 4 Phase B AUC-delta gate and render V4_SHORTFALL_HEAD.md.
 
-Pre-committed gate (CONJUNCTIVE, all four required) — locked in plan
-``now-check-empirically-from-eager-bird.md``:
+Frozen historical gate (conjunctive; all four required):
 
 - G1 — pooled-OOS AUC(TREATMENT) − AUC(BASELINE) ≥ +0.02
 - G2 — 95% lower bound of paired stationary block bootstrap
@@ -155,7 +154,7 @@ unblinded numbers if they want to revisit.
 
     return f"""# V4 Conditional-Shortfall Classifier — Gate Result
 
-Cycle 4 Phase B (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 4 Phase B comparison.
 
 Three LightGBM classifiers with identical hyperparameters
 (``DFL_LGBM_PARAMS``), identical walk-forward year folds (expanding by

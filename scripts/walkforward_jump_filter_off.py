@@ -1,9 +1,12 @@
 """Walk-forward test: does removing `max_jump_fraction_for_shorts` hold OOS?
 
-Pre-committed test (2026-05-11) to avoid in-sample cherry-pick after the
+Historical within-model comparison (2026-05-11) on the invalidated V2
+research setup. Passing these gates can rank settings inside that setup; it
+does not validate PnL realism or authorize deployment.
+
+Frozen historical test to avoid in-sample cherry-picking after the
 full-sample sweep showed jf=1.00 dominates jf=0.15 unanimously on
-every year. Per ``feedback_no_cherry_pick.md``, accept a structural
-result only when:
+every year. Treat a structural result as a candidate only when:
 
   (a) TRAIN years (2022-2024) confirm the win.
   (b) OOS years (2025-2026) confirm the win.
@@ -19,7 +22,8 @@ PRE-COMMITTED GATES (locked BEFORE running):
   G5 — Train-to-OOS sign consistency: dPnL is positive in BOTH
        TRAIN and OOS (i.e., the win replicates).
 
-Reject if any gate fails. Ship only if ALL five gates pass.
+Reject the candidate if any gate fails. Retain it for further research only if
+all five gates pass.
 
 Plus a TRADE COUNT delta — how many extra shorts fire, and how
 profitable are the marginal trades on average.
@@ -63,7 +67,7 @@ GATE_OOS_MDD_WORSEN_MAX = 2_000.0  # MDD worsening tolerance ($)
 def _run(jf_cap: float) -> pd.DataFrame:
     """Run the full V2 backtester with the given jump-filter cap."""
     cfg = (BacktestConfig()
-           .with_btc_production_filters_v2()
+           .with_historical_btc_v2()
            .with_realistic_costs())
     cfg.max_jump_fraction_for_shorts = jf_cap
     _, tl = VolArbBacktester(cfg).run_backtest()
@@ -135,7 +139,7 @@ def main() -> int:
     print("=" * 80)
 
     t0 = time.time()
-    logger.info("Running V2 with jf=0.15 (baseline, current production) ...")
+    logger.info("Running invalidated historical V2 with jf=0.15 (reference baseline) ...")
     tl_base = _run(0.15)
     logger.info("Running V2 with jf=1.00 (filter OFF, treatment) ...")
     tl_trt = _run(1.00)
@@ -286,17 +290,18 @@ def main() -> int:
 
     print()
     if all_pass:
-        print("  VERDICT: ALL GATES PASS — jf=1.00 (filter OFF) is the new default.")
+        print("  VERDICT: ALL GATES PASS — jf=1.00 is a historical research candidate; PnL realism remains unvalidated.")
     else:
-        print("  VERDICT: AT LEAST ONE GATE FAILED — keep jf=0.15 (production default).")
+        print("  VERDICT: AT LEAST ONE GATE FAILED — retain jf=0.15 as the historical reference setting.")
 
     # ── Write markdown report ──
     lines = ["# Jump-filter walk-forward: jf=0.15 vs jf=1.00 (OFF)", ""]
-    lines.append("Pre-committed test (2026-05-11). Sweep at "
-                 "`vol_arb/output/JUMP_FRACTION_SWEEP_2026_05_11.md` "
-                 "showed jf=1.00 dominates jf=0.15 unanimously on every year of "
-                 "the full sample. This walk-forward verifies the result holds "
-                 "OOS without in-sample contamination.")
+    lines.append("Historical frozen test (2026-05-11). An earlier sweep "
+                 "showed jf=1.00 dominates jf=0.15 on every year of "
+                 "the full sample. This comparison checks whether that result "
+                 "holds on the later slice. The underlying V2 result is "
+                 "invalidated, so this does not establish PnL realism or "
+                 "deployability.")
     lines.append("")
     lines.append(f"- TRAIN: {sorted(TRAIN_YEARS)}")
     lines.append(f"- OOS:   {sorted(OOS_YEARS)}")
@@ -308,7 +313,7 @@ def main() -> int:
         lines.append(f"- {marker} {name}")
         lines.append(f"  - {detail}")
     lines.append("")
-    lines.append(f"## Verdict: {'**SHIP** (all 5 gates pass)' if all_pass else '**REJECT** (at least one gate failed)'}")
+    lines.append(f"## Verdict: {'**RESEARCH CANDIDATE** (all 5 within-model gates pass)' if all_pass else '**REJECT** (at least one gate failed)'}")
     lines.append("")
 
     lines.append("## TRAIN slice (2022-2024)")

@@ -1,7 +1,5 @@
 """Tests for ``deribit_paper/execution/profit_scale.py``.
 
-E.1.1 in plan ``C:\\Users\\laure\\.claude\\plans\\starry-rolling-rabin.md``.
-
 Three contracts under test:
 
 1. **Cold-start prior**: with no realised trades, profit_scale is

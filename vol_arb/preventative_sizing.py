@@ -1,14 +1,14 @@
 """Preventative sizing rule — externally-anchored gamma + vega budget.
 
-Cycle 2 Phase P (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 2 Phase P rule.
 
 V2's edge is short-gamma + IV mean reversion within 15 minutes; reactive
 stops destroyed PnL at every threshold tested in Cycle 1 (Tier C-2). The
-plan's preventative alternative shrinks size at trade ENTRY when pre-trade
+The preventative alternative shrinks size at trade entry when pre-trade
 gamma OR vega exceeds an externally-anchored Deribit-PME loss budget. No
 backtest tuning, no free parameters.
 
-Derivation (see plan §"Pre-committed parameters"):
+Frozen derivation:
 
     LossBudget   = equity × loss_budget_pct        (1% of equity per event)
     gamma_target = 2 × LossBudget / (Spot × pme_shock_spot)²
@@ -48,7 +48,7 @@ Anti-leakage guarantees:
 Anti-overfitting guarantees:
 - The three external anchors are documented public values. They are
   asserted in tests via constant-equality checks; modifying any of them
-  in code without updating the plan file should fail the test suite.
+  in code without an explicit protocol revision should fail the test suite.
 - The per-trade scaler is a closed-form function with NO fitted parameter.
 """
 from __future__ import annotations
@@ -103,7 +103,7 @@ def compute_pme_iv_shock_anchor(
 
     Uses RELATIVE 1-day DVOL changes ``|ΔDVOL_t / DVOL_{t-1}|`` and takes
     the 99th percentile. Multiplying ATM IV by this scalar gives the
-    plan's vega-budget shock magnitude in vol points.
+    frozen vega-budget shock magnitude in vol points.
 
     Anti-leak: restricts inputs to the calibration window before any
     computation; raises if `dvol_series` lacks a DatetimeIndex.

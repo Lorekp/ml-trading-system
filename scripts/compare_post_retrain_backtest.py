@@ -1,7 +1,7 @@
 """Cycle 8 post-retrain V2 backtest impact comparison (2026-05-08).
 
 After the 6-month --force retrain (C2 closure), this script runs the
-canonical V2 backtest against the fresh checkpoints and diffs key
+invalidated historical V2 backtest against the fresh checkpoints and diffs key
 metrics against the pre-retrain backup at
 ``backups/2026-05-08_pre_cycle8_retrain/BTC_v2_trade_log_pre_retrain.parquet``.
 
@@ -15,7 +15,7 @@ Reports:
   - Per-month PnL deltas
 
 The backup is created by the operator before kicking off the retrain
-so the baseline is the pre-retrain BTC_v2_trade_log.parquet (canonical
+so the baseline is the pre-retrain BTC_v2_trade_log.parquet (historical
 cycle-7 trade log).
 
 Usage::
@@ -48,11 +48,11 @@ _PRE_RETRAIN_TRADE_LOG = _BACKUP_DIR / "BTC_v2_trade_log_pre_retrain.parquet"
 
 
 def _run_canonical_v2_backtest() -> pd.DataFrame:
-    """Run the V2 canon (production filters + realistic costs)."""
+    """Run the invalidated historical V2 preset with realistic costs."""
     from vol_arb.backtester import BacktestConfig, VolArbBacktester
     cfg = (
         BacktestConfig()
-        .with_btc_production_filters_v2()
+        .with_historical_btc_v2()
         .with_realistic_costs()
     )
     _, trade_log = VolArbBacktester(cfg).run_backtest()
@@ -69,7 +69,7 @@ def _per_trade_metrics(tl: pd.DataFrame) -> dict:
     fired_pnl = nc[fired]
     if len(fired_pnl) > 1 and fired_pnl.std(ddof=1) > 0:
         # Annualisation factor: sqrt(trades_per_year). For h=15m the
-        # production heuristic is ~96 bars/day × 365 = ~35k bars/year;
+        # historical 15-minute heuristic is ~96 bars/day × 365 = ~35k bars/year;
         # trade rate is much lower. Use raw sharpe (PnL mean / std).
         sharpe_trade = float(fired_pnl.mean() / fired_pnl.std(ddof=1))
     else:

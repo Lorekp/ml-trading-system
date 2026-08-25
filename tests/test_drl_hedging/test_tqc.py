@@ -48,10 +48,14 @@ def _build_synthetic_market(n_bars: int = 200) -> MarketDataView:
         "T_years": np.full(n_bars, 7.0 / 365.25),
     }, index=idx)
 
+    # Mirror MarketDataView.__init__: use only realized volatility known
+    # before the sampled bar so the fixture preserves the causal contract.
+    df["vol_ann_lagged"] = df["vol_ann"].shift(1)
+
     data = MarketDataView.__new__(MarketDataView)
     data.period = ("2024-01-01", "2024-01-05")
     data.df = df
-    data.active_idx = df.index
+    data.active_idx = df.index[df["vol_ann_lagged"].notna()]
     data.sample_weights = None
     svi_params = pd.DataFrame({
         "timestamp": [idx[0] - pd.Timedelta(hours=1)],

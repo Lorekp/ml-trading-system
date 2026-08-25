@@ -84,7 +84,7 @@ combined = pd.concat([
 ], axis=1)
 
 # ---- Regime classification ------------------------------------------------
-# External market knowledge + memory:
+# Historical regime labels used by this diagnostic:
 #   - 2022-05: LUNA/UST collapse (May 7-12)
 #   - 2022-06: 3AC + Celsius unwind (mid-June)
 #   - 2022-09 to 2022-10: post-Merge selloff, FOMC shocks

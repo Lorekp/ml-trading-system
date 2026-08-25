@@ -1,7 +1,6 @@
 """Generate boolean filter sidecars from Phase B's pooled-OOS shortfall scores.
 
-Cycle 4 Phase C (CONDITIONAL on Phase B passing) — plan
-``now-check-empirically-from-eager-bird.md``.
+Historical Cycle 4 Phase C, conditional on the Phase B comparison.
 
 3 pre-committed cuts on the calibration-window distribution of
 ``p_treatment``: drop trades where pooled-OOS P(shortfall) is in top

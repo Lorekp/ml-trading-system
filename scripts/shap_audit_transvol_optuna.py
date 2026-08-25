@@ -43,15 +43,21 @@ sys.path.insert(0, str(REPO_ROOT))
 import numpy as np  # noqa: E402
 import optuna  # noqa: E402
 import pandas as pd  # noqa: E402
-import shap  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
+
+# NOTE: ``shap`` is imported LAZILY inside ``_audit_month`` (the only consumer)
+# so the production retrain path — which imports _make_per_month_datasets /
+# _train_transvol / _select_transvol_features from this module — does NOT
+# require the heavy (and here uninstalled) ``shap`` package. The rehab retrain
+# (scripts/retrain_transvol_optuna.py) goes through that path and must run on a
+# box without shap.
 
 from vol_model.config import VolModelConfig  # noqa: E402
 from vol_model.pipeline import build_dataset  # noqa: E402
 from vol_model.transvol.config import TransVolConfig  # noqa: E402
 from vol_model.transvol.dataset import (  # noqa: E402
-    TIME_COLS, FeatureNormalizer, TransVolDataset,
+    TIME_COLS, FeatureNormalizer, FeatureWinsorizer, TransVolDataset,
 )
 from vol_model.transvol.model import TransVolEncoder  # noqa: E402
 
@@ -84,43 +90,101 @@ def _select_transvol_features(X: pd.DataFrame) -> pd.DataFrame:
 def _make_per_month_datasets(
     X: pd.DataFrame, cont: pd.Series, jump: pd.Series,
     month_start: pd.Timestamp, seq_len: int,
-) -> tuple[TransVolDataset, TransVolDataset, FeatureNormalizer]:
+    rehab: bool = False,
+) -> tuple[TransVolDataset, TransVolDataset, FeatureNormalizer] | tuple[
+    TransVolDataset, TransVolDataset, FeatureNormalizer, dict
+]:
     """Build train + val datasets for a single audit month using
     PRIOR-only data. Train = first 85% of prior data; val = last 15%
-    of prior data."""
+    of prior data.
+
+    ``rehab=False`` (PRODUCTION DEFAULT): byte-identical to the deployed
+    path — feature z-norm fit on the train slice, time z-norm re-fit (not
+    returned), raw-variance continuous target. Returns
+    ``(train_ds, val_ds, feature_normalizer)``.
+
+    ``rehab=True`` applies the pre-committed R1+R2+R6 clean build, every
+    statistic fit on the TRAIN slice only (no leakage):
+      * R1 — winsorize features at p0.5/p99.5 (train-fit) BEFORE z-score.
+      * R6 — return the time-normalizer (train-fit) so it travels with the
+        checkpoint instead of being re-fit on the extraction window.
+      * R2 — log-target: ``continuous_var`` -> log; the raw variance is kept
+        for the QLIKE validation metric.
+    Returns ``(train_ds, val_ds, feature_normalizer, prep)`` where ``prep``
+    carries the fitted winsorizer / time-normalizer / log-bias to persist.
+    """
     prior = X.index < month_start
     X_prior = X[prior]
     cont_prior = cont[prior]
     jump_prior = jump[prior]
     n = len(X_prior)
     val_start = int(n * 0.85)
-    feature_cols = list(X_prior.columns)
 
     feat_vals = X_prior.values.astype(np.float32)
     time_vals = X_prior[TIME_COLS].values.astype(np.float32)
     cont_vals = cont_prior.values.astype(np.float32)
     jump_vals = jump_prior.values.astype(np.float32)
 
-    # Z-norm features fit on TRAIN slice only.
-    norm = FeatureNormalizer().fit(feat_vals[:val_start])
-    feat_norm = norm.transform(feat_vals)
-
-    time_norm_obj = FeatureNormalizer().fit(time_vals[:val_start])
-    time_norm = time_norm_obj.transform(time_vals)
-
-    # Normalize jump_var to O(1).
+    # Normalize jump_var to O(1) (identical in both modes; train-fit mean).
     jump_mean = max(float(jump_vals[:val_start].mean()), 1e-15)
     jump_norm = jump_vals / jump_mean
 
+    if not rehab:
+        # ── PRODUCTION PATH (unchanged) ──────────────────────────────
+        norm = FeatureNormalizer().fit(feat_vals[:val_start])
+        feat_norm = norm.transform(feat_vals)
+
+        time_norm_obj = FeatureNormalizer().fit(time_vals[:val_start])
+        time_norm = time_norm_obj.transform(time_vals)
+
+        train_ds = TransVolDataset(
+            feat_norm[:val_start], time_norm[:val_start],
+            cont_vals[:val_start], jump_norm[:val_start], seq_len,
+        )
+        val_ds = TransVolDataset(
+            feat_norm[val_start:], time_norm[val_start:],
+            cont_vals[val_start:], jump_norm[val_start:], seq_len,
+        )
+        return train_ds, val_ds, norm
+
+    # ── REHAB PATH (R1 + R2 + R6) ────────────────────────────────────
+    # R1: winsorize features (train-fit p0.5/p99.5) BEFORE z-scoring.
+    winsor = FeatureWinsorizer(lo_q=0.005, hi_q=0.995).fit(feat_vals[:val_start])
+    feat_clipped = winsor.transform(feat_vals)
+    norm = FeatureNormalizer().fit(feat_clipped[:val_start])
+    feat_norm = norm.transform(feat_clipped)
+
+    # R6: time-normalizer fit on TRAIN slice only and RETURNED for persistence
+    # (production re-fits it on the extraction window -> the A2-M1 leak).
+    time_norm_obj = FeatureNormalizer().fit(time_vals[:val_start])
+    time_norm = time_norm_obj.transform(time_vals)
+
+    # R2: log-target. continuous_var is strictly positive variance; guard the
+    # log with a tiny floor. The head predicts log-variance directly.
+    cont_log = np.log(np.clip(cont_vals, 1e-12, None)).astype(np.float32)
+    cont_log_bias = float(cont_log[:val_start].mean())
+
     train_ds = TransVolDataset(
         feat_norm[:val_start], time_norm[:val_start],
-        cont_vals[:val_start], jump_norm[:val_start], seq_len,
+        cont_log[:val_start], jump_norm[:val_start], seq_len,
+        continuous_var_metric=cont_vals[:val_start],
     )
     val_ds = TransVolDataset(
         feat_norm[val_start:], time_norm[val_start:],
-        cont_vals[val_start:], jump_norm[val_start:], seq_len,
+        cont_log[val_start:], jump_norm[val_start:], seq_len,
+        continuous_var_metric=cont_vals[val_start:],
     )
-    return train_ds, val_ds, norm
+    prep = {
+        "winsor_lo": winsor.lo,
+        "winsor_hi": winsor.hi,
+        "winsor_lo_q": winsor.lo_q,
+        "winsor_hi_q": winsor.hi_q,
+        "time_normalizer_mean": time_norm_obj.mean,
+        "time_normalizer_std": time_norm_obj.std,
+        "cont_log_bias": cont_log_bias,
+        "target_log": True,
+    }
+    return train_ds, val_ds, norm, prep
 
 
 def _train_transvol(
@@ -172,6 +236,10 @@ def _train_transvol(
                 "continuous_var": batch["continuous_var"].to(device),
                 "jump_var": batch["jump_var"].to(device),
             }
+            if "continuous_var_raw_for_metric" in batch:
+                targets["continuous_var_raw_for_metric"] = (
+                    batch["continuous_var_raw_for_metric"].to(device)
+                )
             with torch.amp.autocast("cuda"):
                 outputs = model(x, t)
                 losses = model.compute_loss(outputs, targets)
@@ -195,6 +263,10 @@ def _train_transvol(
                     "continuous_var": batch["continuous_var"].to(device),
                     "jump_var": batch["jump_var"].to(device),
                 }
+                if "continuous_var_raw_for_metric" in batch:
+                    tgt["continuous_var_raw_for_metric"] = (
+                        batch["continuous_var_raw_for_metric"].to(device)
+                    )
                 with torch.amp.autocast("cuda"):
                     out = model(x, t)
                     losses = model.compute_loss(out, tgt)
@@ -372,6 +444,7 @@ def _audit_month(
     bg_x = torch.from_numpy(np.stack(bg_x_list)).to(device)
     bg_t = torch.from_numpy(np.stack(bg_t_list)).to(device)
 
+    import shap  # lazy: only the SHAP-audit path needs it (see module header)
     t0 = time.time()
     explainer = shap.GradientExplainer(wrapped, [bg_x, bg_t])
     shap_values = explainer.shap_values([X_seq, T_seq])

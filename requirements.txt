@@ -10,19 +10,18 @@ lz4>=4.0
 
 # ML
 scikit-learn>=1.4
+lightgbm>=4.0
+optuna>=3.0
 xgboost>=2.0
 statsmodels>=0.14
 
 # Scientific
 scipy>=1.12
+pydantic>=2.0
+pyyaml>=6.0
 
 # Visualization
 matplotlib>=3.8
-
-# PDF/EPUB reading (for library)
-pymupdf>=1.24
-ebooklib>=0.18
-beautifulsoup4>=4.12
 
 # Note: mlfinlab and fracdiff are incompatible with Python 3.14.
 # All AFML algorithms (FFD, triple-barrier, purged CV, feature importance)

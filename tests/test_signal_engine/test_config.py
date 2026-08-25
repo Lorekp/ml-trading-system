@@ -127,7 +127,7 @@ def test_systemconfig_defaults() -> None:
     assert cfg.close_model.lookbacks == [1, 2, 3, 4, 6, 8, 10, 12]
     assert cfg.close_model.model_type == "xgboost"
     assert cfg.close_model.label_mode == "residual_triple_barrier"
-    assert cfg.close_model.production_decision_timeframe == "15min"
+    assert cfg.close_model.reference_decision_timeframe == "15min"
     assert cfg.close_model.research_decision_timeframes == ["5min", "10min", "15min"]
     assert cfg.close_model.use_afml_optimization is True
     assert cfg.close_model.pct_embargo == 0.01

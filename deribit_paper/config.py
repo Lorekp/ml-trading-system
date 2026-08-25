@@ -40,13 +40,13 @@ class PaperConfig:
 
     Grouped by concern: venue/credentials, strategy knobs, execution,
     risk, monitoring, paths.  Most strategy knobs mirror
-    ``vol_arb.backtester.BacktestConfig`` defaults so a paper run is a
-    faithful live replica of the backtest.
+    ``vol_arb.backtester.BacktestConfig`` defaults so a paper run can be
+    compared with the backtest without implying deployability.
     """
 
     # ── Venue / credentials ─────────────────────────────────────────
-    # Deribit testnet by default — flip to ``prod`` only after Phase 7
-    # validation passes + passphrase confirmation at the CLI.
+    # Deribit testnet by default. The CLI selects ``prod`` only for
+    # unauthenticated mainnet quotes in paper mode.
     venue: str = "testnet"  # "testnet" | "prod"
     client_id: str = ""
     client_secret: str = ""
@@ -55,7 +55,7 @@ class PaperConfig:
     # Paper mode: connect to the configured venue (typically prod) for
     # real market data, but never authenticate for private endpoints
     # and never submit orders. Requires no Deribit API credentials.
-    # Implies ``dry_run=True`` (enforced by the CLI). Used for live
+    # Implies ``dry_run=True`` (enforced by the CLI). Used for
     # signal-stack validation against real mainnet quotes without any
     # account-side risk.
     paper_mode: bool = False
@@ -72,16 +72,16 @@ class PaperConfig:
     base_spread_iv: float = 1.5
     spread_jump_k: float = 3.0
     entry_threshold: float = 25.0       # mirrors BacktestConfig: shorts need 25 vp edge
-    # NOTE: ``default`` preset uses 30 (legacy live behaviour). The V2
-    # production stack drops this to 12 because the contango filter
+    # NOTE: the default uses 30. The historical V2 replay preset uses 12
+    # because the contango filter
     # (``skip_long_if_term_slope_gt=0.0``) already removes the bad-regime
     # longs, so surviving longs have structural positive edge — see
-    # ``BacktestConfig.with_btc_production_filters_v2`` docstring. Flipped
-    # to 12.0 by ``PaperConfig.with_v2_preset()``.
+    # ``BacktestConfig.with_historical_btc_v2`` docstring. This
+    # value is set only by ``PaperConfig.historical_v2_preset()``.
     entry_threshold_long: float = 30.0
     # V2: drop LONG signals when 1w-2w term slope > 0 (IV contango).
-    # ``None`` disables the filter (legacy live default). The V2 preset
-    # sets this to 0.0 to match the backtest contract.
+    # ``None`` disables the filter. The historical V2 replay preset sets
+    # this to 0.0 to reproduce that backtest contract.
     skip_long_if_term_slope_gt: float | None = None
     # V2 cycle-10 (2026-05-10): drop SHORT signals when 1w 25-delta skew
     # exceeds this threshold (positive = call-bid). Mirror-symmetric to
@@ -90,10 +90,8 @@ class PaperConfig:
     # ``BacktestConfig.skip_short_if_skew_1w_gt`` for mechanism.
     skip_short_if_skew_1w_gt: float | None = None
     # D2 (parity 2026-05-07): mute LONG (+1) signals at these UTC hours.
-    # Mirrors ``BacktestConfig.skip_long_hours_utc``. The V2 production
-    # backtest uses ``(14, 15, 16)`` to drop US-cash-open longs that fade
-    # 4/5 historical years. Empty tuple disables (default; preserves the
-    # legacy live behaviour for non-V2 presets).
+    # Mirrors ``BacktestConfig.skip_long_hours_utc``. The historical V2
+    # backtest used ``(14, 15, 16)``. Empty tuple disables the filter.
     skip_long_hours_utc: tuple[int, ...] = ()
     option_maker_fee: float = 0.0003    # Deribit: 0.03% of underlying (same maker & taker)
     perp_taker_fee: float = 0.0005     # Deribit: 0.05% taker (maker gets -0.01% rebate)
@@ -110,11 +108,8 @@ class PaperConfig:
 
     # ── Position sizing ────────────────────────────────────────────
     initial_equity: float = 1.0              # demo BTC (testnet starts with ~10 BTC)
-    # ``default`` preset matches the legacy live conservative posture
-    # (5%). The V2 preset bumps this to 0.15 — the 3x leverage difference
-    # is the single largest dollar driver of live-vs-backtest divergence
-    # per ``01-landscape.md``. Flipped to 0.15 by
-    # ``PaperConfig.with_v2_preset()``.
+    # The historical V2 replay preset overrides this default to reproduce
+    # its archived sizing configuration.
     target_margin_utilization: float = 0.05
     # Conviction-weighted size scaling (mirrors BacktestConfig): scales
     # position by trailing-window profit factor floored at
@@ -131,11 +126,9 @@ class PaperConfig:
     baseline_target_dvol: float = 50.0
     max_jump_fraction_for_shorts: float = 0.15
     # D6 (parity 2026-05-07): RND tail-risk size scaling has no V2
-    # backtester counterpart. Default OFF so V2 preset matches the
-    # backtest contract; opt-in for live operators who want the
-    # additional defence-in-depth (memory: project_rnd_monitor_validated
-    # — historical halt rate ~0%, but the size-scaling path can shrink
-    # positions on real tail-risk events).
+    # backtester counterpart. Default off so the historical V2 preset
+    # matches the replay contract. It remains an unvalidated research
+    # control rather than evidence of tail-risk coverage.
     use_rnd_scaling: bool = False
 
     # ── Execution ──────────────────────────────────────────────────
@@ -154,7 +147,7 @@ class PaperConfig:
     # E.1.6: when True, all 4 production IOC sites in straddle_flow.py
     # escalate through the 3-tier ladder
     # (touch+1tick → cap → bounded-IOC). Off by default to preserve the
-    # legacy ``default`` preset; flipped on by ``with_v2_preset``.
+    # default configuration; enabled by ``historical_v2_preset`` for replay.
     use_tiered_taker: bool = False
     sizing_liq_cap: float = 1.5              # max upscale in liquid markets (conservative for live)
     sizing_edge_cap: float = 3.0             # mirrors BacktestConfig: max edge multiplier
@@ -296,11 +289,9 @@ class PaperConfig:
     # (sentinel -> resolved from ``data/funding-rates/{currency}USDT_funding.parquet``).
     funding_parquet_path: str = ""
 
-    # ── Config preset metadata (set by CLI / with_v2_preset) ────────
-    # Tagged into harness trade rows so the I4 reproduction analysis
-    # can attribute drift to a specific preset. "default" preserves
-    # the legacy live behaviour; "v2" enables the production parity
-    # stack (β*, Kelly K1, realistic_taker, contango filter, …).
+    # ── Config preset metadata ─────────────────────────────────────
+    # Tagged into harness trade rows for reproduction analysis. ``v2``
+    # identifies historical replay output and is never selected by CLI.
     config_preset: str = "default"
 
     # ── V2 sidecars (predictions, Kelly, slippage) ─────────────────
@@ -373,9 +364,8 @@ class PaperConfig:
     min_trade_floor: bool = False
 
     # ── Safety ─────────────────────────────────────────────────────
-    # This MUST default to True.  The flag is checked by every execution
-    # path and by the CLI before allowing any live orders.  The only way
-    # to disable it is an explicit ``--live`` flag + passphrase confirm.
+    # This MUST default to True. The CLI forces both this field and the
+    # process-global dry-run state to True; it has no real-order option.
     dry_run: bool = True
     # E.2.3 escape hatch (set via CLI ``--allow-stale-aligner``). Defaults
     # off — the V2 staleness check refuses to start at ≥2 months stale.
@@ -474,7 +464,8 @@ class PaperConfig:
             cfg.ws_url = ws_env
         cfg.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-        # PAPER_DRY_RUN env var can set dry_run=False only if explicitly "false"
+        # Retained for programmatic configuration; the CLI always overrides
+        # this field to True before constructing an engine.
         dry_run_env = os.environ.get("PAPER_DRY_RUN", "true").lower()
         cfg.dry_run = dry_run_env != "false"
         # Cycle-33 (2026-05-13): opt-in per-bar feature trace via env var.
@@ -489,7 +480,7 @@ class PaperConfig:
 
     @classmethod
     def for_small_account(cls, equity_usd: float = 750.0) -> "PaperConfig":
-        """Create a config tuned for small live accounts ($500–$2000).
+        """Create a paper/testnet config for small accounts ($500–$2000).
 
         Enables ``min_trade_floor`` so the sizing formula returns the
         exchange minimum (0.1 BTC) when equity is too low for the
@@ -500,27 +491,23 @@ class PaperConfig:
         Does NOT hardcode ``max_single_trade_btc`` — that would lock
         the account to 0.1 BTC forever even as it scales.
 
-        Cycle-21 (2026-05-11): inherits ``kill_switch_daily_dd_pct``
-        from ``with_v2_preset()`` so future cycle bumps to the V2
-        kill-switch value can't drift the small-account path
-        independently. The cycle-18 audit found this hard-coded 5.0
-        before — same value as V2, but no link between the two.
+        The path intentionally uses the conservative default kill-switch;
+        it is independent of the invalidated historical V2 preset.
         """
         cfg = cls.from_env()
         btc_approx = 100_000.0  # overridden from REST at startup
         cfg.max_open_positions = 1
-        # Inherit V2's protective kill-switch threshold (cycle-21 fix).
-        # Builds a throwaway V2 preset purely to read the canonical
-        # kill_switch value, so any future change to V2's threshold
-        # ripples here automatically.
-        cfg.kill_switch_daily_dd_pct = cls.with_v2_preset().kill_switch_daily_dd_pct
         cfg.initial_equity = equity_usd / btc_approx
         cfg.min_trade_floor = True
         return cfg
 
     @classmethod
-    def with_v2_preset(cls, base: "PaperConfig | None" = None) -> "PaperConfig":
-        """Return a config aligned with ``BacktestConfig.with_btc_production_filters_v2()``.
+    def historical_v2_preset(cls, base: "PaperConfig | None" = None) -> "PaperConfig":
+        """Reconstruct the invalidated historical V2 configuration.
+
+        This exists only for forensic replay and parity tests. It is not a
+        production recommendation and is deliberately unavailable from the
+        CLI. Raw V2 output reports are non-canonical evidence.
 
         Invariants flipped or set:
 
@@ -528,169 +515,63 @@ class PaperConfig:
         * ``skip_long_if_term_slope_gt``: None → 0.0 (drop longs in IV contango).
         * ``skip_long_hours_utc``: () → (14, 15, 16) — D2 (2026-05-07).
         * ``dte_min_days``: 1 → 5 — D1 (2026-05-07).
-        * ``target_margin_utilization``: 0.05 → 0.15 (3x leverage closer to backtest).
+        * ``target_margin_utilization``: 0.05 → 0.10.
         * ``use_profit_scaling``: False → True (conviction-weighted sizing).
         * ``profit_scaling_floor``: stays 0.3 (matches BacktestConfig V2).
         * ``max_single_trade_btc``: 2.0 → 0.0 (= disabled per V2) — D10 (2026-05-07).
         * ``use_rnd_scaling``: stays False (V2 has no RND monitor) — D6 (2026-05-07).
-        * ``aligned_predictions_parquet`` → production aligner parquet.
+        * ``aligned_predictions_parquet`` → historical aligned predictions.
         * ``aligner_betas_json`` → derived per-month β* JSON path.
         * ``kelly_mult_path`` → V2 Kelly K1 sidecar.
         * ``bar_exec_quality_path`` → V2 realistic_taker slippage sidecar.
 
-        ``base`` (optional) lets the caller pre-populate venue / credentials
-        from ``PaperConfig.from_env()`` first; the preset only overrides
-        strategy fields and leaves env-bound fields alone.
+        ``base`` (optional) preserves environment-bound fields while replacing
+        the archived strategy fields needed for reproduction.
 
-        Single source of truth: this method's expected output is asserted
-        against ``BacktestConfig.with_btc_production_filters_v2()`` in
+        The method's expected output is asserted
+        against ``BacktestConfig.with_historical_btc_v2()`` in
         ``deribit_paper/tests/test_config_v2_parity.py``. Updating the V2
         invariants in either side without updating the cross-check test
-        will fail Phase A's regression gate.
+        will fail the historical replay parity test.
         """
         cfg = base if base is not None else cls()
         cfg.config_preset = "v2"
-        # V2 cycle-10 (2026-05-10): short threshold loosened 22 -> 20
-        # to admit more profitable shorts, paired with new skew gate.
-        # Sweep showed +$43K NC PnL (+4.3%) vs cycle-9 baseline,
-        # Sharpe -0.02 (neutral), MDD neutral, 5/5 strict per-year stable.
+
+        # These values reproduce the invalidated historical preset. Keep the
+        # assignments explicit so the parity test can compare them with the
+        # backtester factory; none of them is a current deployment choice.
         cfg.entry_threshold = 20.0
         cfg.entry_threshold_long = 12.0
         cfg.skip_long_if_term_slope_gt = 0.0
-        # V2 cycle-10 (2026-05-10): mirror-symmetric short filter to
-        # contango-long-skip. Drops shorts in extreme call-skew regime
-        # (svi_25d_skew_1w > 25, ~1% of fired shorts, almost entirely
-        # 2022 LUNA/3AC/FTX trending-down crisis era).
-        # Cycle-14 (2026-05-11, stale-defense T3): deactivated. Under the
-        # cycle-12+cycle-13 trade pool the filter is a near-no-op (60
-        # catches in 11,521 fired shorts; 0 OOS impact). 1-point sweep
-        # [-15, 40] confirmed wide stable plateau. See
-        # STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
         cfg.skip_short_if_skew_1w_gt = None
-        # D2 (parity 2026-05-07): mute longs at US cash-open hours. The V2
-        # backtest applies this in ``_apply_entry_filters``; the live
-        # predictor mirrors the same shape after the contango filter.
         cfg.skip_long_hours_utc = (14, 15, 16)
-        # D1 (parity 2026-05-07): live default of 1 lets the engine trade
-        # the 1-4 DTE band the V2 backtester deliberately skips
-        # (theta-decay-dominated, fee-vs-vega ratio is poor).
         cfg.dte_min_days = 5
-        # Cycle-16 (2026-05-11, stale-defense T4): lowered 0.15 -> 0.10.
-        # The full sweep [0.05, 0.30] revealed compound saturation: above
-        # ~0.10 the dynamic_btc_cap binds, so X just inflates NC numbers
-        # without changing real (compound) trades. NC Sharpe peaks at 0.10
-        # with 2.24pp tighter NC MDD. OOS compound identical across X >= 0.10.
-        # Also gives live max_margin_util_hard=0.20 more defense-in-depth
-        # headroom. See STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
         cfg.target_margin_utilization = 0.10
         cfg.use_profit_scaling = True
         cfg.profit_scaling_floor = 0.3
-        # D10 (parity 2026-05-07): V2 backtester has no per-trade BTC cap
-        # (``BacktestConfig.max_position_btc=0.0``). The live default 2.0
-        # was a defence-in-depth knob; under V2 we disable it (``0.0``)
-        # so dynamic_btc_cap is the only ceiling. The cap is still
-        # honoured under non-V2 presets where the field stays at 2.0.
+
+        # Historical sizing and risk parity.
         cfg.max_single_trade_btc = 0.0
-        # R-7 (parity-r3 cycle 8 — 2026-05-08): V2 backtester has no
-        # per-trade BTC min-lot floor either (the exchange's own 0.1
-        # BTC option minimum is the binding constraint at fill time).
-        # Disable the live floor symmetrically with D10's max-side
-        # disable. The V2 risk-limit's ``min_single_trade_btc <= 0``
-        # check skips the floor when this field is set to 0.0.
         cfg.min_single_trade_btc = 0.0
-        # D6 (parity 2026-05-07): no RND monitor in V2 backtester. Stays
-        # False under the V2 preset; opt-in for non-V2 live deployments
-        # via ``cfg.use_rnd_scaling = True``.
+        cfg.max_gross_notional_usd = 200_000.0
+        cfg.max_jump_fraction_for_shorts = 1.0
+        cfg.short_sizing_penalty = 1.0
+        cfg.sizing_edge_cap = 100.0
+        cfg.sizing_dd_floor = 1.0
+        cfg.kill_switch_daily_dd_pct = 5.0
+
+        # Historical artifact and execution parity.
         cfg.use_rnd_scaling = False
         cfg.aligned_predictions_parquet = (
             "vol_model/output/"
             "BTCUSDT_pruned_svi_har_pd_predictions_aligned_bias.parquet"
         )
-        cfg.aligner_betas_json = (
-            "vol_model/output/aligner_betas_by_month.json"
-        )
-        # Cycle-11 (2026-05-10): K1 + walk-forward term_slope amplifier.
-        # +$33K NC PnL (+3.2%), Sharpe -0.031 (essentially unchanged),
-        # MDD UNCHANGED, 5/5 per-year strict pass. $/Sharpe-pt $1.07M.
-        # Phase 2 report: vol_arb/output/PHASE2_LONG_SIZING.md.
+        cfg.aligner_betas_json = "vol_model/output/aligner_betas_by_month.json"
         cfg.kelly_mult_path = "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
         cfg.bar_exec_quality_path = "vol_arb/output/bar_execution_quality.parquet"
-        cfg.use_tiered_taker = True   # E.1.6: 3-tier ladder at all 4 IOC sites
-        # Cycle-10 parity audit (2026-05-10): the default $30k cap was
-        # sized for an earlier BTC spot regime. At BTC=$80k a single ATM
-        # straddle is $40-97k notional; the $30k cap blocks 100% of fired
-        # signals. Bump to $200k (~2x equity) as defence-in-depth that
-        # actually allows legitimate trades. Backtester has no equivalent
-        # cap (margin-utilization is the binding constraint). Discovered
-        # via 24h homeserver behavior audit: 4 SHORT signals fired
-        # 2026-05-09 → 0 reached the exchange because of this cap.
-        cfg.max_gross_notional_usd = 200_000.0
-        # S-8 (parity-r3 cycle 2 — 2026-05-08): the canonical V2 trade log
-        # was generated via ``BacktestConfig.with_btc_production_filters_v2().with_realistic_costs()``,
-        # and ``with_realistic_costs()`` flips ``base_spread_iv 1.5 → 2.0``
-        # (vol_arb/backtester.py:464). Pre-fix the live ``with_v2_preset``
-        # missed this — bare ``PaperConfig.with_v2_preset()`` left
-        # ``base_spread_iv = 1.5`` (the default), producing a tighter
-        # half-spread than V2 canon. Live now matches the canonical V2
-        # trade-log generator. The 0.5-vol-pt difference flows through
-        # ``Predictor._dynamic_half_spread`` (predictor.py:233) to entry
-        # threshold gating.
+        cfg.use_tiered_taker = True
         cfg.base_spread_iv = 2.0
-        # Cycle-12 (2026-05-11): disable the legacy jump-fraction circuit
-        # breaker (was 0.15 inherited from pre-DRL-hedger era). The SAC v4
-        # DRL hedger now handles high-jump regimes adaptively via its
-        # VPIN/jump_fraction/trailing_volume conditioning. Walk-forward
-        # 2026-05-11: TRAIN +$219K, OOS +$130K NC PnL, OOS daily Sharpe
-        # +1.65, OOS MDD essentially flat. 5/5 pre-committed gates pass.
-        # The filter was killing 868 OOS shorts averaging $150/trade.
-        # See JUMP_FILTER_WALKFORWARD_2026_05_11.md.
-        cfg.max_jump_fraction_for_shorts = 1.0
-        # Cycle-13 (2026-05-11): deactivate the legacy short-sizing
-        # penalty (was 0.5, "halve N for short straddles (tail risk)").
-        # Same architectural story as cycle-12: the SAC v4 DRL hedger
-        # handles short-side gamma adaptively; the blanket 0.5x N cut
-        # was double-discounting on top of the hedger's own response.
-        # Walk-forward 2026-05-11: TRAIN dPnL +$559K, OOS dPnL +$269K
-        # (+56%), OOS daily Sharpe +0.61 (8.60 -> 9.21). OOS MDD widens
-        # $-3,984 -> $-6,149 (+54%) but per-year strict 5/5 still passes
-        # ($181K worst year). 1.0 = no penalty (shorts size symmetric
-        # with longs at the base sizing layer).
-        cfg.short_sizing_penalty = 1.0
-        # Cycle-15 (2026-05-11, stale-defense S2): deactivate the
-        # exponential half-spread widening on jumps. Same architectural
-        # story as cycle-12/13/14 — the punitive widening was for the
-        # pre-DRL-hedger era; SAC v4 handles jumps adaptively. Full
-        # 0.25-step sweep [0, 5] monotonic improvement to k=0. Walk-
-        # forward k=3 vs k=0: OOS dPnL +$64K, Sharpe +0.41 IMPROVES,
-        # MDD essentially unchanged. 5/5 gates pass. At k=0 the
-        # exp(0 * jump_fraction) = 1 collapse means the jump-fraction
-        # term drops out of half_spread entirely. See
-        # STALE_DEFENSE_CAMPAIGN_2026_05_11.md.
         cfg.spread_jump_k = 0.0
-        # Cycle-17 (2026-05-11, stale-defense L6): deactivate the two
-        # composite_v2 caps that don't do measurable work, keep liq_cap.
-        # sizing_edge_cap: NC-flat across [1, 100], compound saturates ~5;
-        # raised to 100 for marginal +$120K OOS Cp PnL and one fewer
-        # effective parameter. sizing_dd_floor: dd_scale never binds under
-        # current compound profile — set to 1.0 to collapse the rule entirely.
-        # sizing_liq_cap KEPT at 1.5 — only cap doing real signal-quality
-        # work (removing it drops NC Sharpe 0.30).
-        cfg.sizing_edge_cap = 100.0
-        cfg.sizing_dd_floor = 1.0
-        # Cycle-18 (2026-05-11, stale-defense LE3): raise from 2.0% to 5.0%.
-        # Halt-simulation sweep against final cycle-17 trade log revealed
-        # the current 2.0% threshold is STRICTLY DOMINATED by OFF: it
-        # triggers in a regime (1.5-4%) where halts skip post-trigger
-        # recovery trades, deepening realized drawdowns. At 2.0%: 8
-        # historical halts, full-sample Cp MDD -6.87% (vs -6.08% at OFF,
-        # 0.79pp WORSE). At 5.0%: 1 historical halt (Nov 2024 -5.50%
-        # grind event), Cp MDD -5.98% (tighter than 2.0%). The
-        # threshold change covers the worst observed daily move (-5.50%)
-        # while avoiding the recovery-skip pathology. OOS impact: zero
-        # at any threshold (no OOS day exceeds -1% daily DD). Other
-        # kill switches still active (margin_util_hard, consecutive_errors,
-        # network_outage). See STALE_DEFENSE_CAMPAIGN_2026_05_11.md LE3.
-        cfg.kill_switch_daily_dd_pct = 5.0
         return cfg
 
     def ensure_dirs(self) -> None:
@@ -699,16 +580,14 @@ class PaperConfig:
             Path(path).mkdir(parents=True, exist_ok=True)
 
     def validate_preset_invariants(self) -> list[str]:
-        """S-7 (parity-r3 cycle 8 — 2026-05-08): defence-in-depth
-        check that V2-preset config fields match the canonical V2
-        invariants.
+        """Check the historical V2 replay marker against its archived fields.
 
-        Pre-fix the V2 preset method ``with_v2_preset()`` was the
+        The historical preset method ``historical_v2_preset()`` is the
         single source of truth, but a CLI / user constructing a
         ``PaperConfig`` and manually setting ``config_preset="v2"``
         without flipping the threshold knobs would silently run
         with V1 thresholds. ``test_config_v2_parity.py`` locks the
-        expected output of ``with_v2_preset()``, but doesn't catch
+        expected output of ``historical_v2_preset()``, but doesn't catch
         downstream mutation.
 
         Returns a list of human-readable mismatch strings (empty
@@ -745,7 +624,7 @@ class PaperConfig:
             actual = getattr(self, name, None)
             if actual != expected:
                 mismatches.append(
-                    f"{name}: expected {expected!r} (V2 canon) "
+                    f"{name}: expected {expected!r} (historical V2 replay) "
                     f"but got {actual!r}"
                 )
         return mismatches
@@ -753,11 +632,9 @@ class PaperConfig:
     def switch_to_prod(self, *, paper_mode: bool = False) -> None:
         """Flip the venue URLs to production Deribit.
 
-        This should ONLY be called after Phase 7 validation passes and
-        the user has explicitly confirmed via CLI passphrase.  The
-        default venue is testnet and stays testnet unless this is
-        invoked.  ``DERIBIT_PROD_CLIENT_ID`` / ``_SECRET`` must be set
-        separately — we refuse to reuse testnet credentials on prod.
+        The CLI calls this only with ``paper_mode=True`` to consume public
+        mainnet quotes without orders. The authenticated branch remains an
+        internal execution primitive and is not exposed by the CLI.
 
         When ``paper_mode=True``, mainnet URLs are still set but
         credentials are NOT required: the engine connects to public

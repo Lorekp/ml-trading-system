@@ -1,11 +1,10 @@
-"""Monthly sidecar refresh job for the live engine.
-
-I6 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
+"""Monthly sidecar refresh utility for replay infrastructure.
 
 Recomputes the two walk-forward sidecars (aligner β* per-month, Kelly K1
 per-bar) using the live engine's own trade-log history once enough data
-has accumulated. Until then, the bundled mainnet-derived sidecars are
-the bootstrap default — the script verifies them in place and exits.
+has accumulated. Until then, the bundled historical sidecars are the bootstrap
+reference — the script verifies them in place and exits. This does not validate
+the underlying strategy.
 
 Inputs:
   ``vol_arb/output/live_trades_harness.parquet`` (produced by C6).
@@ -28,7 +27,7 @@ sidecar with a noisy one).
 
 Usage::
 
-    cd C:/Claude/ml-trading-system
+    # from the repository root
     PYTHONPATH=. python scripts/refresh_live_sidecars.py
     # Optional flags:
     PYTHONPATH=. python scripts/refresh_live_sidecars.py --dry-run

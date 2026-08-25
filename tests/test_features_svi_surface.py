@@ -9,7 +9,7 @@ Hard gates pinned here:
 4. Delta features PASS ``probe_current_bar_dependence`` on ``raw[T-lag]``
    (i.e., the 4-bar-lagged row is legitimately used).
 5. First ``delta_lag_bars`` rows have NaN deltas (warmup).
-6. Coverage on real sidecar data is ≥ 90% for every feature.
+6. Coverage on real sidecar data is ≥ 88% for every feature.
 """
 from __future__ import annotations
 
@@ -153,6 +153,7 @@ def test_current_bar_dependence_sanity() -> None:
 # ── 5. Real-data smoke: coverage ≥ 90% ───────────────────────────────
 
 
+@pytest.mark.integration
 def test_coverage_on_real_sidecar() -> None:
     """If the real BTC sidecar is available, confirm every feature has
     ≥ 88% non-NaN coverage. Levels match the raw sidecar (95.3% / 91.9%
@@ -171,6 +172,7 @@ def test_coverage_on_real_sidecar() -> None:
     assert low_cov.empty, f"low-coverage features: {low_cov.to_dict()}"
 
 
+@pytest.mark.integration
 def test_causality_by_mutation_real_sidecar() -> None:
     """End-to-end real-data probe: mutate all rows > T in the real sidecar,
     feature at T must be byte-identical."""

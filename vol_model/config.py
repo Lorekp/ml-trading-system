@@ -4,9 +4,9 @@ from pydantic import BaseModel, Field, model_validator
 
 
 # Per-asset microstructure calibration. Populated empirically via
-# ``TSRV/run_signature_plot.py --asset {ASSET}`` — see PIPELINE_DOCUMENTATION
-# line 150 ("calibrated via signature plot — knee detection on RV vs
-# threshold curve") and the knee result printed by that script.
+# ``TSRV/run_signature_plot.py --asset {ASSET}``. The calibration is the knee
+# detected on the script's RV-versus-threshold curve; retain that result with
+# any generated calibration artifact rather than relying on a deleted report.
 #
 # Fields:
 #   - tick_size: Binance USD-M perp tick in USD (from exchange spec).
@@ -21,11 +21,10 @@ _PER_ASSET_CALIBRATION: dict[str, dict[str, float]] = {
         "tick_size": 0.10,
         "dollar_bar_threshold": 500_000,  # Stage 0 knee calibration
         "vpin_bucket_size": 1_000_000,
-        # BTC TSRV parquet migrated START-stamped → END-stamped on 2026-04-11
-        # (see .pre_end_stamp_bak backup). load_labels() compensates by
+        # BTC TSRV parquet migrated START-stamped → END-stamped on 2026-04-11.
+        # load_labels() compensates by
         # shifting the index by -freq so Stage 18 forecast semantics
-        # (y[T] = log(vol of [T, T+freq))) are preserved. Audit artifact:
-        # vol_model/output/LABEL_SHIFT_AUDIT.md.
+        # (y[T] = log(vol of [T, T+freq))) are preserved.
         "tsrv_end_stamped": True,
     },
     # ETHUSDT calibrated via `TSRV/run_signature_plot.py --asset ETHUSDT`
@@ -193,9 +192,8 @@ class VolModelConfig(BaseModel):
     # 30m, 60m via per-horizon presets). Every horizon-dependent constant
     # downstream — feature lookback windows, backtester holding_minutes,
     # sidecar paths — derives from these helpers, NOT from a hardcoded "15"
-    # somewhere. See plan: starry-rolling-rabin.md and
-    # tests/test_horizon_parametrization.py for the byte-identity guarantee
-    # at h=15.
+    # somewhere. ``tests/test_horizon_parametrization.py`` locks the
+    # historical h=15 behavior.
     #
     # Why properties (not fields)? `freq_s` already encodes the horizon in
     # seconds; adding a parallel `horizon_minutes` field would create the

@@ -29,7 +29,8 @@ scale for day D is a function of closed P&L through day D-1 only.
 A unit test (``tests/test_pnl_throttle.py``) mutates test-day P&L
 and asserts the schedule is byte-identical.
 
-See: ``vol_arb/output/V2_DRAWDOWN_ROOT_CAUSE.md``.
+This is a historical V2 control; it does not rehabilitate the invalidated
+strategy result.
 """
 
 from __future__ import annotations

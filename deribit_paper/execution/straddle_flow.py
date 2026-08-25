@@ -646,7 +646,7 @@ class StraddleFlow:
         #
         # Cycle-22 (2026-05-11): the previous fallback ``0.5`` was a
         # 10σ outlier vs SAC v4's training-time VPIN distribution
-        # (mean ≈ 0.189, std ≈ 0.032 on the production parquet). Using
+        # (mean ≈ 0.189, std ≈ 0.032 on the historical training parquet). Using
         # 0.5 forces the policy into a regime it was never trained on.
         # The 7-agent audit (A6 H7) flagged this as a silent corruption
         # of every hedge action when the provider misbehaves.

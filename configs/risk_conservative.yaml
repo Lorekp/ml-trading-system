@@ -1,13 +1,13 @@
 # Conservative Risk Profile Override
 # ====================================
-# Ultra-safe settings for initial live testing:
+# Conservative settings for paper/testnet research:
 # - 3 positions max
 # - 40% max exposure
 # - 3% daily drawdown halt
 # - 1% base sizing
 # - Higher confidence threshold
 #
-# Use alongside live_mexc.yaml or live_paper.yaml.
+# Use alongside live_paper.yaml.
 
 risk:
   max_positions: 3

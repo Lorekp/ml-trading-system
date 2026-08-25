@@ -10,10 +10,8 @@ Outputs:
     — ``{"YYYY-MM": float}`` mapping. The live predictor consumes this via
     ``vol_arb.sidecars.load_aligner_betas`` + ``lookup_beta_for_month``.
 
-C2 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Usage:
-    cd C:/Claude/ml-trading-system
+    # from the repository root
     PYTHONPATH=. python scripts/extract_aligner_betas.py
 """
 from __future__ import annotations

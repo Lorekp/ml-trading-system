@@ -32,7 +32,7 @@ def test_ioc_max_slippage_pct_default_is_zero_disabled():
 
 def test_ioc_max_slippage_pct_v2_preset_is_one_percent():
     """`with_realistic_costs()` is the V2 trade-log generator path
-    (`with_btc_production_filters_v2().with_realistic_costs()`); it
+    (`with_historical_btc_v2().with_realistic_costs()`); it
     must enable the 1% cap to match the live ``place_ioc_taker``
     default `max_slippage_pct=1.0`."""
     cfg = BacktestConfig().with_realistic_costs()
@@ -40,10 +40,10 @@ def test_ioc_max_slippage_pct_v2_preset_is_one_percent():
 
 
 def test_ioc_max_slippage_pct_legacy_preset_unchanged():
-    """Bare V2 (``with_btc_production_filters_v2`` alone) does NOT flip
+    """Bare V2 (``with_historical_btc_v2`` alone) does NOT flip
     the cap — only the realistic-costs leg does. Documents that callers
     of the bare preset see legacy behaviour."""
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.ioc_max_slippage_pct == pytest.approx(0.0)
 
 
@@ -107,7 +107,7 @@ def test_cancel_replace_bar_gap_default_off():
 
 def test_cancel_replace_bar_gap_v2_preset_off_by_design():
     """V2 preset uses ``use_sor=False`` (in
-    ``with_btc_production_filters_v2``) so the maker path never fires
+    ``with_historical_btc_v2``) so the maker path never fires
     and the bar-gap branch is N/A. The flag stays default-off in V2."""
     cfg = BacktestConfig().with_realistic_costs()
     assert cfg.cancel_replace_bar_gap is False

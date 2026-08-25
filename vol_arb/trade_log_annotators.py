@@ -1,6 +1,6 @@
 """Post-hoc annotators for V2 trade log — Tier B of tail-risk plan.
 
-Each annotator reads a sibling parquet (sidecar) of the canonical V2
+Each annotator reads a sibling parquet (sidecar) of the historical V2
 trade log and emits ONE additional column. Output goes to
 ``vol_arb/output/BTC_v2_trade_log_annotated.parquet`` — never touches
 the canonical trade log, so V2 byte-identity is preserved.
@@ -30,7 +30,7 @@ Annotators (frozen list, pre-committed in plan):
 
 Usage::
 
-    PYTHONPATH=. python -m vol_arb.run_backtest --btc-production-v2 \\
+    PYTHONPATH=. python -m vol_arb.run_backtest --historical-btc-v2 \\
         --realistic --annotate
 """
 from __future__ import annotations

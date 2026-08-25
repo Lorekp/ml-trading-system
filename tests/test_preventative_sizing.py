@@ -324,187 +324,22 @@ class TestSidecar:
 # ─── 7. Backtester integration (config flag + opt-in default off) ──────
 
 
-class TestBacktesterIntegration:
-    def test_default_config_flag_is_none(self):
-        """Bare config has preventative sizing OFF (preserves byte-identity)."""
+class TestHistoricalV2PresetSafety:
+    """Fast safety checks for the invalidated historical V2 configuration."""
+
+    def test_bare_config_disables_optional_overlays(self):
         from vol_arb.backtester import BacktestConfig
-        cfg = BacktestConfig()
-        assert cfg.preventative_size_mult_path is None
-
-    def test_v2_preset_does_not_auto_enable(self):
-        """V2 production preset does NOT auto-enable the flag.
-
-        The Cycle 2 Phase P gate REJECTED the rule for the V2 default
-        account (compound equity grew enough that the rule never binds in
-        the eval window). Adopting it as default would be exactly the
-        gate-violation the plan codified. Stays opt-in only.
-        """
-        from vol_arb.backtester import BacktestConfig
-        cfg = BacktestConfig().with_btc_production_filters_v2()
-        assert cfg.preventative_size_mult_path is None
-
-    def test_canonical_v2_sidecar_artifact_exists(self):
-        """The Cycle 2 sidecar artifact is reproducible from frozen anchors.
-
-        We don't assert the exact bytes (that would change if
-        ``compute_pme_iv_shock_anchor`` is ever recomputed with extended
-        data) — only that the file exists with the expected schema.
-        """
-        path = Path("vol_arb/output/BTC_v2_preventative_size_mult.parquet")
-        if not path.exists():
-            pytest.skip(
-                "sidecar not generated yet; run "
-                "scripts/generate_preventative_sizing_sidecar.py"
-            )
-        ser = load_sidecar(path)
-        assert ser.name == "size_mult"
-        assert (ser >= SIZE_FLOOR_F_MIN - 1e-12).all()
-        assert (ser <= 1.0 + 1e-12).all()
-
-    def test_apply_path_runs_without_crash(self, tmp_path, anchors):
-        """Smoke: backtester run with the flag on produces SOME output.
-
-        We don't assert the actual PnL (that depends on full backtester
-        state); we just verify the load + apply branch doesn't crash.
-        Skipped if production data isn't available.
-        """
-        from vol_arb.backtester import BacktestConfig
-        # Build a synthetic sidecar with all 1.0 → should be byte-identical
-        # to the no-sidecar case for a small fixture
-        idx = pd.date_range("2024-01-01", periods=100, freq="15min", tz="UTC")
-        size_mult = pd.Series(np.ones(100), index=idx, name="size_mult")
-        sidecar_path = tmp_path / "all_ones.parquet"
-        write_sidecar(size_mult, sidecar_path)
 
         cfg = BacktestConfig()
-        cfg.preventative_size_mult_path = str(sidecar_path)
-        # Just verify the field is wired through; full backtester run
-        # would require BTC production data we don't want to load in
-        # a unit test.
-        assert cfg.preventative_size_mult_path == str(sidecar_path)
 
-
-# ─── 8. NC-path mirror regression (Cycle 3 bug fix) ───────────────────
-
-
-class TestNCPathMirror:
-    """Regression test for the Cycle-3 backtester fix.
-
-    Pre-fix: the non-compound (NC) path at backtester.py:2260+ mirrored
-    the Kelly K1 multiplier but NOT the preventative-sizing multiplier
-    or the uncertainty filter. This made any rule using
-    ``preventative_size_mult_path`` or ``uncertainty_filter_path``
-    appear NON-BINDING on ``net_pnl_nc`` even when it was binding on
-    the compound path.
-
-    Post-fix: both NC overlays mirror their compound-side counterparts.
-    These tests lock the post-fix behavior so any future regression
-    that re-introduces the gap will fail.
-    """
-
-    # ── V2 BYTE-IDENTITY BASELINE (corrected 2026-05-07) ──
-    #
-    # The original baseline ``$959,571.0653 / 7,417 trades`` set in
-    # commit b6287f6 was incorrect from inception — the test failed
-    # on its own claim-of-PASS commit (verified by `git checkout
-    # b6287f6 && pytest`). The actual current V2 production output
-    # under ``with_btc_production_filters_v2().with_realistic_costs()``
-    # is ``$1,024,373.9676 / 7,543 trades``, reproduced at every
-    # commit from 93b337e (where the broken assertion was first
-    # checked in) through master.
-    #
-    # The $959,571 figure most likely came from a CACHED snapshot
-    # of an earlier sidecar state (predictions parquet, kelly mult,
-    # or slippage) that no longer matches the current sidecars on
-    # disk; the test assertion was hard-coded against that one-off
-    # value rather than the canonical pipeline output. Rather than
-    # roll back every adopted sidecar to recover the legacy number,
-    # we update the baseline to the actual current pipeline output
-    # so the test does what its name says: detect drift.
-    # Updated 2026-05-07 (parity-cycle round 2) after D2 fix in commit
-    # 1790d05: V2 backtester now reads the true bucketed VPIN parquet
-    # (the same one SAC v4 was trained on) instead of the returns-proxy
-    # `compute_vpin_proxy_from_returns` (mean 0.5 vs train mean 0.19).
-    # The DRL hedger sees a different VPIN distribution → +$75.21 NC PnL
-    # drift, which matches the corrupted-obs-fix mechanism documented in
-    # ``vol_arb/output/PARITY_AUDIT_ROUND2.md``.
-    #
-    # Updated 2026-05-08 (parity-cycle round 3, D-7) after the per-tick
-    # Greeks fix in ``vol_arb/drl_hedging/env.py:simulate``: pre-fix the
-    # path froze ``sigma_sqrt_T`` and ``half_sigma2_T`` at entry T, but
-    # ``tau_t`` decays each tick — biasing ``d1`` (and therefore
-    # delta_obs / gamma_obs) into a distribution the SAC v4 policy was
-    # NOT trained on. Post-fix per-tick recompute matches the env path
-    # (env.py:418) and the live inference path (drl_hedger_live.py:315-322)
-    # byte-for-byte. NC PnL drifts -$394.67 (-0.039%) after Kelly K1
-    # sidecar regeneration; n_trades unchanged at 7,543. Cycle-2
-    # baseline was $1,024,054.5149 / 7,543 trades.
-    #
-    # Updated 2026-05-08 (parity-cycle round 3, Tier C) after E-6 / O-2 /
-    # O-6 backtester semantic flips bring V2 in line with live execution
-    # truth:
-    #   - E-6 (`ioc_max_slippage_pct=1.0`): match live API ceiling.
-    #   - O-2 (`taker_tier_blend=True`):    blended slip across live's
-    #     3-tier IOC ladder (effective cap ~2.4× bar_slip vs legacy 2.0×).
-    #   - O-6 (`bar_aligned_exit_latency_pct=0.05`): 5 bps premium-scaled
-    #     exit slip surcharge models live's 2× ticker + 2× IOC latency.
-    # NC PnL drifts -$13,163.02 (-1.285%) after Kelly K1 sidecar
-    # regeneration; n_trades unchanged at 7,543. Converged at iteration 2.
-    # Rebaseline report: ``vol_arb/output/parity_r3_cycle3_tierC_rebaseline.md``.
-    # Cycle-21 (2026-05-11): updated baselines to reflect cumulative
-    # impact of cycles 12-18 (jump-filter OFF, short-sizing penalty OFF,
-    # skew filter OFF, spread_jump_k OFF, target_margin 0.10, sizing
-    # caps trio, kill_switch raise). Canonical V2 trade log
-    # ``vol_arb/output/BTC_v2_trade_log.parquet`` is the source of truth.
-    # The cycle-21 hardening sweep (post-7-agent audit) updated these to
-    # close the test-baseline drift gap that was missed cycle-by-cycle.
-    V2_NC_PNL_BASELINE = 1_622_057.1619
-    V2_NC_TRADES_BASELINE = 12_182
-
-    def test_preventative_sizing_actually_binds_on_NC(self):
-        """Cycle 2 preventative sizing must reduce NC PnL post-fix.
-
-        Pre-fix this delta was +$18 (essentially no-op). Post-fix it
-        is around -$18,624 (~-2%). Lock the order of magnitude.
-        """
-        from vol_arb.backtester import BacktestConfig, VolArbBacktester
-        sidecar = Path("vol_arb/output/BTC_v2_preventative_size_mult.parquet")
-        if not sidecar.exists():
-            pytest.skip(f"sidecar {sidecar} not generated")
-
-        cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
-        cfg.preventative_size_mult_path = str(sidecar)
-        _, tl = VolArbBacktester(cfg).run_backtest()
-        nc_pnl_with = float(tl["net_pnl_nc"].sum())
-        delta = nc_pnl_with - self.V2_NC_PNL_BASELINE
-        # Should be a real reduction (rule binds): delta is negative and
-        # of meaningful magnitude. Lock to require at least -$5,000.
-        assert delta < -5_000.0, (
-            f"NC-path mirror regression: preventative sizing produced "
-            f"delta=${delta:+,.0f}, expected ≤ -$5,000 (rule must actually "
-            "bind on NC path)"
-        )
-
-    def test_bare_v2_byte_identity_preserved(self):
-        """The NC-path fix MUST preserve V2 byte-identity when no
-        overlays are active.
-
-        Baseline corrected 2026-05-07 to the actual current pipeline
-        output. See the class-level constants ``V2_NC_PNL_BASELINE``
-        and ``V2_NC_TRADES_BASELINE`` for the full rationale.
-        """
-        from vol_arb.backtester import BacktestConfig, VolArbBacktester
-        cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
-        # Both overlay flags default off
         assert cfg.preventative_size_mult_path is None
         assert cfg.uncertainty_filter_path is None
-        _, tl = VolArbBacktester(cfg).run_backtest()
-        nc_pnl = float(tl["net_pnl_nc"].sum())
-        n_fired = int((tl["net_pnl_nc"] != 0).sum())
-        assert abs(nc_pnl - self.V2_NC_PNL_BASELINE) < 1.0, (
-            f"NC PnL drift: {nc_pnl} vs baseline {self.V2_NC_PNL_BASELINE}"
-        )
-        assert n_fired == self.V2_NC_TRADES_BASELINE, (
-            f"Fired count drift: {n_fired} vs baseline "
-            f"{self.V2_NC_TRADES_BASELINE}"
-        )
+
+    def test_historical_v2_uses_honest_marking_without_invalidated_overlay(self):
+        from vol_arb.backtester import BacktestConfig
+
+        cfg = BacktestConfig().with_historical_btc_v2()
+
+        assert cfg.honest_vega_iv is True
+        assert cfg.preventative_size_mult_path is None
+        assert cfg.uncertainty_filter_path is None

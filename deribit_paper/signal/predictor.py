@@ -133,13 +133,13 @@ class Predictor:
         )
         self._aligner_betas: dict[str, float] = dict(aligner_betas or {})
         self._log_every_bar = log_every_bar
-        # E.1.14 (2026-05-01): under V2 preset, an empty aligner_betas
+        # Under the historical V2 replay marker, an empty aligner_betas
         # dict signals a configuration failure (sidecar JSON missing or
         # malformed), NOT a deliberate "β* disabled" choice. Fail fast
         # at startup rather than silently bypass β* every bar.
         if require_aligner and not self._aligner_betas:
             raise RuntimeError(
-                "Predictor: ``require_aligner=True`` (V2 preset) but no "
+                "Predictor: require_aligner=True (historical V2 replay) but no "
                 "β* sidecar loaded. Confirm aligner_betas_json exists, "
                 "is valid JSON, and contains numeric per-month betas."
             )

@@ -71,6 +71,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 import numpy as np
+# NumPy 2.0 renamed ``np.trapz`` -> ``np.trapezoid``; alias so both names work.
+_trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
 from scipy.optimize import differential_evolution, least_squares, minimize
 from scipy.special import erf as _erf
 from scipy.special import gamma as _gamma
@@ -624,8 +626,8 @@ def carr_madan_call_prices(
     phase = np.exp(-1j * log_strikes_arr[:, None] * v_grid[None, :])
     num_1 = (phase * psi_1[None, :]).imag / v_grid[None, :]  # Re[.../iv] = Im[...]/v
     num_2 = (phase * psi_2[None, :]).imag / v_grid[None, :]
-    int_1 = np.trapz(num_1, dx=dv, axis=-1)
-    int_2 = np.trapz(num_2, dx=dv, axis=-1)
+    int_1 = _trapz(num_1, dx=dv, axis=-1)
+    int_2 = _trapz(num_2, dx=dv, axis=-1)
     Pi_1 = 0.5 + int_1 / math.pi
     Pi_2 = 0.5 + int_2 / math.pi
 

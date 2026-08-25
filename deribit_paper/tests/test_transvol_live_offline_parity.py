@@ -21,8 +21,7 @@ what we can replay without the full historical dollar-bar buffer.
   time_to_funding lag/EMA variants. Live computes on the 15-min TSRV
   cadence; offline ffills onto the dollar-bar grid first then rolls
   there before aggregating to 15-min via ``groupby(window_labels)
-  .last()``. C1 of ``vol_arb/output/PARITY_AUDIT_ROUND2.md`` ships
-  this as a documented design deviation — strict byte-equality would
+  .last()``. This is a documented design deviation — strict byte-equality would
   require a 1750-bar dollar-bar buffer extension (~200 LOC, deferred
   to S-1d). Mathematically equivalent under constant-rate trading,
   deviates on bursty days. The gate REPORTS the diff to the test log

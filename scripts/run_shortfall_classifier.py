@@ -1,8 +1,9 @@
 """Train BASELINE / TREATMENT / PLACEBO shortfall classifiers walk-forward.
 
-Cycle 4 Phase A.1 driver (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 4 Phase A.1 driver.
 
-Loads the V2 trade log + production-aligner predictions + the walk-forward
+Loads the invalidated historical V2 trade log, its historical aligner
+predictions, and the walk-forward
 σ²_epi parquet (Phase A.0 output), trains three LightGBM classifiers
 (identical hyperparameters; only the feature set differs), and saves
 the pooled-OOS predictions to a frozen parquet for Phase B gate
@@ -80,7 +81,7 @@ def main() -> int:
                         default=SHORTFALL_THRESHOLD_USD,
                         help=f"Shortfall threshold in USD (default {SHORTFALL_THRESHOLD_USD})")
     parser.add_argument("--horizon-minutes", type=int, default=15,
-                        help="Bar horizon in minutes (default 15 for V2 production)")
+                        help="Bar horizon in minutes (default 15 for the invalidated historical V2 reference)")
     args = parser.parse_args()
 
     if args.out.exists() and not args.force:

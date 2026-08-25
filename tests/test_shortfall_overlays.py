@@ -1,17 +1,13 @@
-"""Tests for Cycle 4 Phase C — shortfall filter sidecars.
+"""Unit tests for shortfall-filter sidecars.
 
-Critical invariants (locked by plan ``now-check-empirically-from-eager-bird.md``):
+The tests cover these mechanism-level invariants:
 
 1. **Calibration-window quantile freeze** — mutating post-cal-window
    ``p_treatment`` values must NOT change ``q_T1 / q_T2 / q_T3``.
 2. **Filter drops top-X%** — sanity that the cut drops approximately
    the right magnitude.
-3. **V2 byte-identity preserved** — bare V2 preset with default config
-   reproduces $1,024,449.18 / 7,543 trades (baseline updated again
-   2026-05-07 post-D2 true-VPIN fix in commit 1790d05; see
-   ``test_preventative_sizing.py::TestNCPathMirror`` class docstring
-   for the corrected-baseline rationale). Locks regression: Phase C
-   sidecars must NOT modify the default config.
+3. **Explicit opt-in** — the historical V2 replay does not load a Phase C
+   sidecar unless a caller supplies one.
 4. **Sidecar contract matches Cycle 3** — boolean filter parquet with
    column ``drop_trade``; loadable via Cycle-3 ``load_filter_sidecar``.
 5. **DSR multiplier is locked** — K=3 → ≈ 0.5466 (Bailey-de Prado);
@@ -226,14 +222,14 @@ class TestLockedGateConstants:
         assert _gate_mod.OOS_VALIDATION_DAYS == cycle3_oos
 
 
-# ─── 5. V2 byte-identity ────────────────────────────────────────────────
+# ─── 5. Historical V2 opt-in ───────────────────────────────────────────
 
 
-class TestV2ByteIdentity:
+class TestHistoricalV2OptIn:
     def test_default_config_uncertainty_filter_path_is_none(self):
         """Bare V2 preset MUST NOT auto-load Phase C sidecars."""
         from vol_arb.backtester import BacktestConfig
-        cfg = BacktestConfig().with_btc_production_filters_v2().with_realistic_costs()
+        cfg = BacktestConfig().with_historical_btc_v2().with_realistic_costs()
         assert cfg.uncertainty_filter_path is None
 
     def test_phase_c_sidecar_only_loaded_via_explicit_opt_in(self):

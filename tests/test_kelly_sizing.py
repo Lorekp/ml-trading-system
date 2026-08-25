@@ -1,18 +1,17 @@
 """Regression + leakage-safety tests for Kelly-shrinkage sizing boost.
 
-See plan: C:/Users/laure/.claude/plans/starry-rolling-rabin.md (Phase 2).
-
 Four pre-committed test obligations:
 
 1. ``test_null_mode_byte_identical``: ``kelly_mult_path=None`` MUST
-   produce a trade log byte-identical to the V2 baseline (PnL diff = 0.0).
+   produce a trade log byte-identical to the invalidated historical V2
+   reference (PnL diff = 0.0). This is a regression property, not validation.
 2. ``test_monotonic_on_edge``: synthetic trade stream with monotonic
    |edge| -> Kelly multiplier monotonic non-decreasing.
 3. ``test_no_lookahead_mutation_probe``: mutate Q5 LONG PnL at month M
    -> assert sigma2 trailing window and median trailing window both
    unchanged (offline functions only depend on past data).
 4. ``test_upside_only``: all multipliers >= 1.0 under every variant
-   on the actual production sidecars (loaded from disk).
+   on the historical sidecars (loaded from disk).
 """
 from __future__ import annotations
 
@@ -40,24 +39,26 @@ spec.loader.exec_module(_phase1)
 
 
 def test_bare_default_is_none():
-    """Plain ``BacktestConfig()`` keeps Kelly OFF — sidecar is V2-
-    specific and would be wrong on other configs. The V2 preset opts
+    """Plain ``BacktestConfig()`` keeps Kelly OFF — the sidecar belongs to
+    the invalidated historical V2 preset and would be wrong on other configs.
+    That historical preset opts
     in (locked separately by
-    ``test_backtester_config.py::test_production_v2_kelly_default_is_K1``).
+    ``test_backtester_config.py::test_historical_v2_kelly_default_is_K1_slope``).
     """
     cfg = BacktestConfig()
     assert cfg.kelly_mult_path is None
 
 
 def test_v2_preset_loads_k1_sidecar_path():
-    """V2 preset must point at the production K1 sidecar.
+    """Historical V2 preset must point at its K1 regression sidecar.
 
     Cycle-11 (2026-05-10): K1 extended with walk-forward term_slope
     amplifier. Path swapped from `BTC_v2_kelly_mult_K1.parquet` to
     `BTC_v2_kelly_mult_K1_slope.parquet`. See Phase 2 long sizing
-    report and memory project_phase2_long_sizing_2026_05_10.md.
+    report. This path lock preserves reproducibility; it does not validate the
+    preset or its PnL.
     """
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert cfg.kelly_mult_path == (
         "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
     )
@@ -223,7 +224,7 @@ def test_backtester_loads_kelly_sidecar(tmp_path):
     out = tmp_path / "test_kelly.parquet"
     df.to_parquet(out)
 
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     cfg = BacktestConfig(**{**cfg.__dict__, "kelly_mult_path": str(out)})
     assert cfg.kelly_mult_path == str(out)
     # Just verify it round-trips through the parquet reader

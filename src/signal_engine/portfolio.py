@@ -247,8 +247,23 @@ def compute_daily_pnl_series(sim: dict[str, Any]) -> pd.Series | None:
     ts_series = pd.Series(pnls, index=pd.to_datetime(timestamps))
     daily = ts_series.resample("1D").sum()
 
-    # Filter to only days with activity
-    t0 = pd.Timestamp(timestamps[0])
-    daily = daily[daily.index >= t0]
+    # NEW (B-015): include the data-origin days before the first active trade.
+    # The previous filter 'daily.index >= timestamps[0]' dropped all zero-PnL
+    # days from origin to first trade, inflating Sharpe by removing 6-12
+    # months of 0%/0% days for sparse early activity. We now reindex to start
+    # at the earliest signal timestamp so zero-PnL days are visible.
+    #
+    # FIX 2026-06-25: anchor at midnight, not at the signal timestamp's
+    # time-of-day. daily.index from resample("1D").sum() is at midnight; the
+    # original B-015 used t0 directly which carried the time-of-day (e.g.
+    # 12:30), so reindex found no matching index values and the entire PnL
+    # series was filled with 0.0. That zeroed the per-day equity curve, but
+    # the slippage-charge loop still ran (subtracting small negatives),
+    # producing Sharpe = small_neg / small_std * sqrt(365.25) ~ -10.
+    # t0.normalize() aligns the reindex start with daily.index's midnight
+    # convention, restoring correct matching.
+    t0 = pd.Timestamp(timestamps[0]).normalize()
+    full_range = pd.date_range(t0, daily.index.max(), freq="1D")
+    daily = daily.reindex(full_range, fill_value=0.0)
     # Include all days (including zero-PnL) for correct Sharpe annualization
     return daily if len(daily) >= 5 else None

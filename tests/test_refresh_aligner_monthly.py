@@ -7,7 +7,7 @@ coverage is:
 1. **Phase 1 data-availability gates** — must refuse to proceed when
    any of the three data sources (Binance aggTrades, Deribit option
    trades, DVOL) is incomplete.
-2. **Phase 6 sanity gate** — must refuse to ship a JSON whose target-
+2. **Phase 6 sanity gate** — must reject a JSON whose target-
    month β* is out of the safety band, OR that drops historical months.
 """
 from __future__ import annotations

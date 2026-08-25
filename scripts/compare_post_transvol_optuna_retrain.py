@@ -3,8 +3,8 @@
 After the full 51-month TransVol retrain at Optuna-best params
 (lr=7.5e-5, dropout=0.198, weight_decay=0.0012) AND the downstream
 LightGBM walk-forward retrain (since embeddings changed), this
-script runs the canonical V2 backtest against the fresh checkpoints
-and diffs key metrics against the pre-retrain canonical trade log
+script runs the invalidated historical V2 backtest against the fresh checkpoints
+and diffs key metrics against the pre-retrain historical trade log
 backed up at
 ``backups/2026-05-09_pre_transvol_optuna_retrain/BTC_v2_trade_log_pre_retrain.parquet``.
 
@@ -47,11 +47,11 @@ _PRE_RETRAIN_TRADE_LOG = _BACKUP_DIR / "BTC_v2_trade_log_pre_retrain.parquet"
 
 
 def _run_canonical_v2_backtest() -> pd.DataFrame:
-    """Run the V2 canon (production filters + realistic costs)."""
+    """Run the invalidated historical V2 preset with realistic costs."""
     from vol_arb.backtester import BacktestConfig, VolArbBacktester
     cfg = (
         BacktestConfig()
-        .with_btc_production_filters_v2()
+        .with_historical_btc_v2()
         .with_realistic_costs()
     )
     _, trade_log = VolArbBacktester(cfg).run_backtest()
@@ -169,7 +169,7 @@ def main() -> int:
         "# Cycle-10 post-retrain V2 backtest impact (2026-05-09)",
         "",
         "TransVol retrained at Optuna-best params (lr=7.5e-5, dropout=0.198, ",
-        "wd=0.0012) on all 51 monthly checkpoints, full production training ",
+        "wd=0.0012) on all 51 monthly checkpoints, full historical training ",
         "depth (max_epochs=150, patience=20). Downstream LightGBM walk-forward ",
         "retrained against fresh embeddings; aligner re-extracted.",
         "",

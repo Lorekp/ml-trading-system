@@ -86,11 +86,11 @@ def main():
                         help="Apply realistic Deribit 2026 cost widening "
                              "(perp_slippage_bps 2->3, base_spread_iv 1.5->2.0, "
                              "maker_adverse_selection_iv 0.5->0.75). "
-                             "Use for honest production Sharpe.")
+                             "Reproduces historical cost assumptions; it does "
+                             "not validate a result.")
     parser.add_argument("--use-pinned-exit-iv", action="store_true",
-                        help="Switch from default rolling-ATM attribution "
-                             "(documented in PIPELINE_DOCUMENTATION §17.3 as "
-                             "'exact for ATM straddles') to fixed-contract "
+                        help="Switch from the rolling-ATM approximation to "
+                             "fixed-contract "
                              "attribution where exit IV is reconstructed for "
                              "the entry's exact (K, D) via real same-contract "
                              "trade -> SVI surface -> legacy fallback. Use "
@@ -100,28 +100,29 @@ def main():
                         help="Mute signals on bars where option DTE < this "
                              "floor (0 = disabled, default). Motivated by "
                              "empirical 5/5-year bleed on DTE<5 trades "
-                             "(flat fees but vega ∝ √DTE). Production "
+                             "(flat fees but vega ∝ √DTE). Historical V1 "
                              "value: 5.0 for BTC.")
     parser.add_argument("--skip-long-hours-utc", type=str, default=None,
                         help="Comma-separated UTC hours at which LONG "
                              "signals are muted (shorts kept). Motivated "
                              "by US cash-open vol dislocation. Production "
                              "value: '14,15,16' for BTC. Empty = disabled.")
-    parser.add_argument("--btc-production", action="store_true",
-                        help="Apply the full BTC production filter/threshold "
-                             "stack (with_btc_production_filters): "
+    parser.add_argument("--historical-btc-v1", action="store_true",
+                        help="Replay the invalidated historical BTC V1 "
+                             "filter/threshold stack (with_historical_btc_v1): "
                              "thr_S=22, thr_L=30, min_dte_days=5, "
                              "skip_long_hours_utc=(14,15,16), "
                              "target_margin_utilization=0.075, "
-                             "use_sor=False. Normally combined with "
-                             "--realistic.")
-    parser.add_argument("--btc-production-v2", action="store_true",
-                        help="Apply the v2 production stack "
-                             "(with_btc_production_filters_v2): v1 "
+                             "use_sor=False. For forensic reproduction only; "
+                             "normally combined with --realistic.")
+    parser.add_argument("--historical-btc-v2", action="store_true",
+                        help="Replay the invalidated historical BTC V2 stack "
+                             "(with_historical_btc_v2): v1 "
                              "+ DRL hedging + profit_scaling(floor=0.3) "
-                             "+ util=0.15 + holding=30m + kelly sizing "
+                             "+ util=0.10 + holding=15m + kelly sizing "
                              "+ skip_long_if_term_slope_gt=0.0. "
-                             "Normally combined with --realistic.")
+                             "For forensic reproduction only; normally "
+                             "combined with --realistic.")
     parser.add_argument("--dfl-scores-path", type=str, default="",
                         help="Enable DFL head filter. Path to walk-forward "
                              "P(win) scores parquet (produced by "
@@ -140,13 +141,13 @@ def main():
                              "profit_scaling and BEFORE dynamic_btc_cap clip.")
     parser.add_argument("--horizon-minutes", type=int, default=15,
                         help="Prediction horizon in minutes (default 15). When "
-                             "combined with --btc-production-v2 selects the "
-                             "matching per-horizon V2 preset "
-                             "(`with_btc_production_h{N}m()`). Sidecars at "
+                             "combined with --historical-btc-v2 selects the "
+                             "matching historical per-horizon V2 preset "
+                             "(`with_historical_btc_v2_h{N}m()`). Sidecars at "
                              "h!=15 must already be regenerated; missing files "
                              "surface as a backtester load error rather than "
                              "silent fallback. Must divide 1440 (e.g., 5, 15, "
-                             "30, 60). See plan starry-rolling-rabin.md.")
+                             "30, 60).")
     args = parser.parse_args()
     if 1440 % args.horizon_minutes != 0:
         parser.error(
@@ -197,19 +198,36 @@ def main():
     config = BacktestConfig.for_currency(args.currency, **config_kwargs)
     if args.realistic:
         config = config.with_realistic_costs()
-    if args.btc_production:
-        config = config.with_btc_production_filters()
-    if args.btc_production_v2:
-        # Per-horizon dispatch: at h=15 use the named legacy preset
-        # (preserves the test_production_v2_kelly_default_is_K1 invariant
-        # and is byte-identical to current production). At h!=15 use the
+    if args.historical_btc_v1:
+        config = config.with_historical_btc_v1()
+    if args.historical_btc_v2:
+        # Per-horizon dispatch: at h=15 use the named historical preset.
+        # At h!=15 use the
         # generic for-horizon factory which composes for_timeframe(N) +
         # V1 filters + V2 horizon-invariants + horizon-aware paths.
         if args.horizon_minutes == 15:
-            config = config.with_btc_production_filters_v2()
+            config = config.with_historical_btc_v2()
         else:
-            config = BacktestConfig.with_btc_production_for_horizon(
-                args.horizon_minutes,
+            # MF-3: thread the caller's overrides THROUGH the per-horizon
+            # factory (applied last via model_copy) instead of letting the
+            # factory's horizon-aware defaults silently drop them. Without
+            # this, a freshly-trained ``--predictions-path`` at h!=15 was
+            # discarded and the stale h15-tuned aligned_bias file scored
+            # instead (or a FileNotFoundError swallowed where it is absent).
+            horizon_overrides: dict = {}
+            if args.predictions_path:
+                horizon_overrides["predictions_path"] = args.predictions_path
+            # ``--kelly-mult-path none`` (case-insensitive) explicitly disables
+            # the h15-tuned Kelly overlay — the bare V2 comparison stack the
+            # cross-horizon job uses (aligner OFF via predictions override +
+            # Kelly OFF here). A real path still threads through normally.
+            if args.kelly_mult_path:
+                kv = args.kelly_mult_path.strip()
+                horizon_overrides["kelly_mult_path"] = (
+                    None if kv.lower() in ("none", "null", "off") else kv
+                )
+            config = BacktestConfig.with_historical_btc_v2_for_horizon(
+                args.horizon_minutes, **horizon_overrides,
             )
     # Explicit --min-dte-days / --skip-long-hours-utc override the preset
     # so users can sweep filter-level knobs while keeping realistic costs.

@@ -1,6 +1,6 @@
 """Tests for vol_arb.shortfall_head — Cycle 4 conditional-shortfall classifier.
 
-Critical invariants (locked by plan ``now-check-empirically-from-eager-bird.md``):
+Critical invariants frozen by this regression suite:
 
 1. **Hyperparameter parity** — BASELINE / TREATMENT / PLACEBO must use
    ``DFL_LGBM_PARAMS`` exactly. Parity is the experimental control.
@@ -17,7 +17,7 @@ Critical invariants (locked by plan ``now-check-empirically-from-eager-bird.md``
    autocorrelated synthetic data than under IID.
 8. **DeLong test** — paired-AUC p-value matches a reference implementation
    on synthetic data of known correlation.
-9. **Locked gate constants** — gate thresholds match the plan exactly;
+9. **Locked gate constants** — thresholds match the frozen protocol;
    regression locks them against accidental drift.
 """
 from __future__ import annotations
@@ -110,7 +110,7 @@ class TestHyperparameterParity:
         assert ours == DFL_LGBM_PARAMS
 
     def test_locked_gate_constants(self):
-        """Gate thresholds must match plan exactly (regression lock)."""
+        """Gate thresholds must match the frozen protocol exactly."""
         assert GATE_G1_DELTA_MIN == 0.02
         assert GATE_G3_DELONG_P_MAX == 0.01
         assert GATE_G4_PLACEBO_MAX == 0.005

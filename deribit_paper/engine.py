@@ -183,19 +183,13 @@ class TradingEngine:
     def __init__(self, config: PaperConfig):
         self.config = config
         self.config.ensure_dirs()
-        # S-7 (parity-r3 cycle 8 — 2026-05-08): defence-in-depth
-        # check that V2-preset configs haven't been silently mutated
-        # away from the canonical V2 invariants
-        # (``with_v2_preset()``'s expected output). Logs WARNINGs;
-        # does not refuse to start (operators may legitimately tweak
-        # individual knobs while keeping config_preset="v2" for the
-        # rest of the V2 stack).
+        # Historical V2 replay rows retain the ``v2`` marker. Warn if a
+        # reconstructed preset has drifted from the archived fields; this
+        # marker is not a production/configuration option.
         for mismatch in config.validate_preset_invariants():
             logger.warning(
-                "V2 preset invariant mismatch: %s — defence-in-depth "
-                "warning per round-3 audit S-7. Reconstruct the config "
-                "via ``PaperConfig.with_v2_preset()`` if this drift was "
-                "unintentional.",
+                "Historical V2 replay mismatch: %s. Reconstruct forensic "
+                "runs via PaperConfig.historical_v2_preset().",
                 mismatch,
             )
 
@@ -779,9 +773,8 @@ class TradingEngine:
             # ── E.2.3: staleness alert + soft refusal ──
             # The aligner sidecar is regenerated monthly. Stale > 1
             # month → WARN (degraded but trading continues). Stale > 2
-            # months under V2 preset → refuse to start (the live engine
-            # is silently using a β* that hasn't seen recent regime
-            # data; better to halt than to ship biased predictions).
+            # months under the historical V2 replay marker → refuse to
+            # start rather than silently reproduce with stale β* data.
             try:
                 latest_month_str = max(aligner_betas.keys())
                 latest_month = pd.Period(latest_month_str, freq="M")
@@ -794,7 +787,7 @@ class TradingEngine:
                     msg = (
                         f"Aligner β* sidecar stale by {gap_months} months "
                         f"(latest={latest_month_str}, now={now_month}). "
-                        f"Under V2 preset this is a refusal to start — "
+                        f"Under historical V2 replay this is a refusal to start — "
                         f"refresh via scripts/extract_aligner_betas.py + "
                         f"scripts/refresh_live_sidecars.py before "
                         f"launching, OR pass --allow-stale-aligner to "
@@ -879,7 +872,7 @@ class TradingEngine:
             # D2 (parity 2026-05-07): mirror V2 backtester long-hour filter.
             skip_long_hours_utc=cfg.skip_long_hours_utc,
             aligner_betas=aligner_betas,
-            # E.1.14: V2 preset configures the aligner sidecar; an empty
+            # Historical V2 replay configures the aligner sidecar; an empty
             # dict here means the configuration failed silently. Fail
             # fast at startup rather than bypass β* on every bar.
             require_aligner=(cfg.config_preset == "v2"),
@@ -980,7 +973,7 @@ class TradingEngine:
             # quietly mishedging from the first bar.
             #
             # Tests / non-DRL configs can still pass by setting
-            # ``vpin_state_path=""`` AND a non-V2 ``config_preset``
+            # ``vpin_state_path=""`` and a non-V2 ``config_preset``
             # (this path will get the "disabled" log only when DRL is
             # demonstrably off).
             drl_enabled = (
@@ -989,14 +982,13 @@ class TradingEngine:
             )
             if drl_enabled:
                 raise RuntimeError(
-                    "Live engine refused to start: V2 preset enables DRL "
+                    "Paper engine refused to start: historical V2 replay enables DRL "
                     "hedging but vpin_state_path is empty. The SAC v4 "
                     "policy requires a wired VPIN stream to stay in its "
                     "training distribution; pre-cycle-22 the missing "
                     "stream silently corrupted every hedge action with a "
                     "10σ fallback. Set cfg.vpin_state_path to the warm-"
-                    "start parquet or run with a non-V2 preset. See "
-                    "memory/project_cycle22_vpin_drl_provenance_2026_05_11.md."
+                    "start parquet or use the default paper configuration."
                 )
             logger.info("LiveVPINStream disabled (vpin_state_path empty)")
 
@@ -1465,9 +1457,9 @@ class TradingEngine:
         # signal decision alongside the kill switch.
         #
         # D6 (parity 2026-05-07): V2 backtester has no RND counterpart.
-        # Gated behind ``cfg.use_rnd_scaling`` (default False, V2 preset
-        # leaves False) so V2-preset live behaviour matches the backtest.
-        # Operators wanting tail-risk scaling can opt in via
+        # Gated behind ``cfg.use_rnd_scaling`` (default False; historical V2
+        # replay leaves it False) so the reconstruction matches the backtest.
+        # Paper experiments wanting tail-risk scaling can opt in via
         # ``cfg.use_rnd_scaling = True``.
         if cfg.use_rnd_scaling:
             self.rnd_monitor = RNDMonitor(
@@ -2552,7 +2544,7 @@ class TradingEngine:
         )
 
         # Profit-scale lookup (V2 wiring, E.1.1). ``None`` estimator →
-        # 1.0 (no-op); under V2 preset, computes empirical-Bayes
+        # 1.0 (no-op); under historical V2 replay, computes empirical-Bayes
         # shrinkage from realised gross EMA + theoretical edge×vega prior.
         profit_scale = 1.0
         if self._profit_scale_estimator is not None and n_pre_ps > 0.0 and signal.straddle is not None:

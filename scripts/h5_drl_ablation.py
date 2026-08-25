@@ -1,7 +1,7 @@
 """DRL hedger horizon-mismatch ablation at h=5m (plan Phase 2h5.7.B).
 
-The shipped SAC policy ``production_sac_v4_final`` was trained at the
-DRLHedgingConfig default ``bar_minutes=15``. The V2 ``with_btc_production_h5m()``
+The historical SAC artifact ``production_sac_v4_final`` was trained at the
+DRLHedgingConfig default ``bar_minutes=15``. The historical V2 ``with_historical_btc_v2_h5m()``
 preset still loads that policy and invokes it at ``holding_minutes=5``,
 i.e. 3x more often per unit time. The audit (plan §Phase-0) flagged this
 as a silent policy-cadence mismatch; this script measures the effect
@@ -9,7 +9,7 @@ WITHOUT retraining SAC.
 
 Method
 ------
-1. Build the V2 h=5 preset (``with_btc_production_h5m()``).
+1. Build the historical V2 h=5 replay (``with_historical_btc_v2_h5m()``).
 2. Run TWO backtests with that preset:
    - **DRL-on**: existing config (the canonical h=5m trade log).
    - **DRL-off**: `model_copy(use_drl_hedging=False)` — falls back to
@@ -17,12 +17,12 @@ Method
      Black-Scholes-bands hedger).
 3. Compare headline NC PnL / NC Sharpe / NC MDD between the two runs.
 
-Decision (pre-committed in plan §Phase 2h5.7.B):
-- DRL-on better by >= +5% (NC PnL or +0.5 Sharpe): policy transfers
-  despite mismatch; ship as-is.
-- |d| < 5%: mismatch immaterial at h=5; ship with documented note.
+Historical comparison thresholds:
+- DRL-on better by >= +5% (NC PnL or +0.5 Sharpe): record apparent transfer
+  despite the mismatch; do not treat it as validation.
+- |d| < 5%: record the mismatch as inconclusive at h=5.
 - DRL-off better by >= +5%: mismatch is harmful; recommend
-  ``with_btc_production_h5m_static_hedge()`` factory in follow-up.
+  ``with_historical_btc_v2_h5m_static_hedge()`` factory in follow-up.
 
 Output: prints headline comparison; writes
 ``vol_arb/output/BTC_v2_trade_log_h5m_no_drl.parquet`` so downstream
@@ -30,7 +30,7 @@ analyses can reuse the DRL-off trade log.
 
 Usage
 -----
-    cd C:/Claude/ml-trading-system
+    # from the repository root
     python scripts/h5_drl_ablation.py
 """
 from __future__ import annotations
@@ -85,7 +85,7 @@ def _headline_nc(tl: pd.DataFrame) -> dict:
 
 
 def _run_h5_backtest(*, use_drl: bool) -> pd.DataFrame:
-    cfg = BacktestConfig.with_btc_production_h5m()
+    cfg = BacktestConfig.with_historical_btc_v2_h5m()
     if not use_drl:
         cfg = cfg.model_copy(update=dict(use_drl_hedging=False))
     label = "DRL-on" if use_drl else "DRL-off"
@@ -139,7 +139,7 @@ def main() -> int:
         else:
             print(f"  {k:<14}${v_on:>14,.0f} ${v_off:>14,.0f} ${delta:>+14,.0f}{pct:>+10.2f}")
 
-    # Pre-committed decision logic from plan §Phase 2h5.7.B
+    # Historical comparison thresholds; these do not authorize adoption.
     pnl_pct = (off["nc_pnl"] - on["nc_pnl"]) / abs(on["nc_pnl"]) * 100 if on["nc_pnl"] else 0.0
     sharpe_delta = off["nc_sharpe"] - on["nc_sharpe"]
     print(f"\n  dNC PnL: {pnl_pct:+.2f}%   dNC Sharpe: {sharpe_delta:+.3f}")
@@ -147,8 +147,8 @@ def main() -> int:
         print("  VERDICT: DRL-off WINS by >=5% PnL or +0.5 Sharpe — "
               "h=15 policy is harmful at h=5; recommend static-hedge variant.")
     elif pnl_pct <= -5 or sharpe_delta <= -0.5:
-        print("  VERDICT: DRL-on WINS by >=5% PnL or +0.5 Sharpe — "
-              "policy transfers despite cadence mismatch; ship as-is.")
+        print("  RESULT: DRL-on exceeds the historical threshold despite the "
+              "cadence mismatch; this ablation alone is not validation.")
     else:
         print("  VERDICT: DRL contribution at h=5 is within +/-5% / +/-0.5 Sharpe "
               "of the static-hedge baseline — mismatch is non-material.")

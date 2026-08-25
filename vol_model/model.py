@@ -90,10 +90,8 @@ def train_purged_cv(
         config: VolModelConfig.
         embargo_bars: Absolute-bar embargo. When provided, OVERRIDES
             ``config.pct_embargo`` so the embargo is independent of total
-            observation count — the horizon-aware path (plan
-            starry-rolling-rabin.md Phase 1d / Phase 2h5.7.A). Default
-            ``None`` preserves the legacy ``pct_embargo`` behaviour
-            byte-identically at h=15 and at every existing call site.
+            observation count. Default ``None`` retains percentage-based
+            embargo behavior at existing call sites.
         max_feature_lookback_bars: Convenience for HAR-PD-style models with
             multi-day feature lookback. When ``embargo_bars`` is None and
             this is positive, the function auto-derives an embargo of
@@ -111,7 +109,7 @@ def train_purged_cv(
     ``vol_model/run_walkforward_pruned_svi_har_pd.py`` and uses strictly
     chronological train/val/test masks (not PurgedKFold). This function is
     used by ``run_train.py``, ``run_optuna.py``, and ``hybrid.py`` for
-    SHAP-importance / certification-scale retrain.
+    SHAP-importance / large research retrain.
     """
     if embargo_bars is None and max_feature_lookback_bars > 0:
         # Derive horizon-aware embargo from feature-lookback metadata.

@@ -123,12 +123,10 @@ class RNDConfig:
     # W2.2 backtest showed that no halt_mult value delivers positive
     # Sharpe delta — the strategy's existing risk management already
     # handles the stress events this monitor is meant to catch.  We
-    # ship the monitor "armed but silent": at halt_mult=2.0 and the
-    # sigma-mult design, the historical halt rate is ~0% and the
-    # monitor functions primarily as a telemetry signal ready to fire
-    # in a genuinely unprecedented vol regime.  See
-    # ``vol_arb/output/rnd_backtest/rnd_backtest_report.md`` for the
-    # W2.2 sweep results that motivated this choice.
+    # At halt_mult=2.0 and with the sigma-mult design, the historical halt
+    # rate is ~0%; retain the monitor only as historical paper/replay
+    # telemetry.
+    # It is not validated as a live tail-risk control.
     # Grid for numerical integration of the RND (log-moneyness).
     k_grid_min: float = -0.40    # ~ exp(-0.40) = 0.67, 33% down
     k_grid_max: float = 0.40     # ~ exp(0.40) = 1.49, 49% up

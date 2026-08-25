@@ -7,7 +7,7 @@ Three categories:
    new column. Mutating a source row at timestamp t' > T must NEVER
    change the annotator output at any t ≤ T.
 3. **Byte-identity invariant**: running the annotator does not modify
-   the canonical V2 trade log file on disk; ``test_v2_preset_loads_k1_sidecar_path``
+   the historical V2 trade log file on disk; ``test_v2_preset_loads_k1_sidecar_path``
    stays green.
 """
 from __future__ import annotations
@@ -221,8 +221,10 @@ class TestByteIdentity:
         for c in synthetic_trade_log.columns:
             assert c in annotated.columns
 
-    def test_kelly_sizing_test_still_imports(self):
-        """Confirm the canonical V2 preset still loads its Kelly sidecar."""
+    def test_historical_v2_uses_recorded_kelly_sidecar(self):
+        """Confirm the forensic V2 replay loads its recorded Kelly sidecar."""
         from vol_arb.backtester import BacktestConfig
-        config = BacktestConfig().with_btc_production_filters_v2()
-        assert config.kelly_mult_path == "vol_arb/output/BTC_v2_kelly_mult_K1.parquet"
+        config = BacktestConfig().with_historical_btc_v2()
+        assert config.kelly_mult_path == (
+            "vol_arb/output/BTC_v2_kelly_mult_K1_slope.parquet"
+        )

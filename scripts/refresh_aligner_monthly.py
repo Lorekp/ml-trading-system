@@ -41,7 +41,7 @@ typically publishes the prior month's aggTrades by day 3-5).
 
 Usage::
 
-    cd C:/Claude/ml-trading-system
+    # from the repository root
     PYTHONPATH=. python scripts/refresh_aligner_monthly.py --month 2026-04
 
     # Dry-run mode: print plan, run feasibility checks, no write.
@@ -271,7 +271,7 @@ def phase5_extract(*, dry_run: bool, output_path: Path) -> bool:
 
 
 def phase6_sanity_gate(new_json: Path, target_ym: str) -> bool:
-    """Refuse to ship when the new month's β* is out of band, OR when
+    """Reject output when the new month's β* is out of band, OR when
     the new JSON drops months that the old one carried."""
     if not new_json.exists():
         logger.error("Sanity gate: new JSON %s missing", new_json)
@@ -298,7 +298,7 @@ def phase6_sanity_gate(new_json: Path, target_ym: str) -> bool:
         dropped = set(old) - set(new)
         if dropped:
             logger.error(
-                "Sanity gate: new JSON drops months %s — refusing to ship",
+                "Sanity gate: new JSON drops months %s — rejecting output",
                 sorted(dropped),
             )
             return False
@@ -327,7 +327,7 @@ def phase7_atomic_swap(new_json: Path) -> bool:
             shutil.copy2(backup, BETAS_JSON)
             logger.info("Rolled back from %s", backup)
         return False
-    logger.info("Swapped: %s is now the live β* sidecar", BETAS_JSON)
+    logger.info("Swapped: %s is now the historical β* reference", BETAS_JSON)
     return True
 
 
@@ -377,8 +377,10 @@ def main() -> int:
         return 9
 
     logger.info("=== Refresh complete for %s ===", target_ym)
-    logger.info("Next step: redeploy to homeserver and restart engine")
-    logger.info("    bash scripts/deploy_to_homeserver.sh --skip-tests")
+    logger.info(
+        "Artifact remains research-only; update the validation ledger and "
+        "run independent replay/parity gates before paper or testnet use"
+    )
     return 0
 
 

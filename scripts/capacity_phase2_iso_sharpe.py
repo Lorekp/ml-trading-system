@@ -1,8 +1,6 @@
 """Method 1 (iso-Sharpe scaling backtest with calibrated impact) for the
 V2 vol-arb capacity analysis.
 
-See plan: ``C:/Users/laure/.claude/plans/c-claude-ml-trading-system-tsrv-pipelin-glistening-bunny.md``.
-
 Replays the V2 NC PnL at scale multipliers K ∈ {0, 1, 2, 5, 10, 20, 50, 100}
 under the square-root impact model, with stationary block bootstrap CIs
 (Politis-Romano 1994) at each K. K=0 is the no-impact identity check
@@ -283,8 +281,6 @@ def write_report(
     body = f"""# V2 Vol-Arb Capacity Analysis — Sharpe(K) Curve
 
 {smoke_tag}
-
-Plan: `C:/Users/laure/.claude/plans/c-claude-ml-trading-system-tsrv-pipelin-glistening-bunny.md`.
 
 ## Headline
 

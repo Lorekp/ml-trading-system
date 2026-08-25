@@ -1,7 +1,7 @@
 """Cycle-22 (2026-05-11) engine-startup fail-fast tests.
 
-Closes A6 H7 (7-agent swarm audit): live engine refused to start
-when V2 preset enables DRL hedging but ``vpin_state_path`` is empty.
+Preserves a historical replay startup guard: the V2 marker requires a
+VPIN warm-start path when DRL hedging is enabled.
 
 Pre-fix the engine would silently start with ``vpin_stream=None``,
 StraddleFlow would silently fall back to ``vpin=0.5`` per trade (10σ
@@ -40,8 +40,7 @@ def test_v2_preset_with_drl_on_is_drl_enabled():
 
 
 def test_v2_preset_with_no_explicit_drl_flag_is_drl_enabled():
-    """V2 preset, use_drl_hedging unset (defaults True) → fail-fast
-    required (this mirrors the production V2 path)."""
+    """Historical V2 replay defaults DRL on and therefore requires VPIN."""
     # getattr(cfg, "use_drl_hedging", True) → True
     assert _drl_enabled_per_engine_logic(True, "v2") is True
 
@@ -69,9 +68,9 @@ def test_v2_config_with_empty_vpin_state_path_would_fail_engine_startup():
     the config state that would trigger the guard.
     """
     from deribit_paper.config import PaperConfig
-    cfg = PaperConfig.with_v2_preset()
+    cfg = PaperConfig.historical_v2_preset()
     assert cfg.config_preset == "v2"
-    # In production V2, vpin_state_path is set (warm-start parquet).
+    # The archived V2 configuration includes a VPIN warm-start path.
     # If a future config change ever flips it empty, the engine fail-
     # fast will catch it. Document the contract here.
     assert cfg.vpin_state_path != "", (

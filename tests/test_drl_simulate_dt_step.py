@@ -82,5 +82,5 @@ def test_v2_default_holding_minutes_unchanged():
     """The V2 preset (``holding_minutes=15``) must drive bar_minutes=15.0
     into the simulate(s), preserving byte-identity with the pre-D5 baseline."""
     from vol_arb.backtester import BacktestConfig
-    cfg = BacktestConfig().with_btc_production_filters_v2()
+    cfg = BacktestConfig().with_historical_btc_v2()
     assert float(cfg.holding_minutes) == pytest.approx(15.0)

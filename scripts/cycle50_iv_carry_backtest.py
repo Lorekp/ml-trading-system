@@ -17,7 +17,7 @@ vol-point round-trip. NO SVI noise, NO vega x d(iv_used) fiction.
 Trades are NON-OVERLAPPING: enter a short ATM straddle when flat and the
 signal fires, hold to the matched contract's expiry, book, repeat.
 
-Signals tested (per feedback_no_cherry_pick — report all, per-year):
+Signals tested (report every candidate and year to limit cherry-picking):
   A unconditional               — always sell (baseline VRP)
   B iv > trailing-30d mean       — sell when implied elevated
   C iv > trailing-30d mean + 5vp — sell only when strongly elevated

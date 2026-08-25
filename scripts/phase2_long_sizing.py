@@ -41,14 +41,11 @@ Falsifiers (any failure rejects):
 The simulation reuses `BTC_v2_trade_log.parquet`'s NC component columns:
 `vega_pnl_nc`, `theta_pnl_nc`, `delta_hedge_pnl_nc`, `option_fees_nc`,
 `slippage_nc`, `hedge_costs_nc`, `net_pnl_nc`. Multiplying these by k
-on qualifying bars exactly equals running the backtester at k× sizing
-on those bars in NC mode (no margin-utilization feedback loop). This
-is honest because: (a) `project_capacity_analysis_2026_05_07.md`
-showed K=0 NC identity holds at our scale; (b) NC isolation removes
-the compound-equity feedback that would change other bar sizes. The
-mode does NOT account for (i) dynamic margin-utilization caps that
-might reject the larger trade in the live engine, or (ii) realistic-
-slippage non-linearity at larger size.
+on qualifying bars is a linear NC approximation to k× sizing. It deliberately
+removes compound-equity feedback and does NOT account for dynamic utilization
+caps, rejection of larger trades, or nonlinear slippage. It also consumes the
+invalidated historical V2 trade log, so its output is forensic research rather
+than an independently valid sizing result.
 
 Outputs:
 

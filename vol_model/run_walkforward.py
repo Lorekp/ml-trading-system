@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -151,7 +152,8 @@ def _load_month_features(model_dir: Path, month_str: str) -> list[str] | None:
 
 def _make_objective(dtrain: lgb.Dataset, dval: lgb.Dataset,
                     X_val: np.ndarray, y_val: np.ndarray, device: str,
-                    *, horizon_minutes: int = 15):
+                    *, horizon_minutes: int = 15,
+                    monotone_constraints: list[int] | None = None):
     """Create an Optuna objective closure over pre-built LGB datasets.
 
     ``horizon_minutes`` scales the ``min_data_in_leaf`` search range so the
@@ -164,13 +166,35 @@ def _make_objective(dtrain: lgb.Dataset, dval: lgb.Dataset,
     constant prevents the search from collapsing to either degenerate
     over-fitting (h=5 with [50, 500] = trivial leaves) or
     under-resolution (h=60 with [50, 500] = monstrously coarse leaves).
-    See plan starry-rolling-rabin.md Phase 1e and
-    feedback_gauntlet_budget.md (TPE convergence is bar-count-agnostic;
-    don't crank trials).
+    The trial budget stays fixed because TPE convergence is not improved merely
+    by changing bar frequency.
+
+    ``monotone_constraints`` is an
+    optional per-feature constraint vector aligned to the training-matrix
+    column order (+1 = monotone-increasing, 0 = unconstrained, -1 =
+    decreasing). When ``None`` (the default) NO ``monotone_constraints``
+    key is added to the params dict, so the produced model is byte-identical
+    to the historical unconstrained behavior. Only a caller that explicitly
+    opts into a sign-certain past-RV constraint set passes a non-None vector.
     """
     scale = horizon_minutes / 15.0
     leaf_lo = max(10, int(round(50 * scale)))
     leaf_hi = max(leaf_lo + 1, int(round(500 * scale)))
+
+    # Horizon-aware min_data_in_leaf cap.
+    # At long horizons the ``500*scale`` upper bound exceeds the per-month
+    # training-row budget, so LightGBM degenerates / aborts (no leaf can hold
+    # that many samples). Clamp the bound to the month's ACTUAL row count via
+    # ``dtrain.num_data()`` (K=15 ⇒ ≥15 samples in the largest allowed leaf).
+    # This binds ONLY when n_train < 7500, i.e. coarse horizons; at h=15 the
+    # min per-month window is ≈35k rows ⇒ cap = 35k//15 ≥ 2333 > 500 ⇒ range
+    # stays exactly [50, 500], retaining the historical h=15 configuration.
+    _K_LEAF = 15
+    _cap = dtrain.num_data() // _K_LEAF
+    leaf_hi = min(leaf_hi, _cap)
+    leaf_lo = min(leaf_lo, max(10, leaf_hi // 5))
+    if leaf_hi <= leaf_lo:
+        leaf_hi = leaf_lo + 1
 
     def objective(trial):
         params = {
@@ -184,10 +208,15 @@ def _make_objective(dtrain: lgb.Dataset, dval: lgb.Dataset,
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 0.9),
             "subsample": 0.8,
             "device": device,
-            "num_threads": -1 if device == "cpu" else 1,
+            "num_threads": int(os.environ.get("OPT_NUM_THREADS", "-1")) if device == "cpu" else 1,
             "verbosity": -1,
             "seed": 42,
         }
+        # Lever [1.3]: only inject the key when a constraint vector is
+        # supplied. Absence of the key (default path) is byte-identical
+        # to the historical reference training path.
+        if monotone_constraints is not None:
+            params["monotone_constraints"] = monotone_constraints
 
         model = lgb.train(
             params, dtrain,

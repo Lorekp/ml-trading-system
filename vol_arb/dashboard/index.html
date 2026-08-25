@@ -1,137 +1,125 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<title>Backtest Dashboard — BTC vol-arb</title>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
-<style>
-  :root{
-    --bg:#0b1017; --bg-2:#0f1620; --panel:#111a24; --panel-2:#152030;
-    --rule:#1d2a3a; --rule-2:#273648;
-    --ink:#e5ecf5; --ink-2:#aab6c4; --muted:#6b7886; --dim:#4a5968;
-    --accent:#14b8a6; --accent-2:#8b5cf6;
-    --pos:#22c55e; --neg:#ef4444; --warn:#f59e0b;
-  }
-  *{box-sizing:border-box}
-  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-feature-settings:"tnum" 1;font-size:13px}
-  .mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
-  button{font-family:inherit;cursor:pointer}
-  /* header */
-  header.top{position:sticky;top:0;z-index:20;background:color-mix(in oklab,var(--bg) 94%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--rule);padding:10px 20px 8px;display:flex;align-items:center;justify-content:space-between;gap:24px}
-  header.top h1{font-weight:500;margin:0;font-size:14px;letter-spacing:0.02em}
-  header.top h1 .dim{color:var(--muted);font-weight:300}
-  header.top .sub{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.12em;margin-top:4px}
-  header.top .meta{font-size:10px;color:var(--muted);text-align:right;font-family:"IBM Plex Mono",monospace;letter-spacing:0.05em}
-  header.top .pill{display:inline-block;padding:2px 8px;border:1px solid var(--rule-2);color:var(--accent);margin-left:6px}
-  /* controls bar */
-  .ctrls{display:flex;align-items:stretch;gap:18px;padding:10px 20px;border-bottom:1px solid var(--rule);background:var(--bg-2);position:sticky;top:48px;z-index:19;overflow-x:auto;scrollbar-width:thin}
-  .ctrls .c{display:flex;flex-direction:column;gap:4px;min-width:max-content}
-  .ctrls .lbl{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase}
-  .seg{display:inline-flex;border:1px solid var(--rule-2);border-radius:2px;overflow:hidden;height:26px}
-  .seg button{background:transparent;border:0;padding:0 10px;font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted)}
-  .seg button:hover{color:var(--ink-2)}
-  .seg button.on{background:var(--accent);color:#0b1017;font-weight:500}
-  /* date range - mini brush */
-  .daterange{height:26px;width:240px;position:relative;border:1px solid var(--rule-2);border-radius:2px;overflow:hidden;background:#0b1017}
-  .daterange svg{width:100%;height:100%;display:block}
-  .daterange .handle{position:absolute;top:0;bottom:0;width:6px;background:var(--accent);cursor:ew-resize;z-index:2}
-  .daterange .sel{position:absolute;top:0;bottom:0;background:rgba(20,184,166,0.15);pointer-events:none}
-  .daterange-label{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--ink-2);margin-left:4px}
-  /* slider */
-  input[type=range]{appearance:none;height:4px;background:var(--rule-2);border-radius:2px;outline:none;accent-color:var(--accent);width:120px}
-  input[type=range]::-webkit-slider-thumb{appearance:none;width:12px;height:12px;background:var(--accent);border-radius:50%;cursor:pointer}
-  input[type=range]::-moz-range-thumb{width:12px;height:12px;background:var(--accent);border-radius:50%;border:none}
-  /* tabs */
-  nav.tabs{display:flex;gap:0;padding:0 18px;border-bottom:1px solid var(--rule);background:var(--bg);position:sticky;top:96px;z-index:18}
-  nav.tabs button{background:transparent;border:0;font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:12px 16px;color:var(--muted);border-bottom:1px solid transparent;margin-bottom:-1px;transition:color 120ms}
-  nav.tabs button:hover{color:var(--ink-2)}
-  nav.tabs button.on{color:var(--accent);border-bottom-color:var(--accent)}
-  nav.tabs .num{opacity:0.55;margin-right:10px}
-  main{padding:16px 20px 80px}
-  /* panel */
-  .panel{background:var(--panel);border:1px solid var(--rule);border-radius:2px;margin-bottom:14px}
-  .panel-hdr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:10px 14px 8px;border-bottom:1px solid var(--rule)}
-  .panel-title{font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--ink);letter-spacing:0.1em;text-transform:uppercase;font-weight:500}
-  .panel-sub{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--muted);letter-spacing:0.04em;text-align:right}
-  .panel-sub .accent{color:var(--accent)}
-  .panel-body{padding:12px 14px}
-  .panel-body.tight{padding:8px 10px}
-  /* grid layout helpers */
-  .grid{display:grid;gap:12px}
-  .grid-3{grid-template-columns:repeat(3,1fr)}
-  .grid-2{grid-template-columns:2fr 1fr}
-  /* stat cell */
-  .stat{display:flex;flex-direction:column;padding:10px 12px;border-right:1px solid var(--rule);min-width:0}
-  .stat:last-child{border-right:none}
-  .stat .lbl{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase}
-  .stat .val{font-family:"IBM Plex Mono",monospace;font-size:22px;color:var(--ink);letter-spacing:-0.01em;margin-top:4px;line-height:1}
-  .stat .val.pos{color:var(--pos)} .stat .val.neg{color:var(--neg)}
-  .stat .ci{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--muted);margin-top:3px}
-  .stat .n{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--dim);margin-top:1px}
-  /* stats table (right col overview) */
-  .stat-table{display:flex;flex-direction:column;padding:4px 12px}
-  .stat-table .row{display:grid;grid-template-columns:1fr auto;gap:10px;padding:10px 0;border-bottom:1px solid var(--rule);align-items:baseline}
-  .stat-table .row:last-child{border-bottom:none}
-  .stat-table .row .k{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em}
-  .stat-table .row .v{font-family:"IBM Plex Mono",monospace;font-size:14px;color:var(--ink);text-align:right}
-  .stat-table .row .ci{grid-column:1/-1;font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--muted);margin-top:-4px}
-  /* chart defaults */
-  svg.chart{width:100%;display:block}
-  svg.chart text{font-family:"IBM Plex Mono",monospace;fill:var(--ink-2);font-size:9.5px}
-  svg.chart text.axis{fill:var(--muted);font-size:9px}
-  /* tooltip */
-  .tip{position:fixed;pointer-events:none;z-index:50;background:var(--panel-2);border:1px solid var(--rule-2);border-radius:2px;padding:8px 10px;font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--ink);box-shadow:0 8px 24px rgba(0,0,0,0.4);min-width:160px}
-  .tip .tk{color:var(--muted);margin-right:10px}
-  .tip .tv{color:var(--ink);float:right}
-  .tip .th{font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;border-bottom:1px solid var(--rule);padding-bottom:4px}
-  /* legend chip */
-  .chip{display:inline-flex;align-items:center;gap:6px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--ink-2);margin-right:14px}
-  .chip .sw{width:12px;height:2px;display:inline-block}
-  .chip .sw.dash{background:repeating-linear-gradient(90deg,currentColor 0 4px,transparent 4px 7px)}
-  /* episodes table */
-  .etable{width:100%;border-collapse:collapse;font-family:"IBM Plex Mono",monospace;font-size:10.5px}
-  .etable thead th{text-align:right;padding:8px 8px;font-weight:500;color:var(--muted);letter-spacing:0.08em;text-transform:uppercase;font-size:9.5px;border-bottom:1px solid var(--rule);position:sticky;top:0;background:var(--panel);cursor:pointer;user-select:none}
-  .etable thead th:first-child,.etable tbody td:first-child{text-align:left}
-  .etable thead th.sort-asc::after{content:" ↑";color:var(--accent)}
-  .etable thead th.sort-desc::after{content:" ↓";color:var(--accent)}
-  .etable tbody td{padding:6px 8px;text-align:right;border-bottom:1px solid rgba(29,42,58,0.5);color:var(--ink-2);white-space:nowrap}
-  .etable tbody tr{cursor:pointer}
-  .etable tbody tr:hover{background:rgba(20,184,166,0.06)}
-  .etable tbody tr.selected{background:rgba(20,184,166,0.14)}
-  .etable tbody tr.selected td{color:var(--ink)}
-  .side-l{color:var(--accent)} .side-s{color:var(--accent-2)}
-  .pos{color:var(--pos)} .neg{color:var(--neg)}
-  /* scroll container */
-  .scroll{overflow:auto;max-height:640px;scrollbar-width:thin}
-  .scroll::-webkit-scrollbar{width:8px;height:8px}
-  .scroll::-webkit-scrollbar-thumb{background:var(--rule-2);border-radius:4px}
-  /* tweaks */
-  .tweaks{position:fixed;right:16px;bottom:16px;z-index:40;background:var(--panel-2);border:1px solid var(--rule-2);border-radius:2px;padding:12px 14px;display:none;flex-direction:column;gap:10px;min-width:240px;font-family:"IBM Plex Mono",monospace;box-shadow:0 10px 30px rgba(0,0,0,0.4)}
-  .tweaks.on{display:flex}
-  .tweaks h4{margin:0 0 2px;font-family:"IBM Plex Sans",sans-serif;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink)}
-  .tweaks .t-row{display:flex;justify-content:space-between;align-items:center;gap:10px}
-  .tweaks .t-row label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em}
-  /* mode banner */
-  .mode-banner{display:inline-flex;align-items:center;gap:6px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--accent);padding:2px 8px;border:1px solid color-mix(in oklab,var(--accent) 40%,var(--rule-2));border-radius:2px}
-  /* crosshair line */
-  .crosshair-v{stroke:var(--accent);stroke-width:0.8;pointer-events:none;opacity:0.6}
-  /* drop-cap number on tab title */
-  .tab-head{display:flex;align-items:baseline;gap:12px;margin-bottom:10px}
-  .tab-head .num{font-family:"IBM Plex Mono",monospace;color:var(--accent);font-size:11px;letter-spacing:0.1em}
-  .tab-head h2{margin:0;font-weight:500;font-size:15px;letter-spacing:0.02em}
-  .tab-head .desc{font-size:11px;color:var(--muted);margin-left:auto;font-family:"IBM Plex Mono",monospace}
-  /* loading + error */
-  .loading{padding:80px;text-align:center;font-family:"IBM Plex Mono",monospace;color:var(--muted);font-size:12px}
-  .loading .pulse{display:inline-block;width:8px;height:8px;background:var(--accent);border-radius:50%;animation:pulse 1.2s ease-in-out infinite;margin-right:8px}
-  @keyframes pulse{0%,100%{opacity:0.3}50%{opacity:1}}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ML Trading System — Research Status</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c1117;
+      --panel: #121a23;
+      --line: #263241;
+      --text: #e7edf4;
+      --muted: #9aa8b7;
+      --bad: #ff7b72;
+      --warn: #e3b341;
+      --neutral: #79c0ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.55 ui-sans-serif, system-ui, sans-serif;
+    }
+    main { width: min(980px, calc(100% - 32px)); margin: 64px auto; }
+    header { margin-bottom: 32px; }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 5vw, 44px); line-height: 1.1; }
+    h2 { margin: 36px 0 14px; font-size: 18px; }
+    p { max-width: 72ch; color: var(--muted); }
+    .notice {
+      border: 1px solid var(--bad);
+      background: color-mix(in srgb, var(--bad) 8%, var(--panel));
+      padding: 16px 18px;
+      border-radius: 10px;
+      color: var(--text);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+    th, td { padding: 14px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    td:nth-child(2) { white-space: nowrap; font-weight: 700; }
+    .invalid, .negative { color: var(--bad); }
+    .uncertain { color: var(--warn); }
+    .infra { color: var(--neutral); }
+    a { color: var(--neutral); }
+    ul { color: var(--muted); padding-left: 20px; }
+    code { color: var(--text); }
+    footer { margin-top: 42px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); }
+    @media (max-width: 680px) {
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
+      td { border-bottom: 0; padding-bottom: 6px; }
+      td:last-child { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+    }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
-  <div id="tip" class="tip" style="display:none"></div>
-  <script type="module" src="/src/main.tsx"></script>
+  <main>
+    <header>
+      <h1>Research status</h1>
+      <p>Compact view of the canonical repository ledger. No trading result on
+      this page is approved for live capital.</p>
+    </header>
+
+    <p class="notice"><strong>No validated strategy.</strong> The V2 options
+      result was invalidated, S3 failed its frozen gate, and S5 needs a clean
+      full-universe rerun on the current code.</p>
+
+    <h2>Current ledger</h2>
+    <table>
+      <thead><tr><th>Area</th><th>Status</th><th>Current conclusion</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Deribit V2 15-minute straddle</td>
+          <td class="invalid">Invalidated</td>
+          <td>SVI calibration jitter was booked as executable vega PnL. Honest
+          DVOL and fill-marked results are negative.</td>
+        </tr>
+        <tr>
+          <td>S3 short-vol-to-expiry</td>
+          <td class="negative">Negative</td>
+          <td>The frozen DSR gate failed and liquidity-selection bias was
+          material. The later E2/H2 rescue was non-causal.</td>
+        </tr>
+        <tr>
+          <td>S5 Binance directional</td>
+          <td class="uncertain">Uncertain</td>
+          <td>Historically promising, but the current sizing fix needs a fresh
+          full-universe run and an independent execution check.</td>
+        </tr>
+        <tr>
+          <td>TSRV and volatility forecasting</td>
+          <td class="infra">Research infrastructure</td>
+          <td>Not invalidated by the V2 PnL bug. Current headline metrics still
+          need pinned, reproducible regeneration.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Promotion requirements</h2>
+    <ul>
+      <li>Clean pinned code and named input artifacts.</li>
+      <li>Causal feature, label, sizing, and execution semantics.</li>
+      <li>Independent fill validation for PnL claims.</li>
+      <li>Precommitted statistical and selection-bias gates.</li>
+      <li>Persisted failures as well as passes.</li>
+    </ul>
+
+    <footer>
+      Canonical detail:
+      <a href="../../docs/STATUS.md">status</a> ·
+      <a href="../../docs/VALIDATION.md">validation</a> ·
+      <a href="../../docs/KNOWN_ISSUES.md">known issues</a>
+    </footer>
+  </main>
 </body>
 </html>

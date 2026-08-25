@@ -389,9 +389,8 @@ def build_composite_instruments(
     )
 
     # END-of-bucket stamping: a bar at T was built from trades in [T - freq, T).
-    # This is the source-level fix for the lookahead documented in
-    # scripts/forensic/01_verify_bar_timing.py and TSRV/PIPELINE_DOCUMENTATION.md
-    # Stage 14.  Must stay in sync with SVI (vol_arb/svi.py:1482, 1494).
+    # This prevents a decision from observing trades after its timestamp.
+    # Keep it in sync with SVI stamping (vol_arb/svi.py).
     result["timestamp"] = result["bucket"] + pd.Timedelta(bucket_freq)
 
     # Stats

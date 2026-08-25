@@ -10,8 +10,8 @@
 #   bash deribit_paper/scripts/run_engine.sh [engine args...]
 #
 # Examples:
-#   bash deribit_paper/scripts/run_engine.sh --venue testnet --dry-run
-#   bash deribit_paper/scripts/run_engine.sh --venue prod --live
+#   bash deribit_paper/scripts/run_engine.sh --duration-minutes 60
+#   bash deribit_paper/scripts/run_engine.sh --paper --duration-minutes 60
 #
 # To stop without restart:  kill -TERM <engine_pid>  (clean stop, rc=0)
 # To drain then stop:       touch deribit_paper/state/drain

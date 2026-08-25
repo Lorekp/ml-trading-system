@@ -1,6 +1,6 @@
 """Deep-ensemble epistemic uncertainty for HAR-PD log-vol forecaster.
 
-Cycle 3 Phase A infrastructure (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 3 Phase A infrastructure.
 
 Lakshminarayanan, Pritzel, Blundell 2017 (NeurIPS) — "Simple and Scalable
 Predictive Uncertainty Estimation using Deep Ensembles". K independent
@@ -27,7 +27,7 @@ Anti-leakage guarantees:
   in time (existing guard in ``vol_model.conformal.hqr.fit_hqr``).
 
 Anti-overfitting guarantees:
-- K=10 members locked in plan; do NOT sweep K post-hoc.
+- K=10 members are frozen for this comparison; do not sweep K post-hoc.
 - All members use IDENTICAL hyperparameters except seed (the
   Lakshminarayanan-default deep-ensemble protocol).
 - Ensemble predictions are NOT compared against the production
@@ -61,7 +61,7 @@ ENSEMBLE_BAGGING_FRACTION: float = 0.80
 ENSEMBLE_FEATURE_FRACTION: float = 0.85
 HQR_COVERAGE_ALPHA: float = 0.10  # 90% PI
 
-# Calibration / evaluation window — MUST match Cycle 2 plan
+# Calibration/evaluation window frozen for the historical comparison.
 CAL_WINDOW: tuple[pd.Timestamp, pd.Timestamp] = (
     pd.Timestamp("2021-04-01", tz="UTC"),
     pd.Timestamp("2023-10-01", tz="UTC"),  # exclusive
@@ -314,7 +314,7 @@ def freeze_uncertainty(
         raise FileExistsError(
             f"Frozen uncertainty parquet already exists at {out}. "
             "Refusing to overwrite. Pass force=True only with a NEW "
-            "plan file authorising regeneration."
+            "explicit protocol revision authorising regeneration."
         )
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out)

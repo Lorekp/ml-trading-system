@@ -1,0 +1,181 @@
+# Historical directional paper profile
+# =====================================
+# Preserved for provenance. It is not a validated execution configuration;
+# live_mode remains disabled.
+# Secrets injected from environment variables:
+#   MEXC_API_KEY, MEXC_API_SECRET, HL_PRIVATE_KEY, HL_VAULT_ADDRESS,
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+signal:
+  model:
+    C: 0.01
+    penalty: "l1"
+    solver: "saga"
+    max_iter: 1000
+    seed: 42
+    fwd_bars: 4
+
+  features:
+    feature_list:
+      - ret_1
+      - ret_3
+      - ret_7
+      - ret_14
+      - bar_range
+      - vol_zscore
+      - rsi_14
+      - stoch_rsi
+      - macd_hist
+      - bb_pct_b
+      - atr_14
+      - dist_swing_high
+      - dist_swing_low
+      - entropy
+      - parkinson_vol_20
+      - cs_spread
+      - ffd_close
+      - ffd_ret_1
+    winsor_lo: 0.01
+    winsor_hi: 0.99
+    vol_filter_quantile: 0.50
+    vol_zscore_window: 30
+    swing_lookback: 20
+    fracdiff_d: 0.4
+    fracdiff_threshold: 0.001
+
+  portfolio:
+    starting_capital: 10000.0
+    max_dd: 0.10
+    delever_start: 0.08
+    slippage: 0.0001
+    max_exposure: 0.90
+    max_per_asset: 0.05
+    base_sizing_pct: 0.04
+    max_signal_mult: 2.0
+
+  regime_filter:
+    enabled: false
+    timeframe: "4h"
+    ema_span: 20
+
+  confidence_filter:
+    mode: "absolute"
+    threshold: 0.14
+
+  signal:
+    step_size: 0.1
+
+  data:
+    data_dirs:
+      - "data/binance-1m"
+      - "data/homeserver-mirror/binance-1m"
+    timeframe: "15min"
+    regime_timeframe: "4h"
+
+exchange:
+  name: "mexc"
+  base_url: "https://futures.mexc.com"
+  ws_url: "wss://contract.mexc.com/edge"
+  rate_limit_per_sec: 20
+  timeout_s: 10.0
+
+telegram:
+  enabled: true
+  notify_on:
+    - signal
+    - trade
+    - error
+    - daily
+    - startup
+
+paper:
+  slippage_bps: 5.0
+  starting_capital: 10000.0
+
+scheduler:
+  bar_interval_m: 15
+  poll_offset_s: 5
+  retry_count: 3
+  retry_delay_s: 2.0
+
+risk:
+  max_positions: 10
+  max_per_asset_pct: 0.05
+  max_total_exposure_pct: 0.90
+  daily_dd_halt_pct: 0.04
+  confidence_threshold: 0.14
+  hold_bars: 4
+  base_sizing_pct: 0.04
+  max_signal_mult: 2.0
+  leverage: 1
+  stop_loss_pct: 0.0
+
+live_mode:
+  enabled: false
+
+circuit_breakers:
+  drawdown_halt_pct: 0.10
+  api_error_limit: 5
+  api_error_window_m: 10
+  api_error_recovery_m: 30
+  position_mismatch_pct: 0.10
+  kill_switch_path: "KILL"
+  reconcile_interval_bars: 4
+  rolling_sharpe_window_days: 20
+  rolling_sharpe_alert_threshold: 1.0
+  rolling_sharpe_halt_threshold: 0.0
+
+db_path: "data/live/paper_state.db"
+log_level: "INFO"
+
+# Global asset universe (dynamic top-30 by volume)
+assets:
+  BTC: "BTCUSDT"
+  ETH: "ETHUSDT"
+  SOL: "SOLUSDT"
+  XRP: "XRPUSDT"
+  BNB: "BNBUSDT"
+  ADA: "ADAUSDT"
+  AVAX: "AVAXUSDT"
+  LINK: "LINKUSDT"
+  DOT: "DOTUSDT"
+  SUI: "SUIUSDT"
+  NEAR: "NEARUSDT"
+  LTC: "LTCUSDT"
+  BCH: "BCHUSDT"
+  UNI: "UNIUSDT"
+  AAVE: "AAVEUSDT"
+  FIL: "FILUSDT"
+  APT: "APTUSDT"
+  FET: "FETUSDT"
+  TAO: "TAOUSDT"
+  ENA: "ENAUSDT"
+  HBAR: "HBARUSDT"
+  XLM: "XLMUSDT"
+  TRX: "TRXUSDT"
+  FTM: "FTMUSDT"
+  WLD: "WLDUSDT"
+  ZEC: "ZECUSDT"
+  BNX: "BNXUSDT"
+  ENJ: "ENJUSDT"
+  ANKR: "ANKRUSDT"
+  SXP: "SXPUSDT"
+
+# === STRATEGY CONFIGURATIONS ===
+strategies:
+  logreg_15m:
+    class: "live.strategies.logreg.LogRegStrategy"
+    enabled: true
+    timeframes: ["15m", "4h"]
+    max_positions: 8
+    max_exposure_pct: 0.60
+    base_sizing_pct: 0.04
+    max_signal_mult: 2.0
+    hold_bars: 4
+    stop_loss_pct: 0.0
+    # Strategy-specific params
+    confidence_threshold: 0.14
+    vol_filter_quantile: 0.50
+    decay_t3_enabled: true
+    model_dir: "data/live/model"
+    nco_weights_path: "data/live/nco_weights.json"

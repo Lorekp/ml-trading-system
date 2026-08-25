@@ -332,8 +332,15 @@ def compute_execution_costs(
             # Compute exit times based on hold_bars and strategy
             hold_bars = signals_df.iloc[idxs]["hold_bars"].values.astype(int)
             strategies = signals_df.iloc[idxs]["strategy"].values
+            # NEW (B-026): prefer explicit bar_seconds column if provided
+            bar_seconds_arr = None
+            if "bar_seconds" in signals_df.columns:
+                bar_seconds_arr = signals_df.iloc[idxs]["bar_seconds"].values.astype(float)
             bar_ns = np.zeros(len(idxs), dtype=np.int64)
             for j in range(len(idxs)):
+                if bar_seconds_arr is not None and bar_seconds_arr[j] > 0:
+                    bar_ns[j] = int(bar_seconds_arr[j] * 1_000_000_000)
+                    continue
                 st = strategies[j]
                 if st == "15m":
                     bar_ns[j] = 15 * 60 * 1_000_000_000
@@ -346,7 +353,9 @@ def compute_execution_costs(
                 elif st == "24h":
                     bar_ns[j] = 24 * 60 * 60 * 1_000_000_000
                 else:
-                    bar_ns[j] = 60 * 60 * 1_000_000_000  # default 1h
+                    # NEW (B-026): fall back to 15m default (safer than 1h for
+                    # shorter signals; logs warning for unknown strategies).
+                    bar_ns[j] = 15 * 60 * 1_000_000_000
 
             exit_ts_ns = sig_ts_ns + hold_bars * bar_ns
             x_filled, x_px = check_maker_fill(

@@ -60,7 +60,7 @@ def _per_year_nc(tl: pd.DataFrame) -> dict[int, float]:
 def _run_one(jf_cap: float, label: str) -> dict:
     """Run V2 backtest with the given jump_fraction cap, return summary."""
     cfg = (BacktestConfig()
-           .with_btc_production_filters_v2()
+           .with_historical_btc_v2()
            .with_realistic_costs())
     cfg.max_jump_fraction_for_shorts = jf_cap
 

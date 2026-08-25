@@ -26,17 +26,23 @@ def btc_features() -> pd.DataFrame:
     if not path.exists():
         pytest.skip(f"SVI features parquet missing at {path}")
     df = pd.read_parquet(path)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "timestamp" not in df.columns:
+            pytest.fail("SVI features require a DatetimeIndex or timestamp column")
+        df = df.set_index(pd.to_datetime(df.pop("timestamp"), utc=True))
     if "svi_atm_spot" not in df.columns:
         pytest.skip("svi_atm_spot column not yet added — run "
                     "`python -m vol_arb.rebuild_svi_features_with_spot --currency BTC`")
     return df
 
 
+@pytest.mark.integration
 def test_svi_atm_spot_column_present(btc_features):
     """The column exists with the expected name."""
     assert "svi_atm_spot" in btc_features.columns
 
 
+@pytest.mark.integration
 def test_svi_atm_spot_coverage(btc_features):
     """Coverage is > 80% over the SVI-calibrated date range.
 
@@ -49,6 +55,7 @@ def test_svi_atm_spot_coverage(btc_features):
     assert coverage > 0.80, f"svi_atm_spot coverage {coverage:.1%} < 80% on active range"
 
 
+@pytest.mark.integration
 def test_svi_atm_spot_distribution_sane(btc_features):
     """Bulk distribution in a plausible BTC vol range.
 
@@ -68,6 +75,7 @@ def test_svi_atm_spot_distribution_sane(btc_features):
     assert sp.max() < 1000.0, f"svi_atm_spot max {sp.max():.1f} absurd"
 
 
+@pytest.mark.integration
 def test_svi_atm_spot_respects_end_shift(btc_features):
     """The +1h end-shift is applied: non-null entries are at hourly
     boundaries (00:00, 01:00, ...) with 15-min forward-fill between."""
@@ -131,6 +139,7 @@ def test_quality_gate_passes_good_calibration():
     assert 20.0 < result < 250.0  # Sane range
 
 
+@pytest.mark.integration
 def test_causality_end_shift_no_future_info(btc_features):
     """The SVI feature at time T was calibrated on trades strictly BEFORE T.
 

@@ -1,8 +1,8 @@
-"""Generic single-parameter walk-forward gate harness for stale-defense campaign.
+"""Historical single-parameter walk-forward comparison harness.
 
 Pre-committed test (cycle-12 style) — given a baseline value and a
 treatment value for ONE BacktestConfig parameter, evaluate 5 strict gates
-to decide whether to ship the treatment.
+to evaluate the treatment under five frozen within-model thresholds.
 
 PRE-COMMITTED GATES (defaults match cycle-12; can be tightened via CLI):
 
@@ -12,7 +12,7 @@ PRE-COMMITTED GATES (defaults match cycle-12; can be tightened via CLI):
   G4 — OOS per-year strict 2/2 non-negative.
   G5 — TRAIN dPnL and OOS dPnL same sign (cycle-12: both positive).
 
-Reject if any gate fails. Ship only if ALL five gates pass.
+These thresholds do not validate the strategy or authorize a new default.
 
 Usage:
     PYTHONPATH=. python scripts/stale_defense_walkforward.py \\
@@ -50,7 +50,7 @@ OOS_YEARS = {2025, 2026}
 
 def _run(param: str, value) -> pd.DataFrame:
     cfg = (BacktestConfig()
-           .with_btc_production_filters_v2()
+           .with_historical_btc_v2()
            .with_realistic_costs())
     if not hasattr(cfg, param):
         raise ValueError(f"BacktestConfig has no field '{param}'.")
@@ -284,7 +284,7 @@ def main() -> int:
         print(f"          {detail}")
     print()
     if all_pass:
-        print(f"  VERDICT: ALL GATES PASS — {args.param}={args.treatment} is the new default.")
+        print(f"  RESULT: ALL HISTORICAL THRESHOLDS PASS for {args.param}={args.treatment}.")
     else:
         print(f"  VERDICT: AT LEAST ONE GATE FAILED — keep {args.param}={args.baseline}.")
 
@@ -305,7 +305,9 @@ def main() -> int:
         lines.append(f"- {marker} {name}")
         lines.append(f"  - {detail}")
     lines.append("")
-    lines.append(f"## Verdict: {'**SHIP** (all 5 gates pass)' if all_pass else '**REJECT** (at least one gate failed)'}")
+    verdict = "all five historical thresholds pass" if all_pass else "at least one threshold failed"
+    lines.append(f"## Historical comparison: **{verdict}**")
+    lines.append("This result does not validate the strategy or authorize deployment.")
     lines.append("")
 
     for name_label, b, t, d in (

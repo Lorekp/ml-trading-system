@@ -4,7 +4,7 @@ This test fixes the "what fraction of the 101 TransVol input columns
 have a live handler" tally as a structural assertion. Pre-cycle-6 the
 ratio was 45/101 (cycle-5 partials + 6 fully-handled bases). After
 cycle 6 Phase 1d the ratio is 96/101 (only the 5 ``funding_basis_*``
-columns remain — they ship in Phase 2 with the live REST/parquet
+columns remain — they were planned for a later REST/parquet
 provider).
 
 If a future cycle drops a handler or breaks an alias, this test

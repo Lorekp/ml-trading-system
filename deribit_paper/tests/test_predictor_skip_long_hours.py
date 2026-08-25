@@ -1,9 +1,10 @@
 """D2 (parity 2026-05-07): predictor mutes LONG signals at configured
 UTC hours.
 
-Mirrors the V2 backtester's ``_apply_entry_filters`` long-only filter.
-This is the highest expected dollar-impact parity divergence per the
-audit at ``vol_arb/output/LIVE_VS_BACKTEST_PARITY_AUDIT.md``.
+Mirrors the invalidated historical V2 backtester's
+``_apply_entry_filters`` long-only filter. These checks preserve the entry
+filter's live/offline parity behavior; they are not evidence that the strategy
+or its historical PnL is valid.
 
 Tests:
 1. ``test_long_muted_at_skip_hour`` — bar at 14:00 UTC, edge above long

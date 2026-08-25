@@ -435,6 +435,7 @@ def test_tsrv_window_decomposition_is_causal() -> None:
     which would introduce forward leakage for Session I Candidate I-1.
     """
     from vol_model.leakage_probes import probe_causality_by_mutation
+    from TSRV.windowing import timestamp_window_ids
 
     rng = np.random.default_rng(0)
     # Simulate 500 tick-level price observations at 1-minute cadence (a
@@ -456,8 +457,7 @@ def test_tsrv_window_decomposition_is_causal() -> None:
         This mirrors ``_process_month_tsrv``'s invariant that each window
         is a strictly-contained block of ticks with matching window_id.
         """
-        ts_ns = raw_df.index.values.astype("int64")
-        window_ids = ts_ns // freq_ns
+        window_ids, _ = timestamp_window_ids(raw_df.index, freq)
         log_p = np.log(raw_df["price"].to_numpy())
         out_rows: list[dict] = []
         # Contiguous-block splitting (same O(n) pattern as TSRV)

@@ -76,13 +76,10 @@ downloader/**/*.zip
 *.csv.gz
 *.csv.zst
 
-# CSVs are regenerable — track only docs-style CSVs in docs/ and configs/
+# CSVs are regenerable — track only docs-style CSVs in docs/ and configs/.
 *.csv
 !docs/**/*.csv
 !configs/**/*.csv
-!vol_model/output/pruned_features.csv
-!vol_model/output/*_pruned_features.csv
-!vol_model/output/*_drop_features.csv
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MODEL WEIGHTS / SERIALIZED ARTIFACTS
@@ -118,7 +115,13 @@ saved_models/
 v3-results/**
 v4-results/**
 results/**
+# Experiment code is part of the research record; generated experiment
+# artifacts are not. Re-include directories first so Python sources can be
+# versioned without admitting reports, caches, or datasets beside them.
 experiments/**
+!experiments/**/
+!experiments/**/*.py
+!experiments/README.md
 vol_arb/output/**
 vol_model/output/**
 TSRV/output/**
@@ -126,11 +129,7 @@ deribit_paper/output/**
 scripts/forensic/output/**
 kronos_3090_package/output/**
 
-# Keep human-authored markdown writeups tracked (opt-in allowlist)
-!vol_model/output/*.md
-!vol_model/output/SIGNAL_RESEARCH_NOTES.md
-!vol_model/output/LABEL_SHIFT_AUDIT.md
-!TSRV/PIPELINE_DOCUMENTATION.md
+# Canonical human-authored documentation belongs in docs/, not output/.
 
 # Logs (all formats)
 *.log
@@ -160,9 +159,12 @@ events.out.tfevents.*
 #  BACKUPS / SNAPSHOTS — can contain historical secrets
 # ─────────────────────────────────────────────────────────────────────────────
 backups/
+_opt_gate_ref/
+_opt_staging/
 *.bak
 *.old
 *.orig
+*.preedit
 *~
 *.swp
 *.swo
@@ -200,6 +202,8 @@ pyvenv.cfg
 
 # Testing
 .pytest_cache/
+.tmp/
+pytest-tmp*/
 .hypothesis/
 .coverage
 .coverage.*
@@ -277,6 +281,11 @@ write_hft.py
 write_hft_sections.py
 write_stdin.py
 write_tutorials_script.py
+# Local agent/workflow scaffolding is not product source.
+scripts/wf_*.js
+scripts/memory_recall.py
+scripts/s5_dashboard_README.md
+vol_arb/dashboard/rendered_sample.html
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RUNTIME STATE
@@ -292,4 +301,6 @@ write_tutorials_script.py
 #  CLAUDE / AI TOOL LOCAL STATE (defensive — none expected but guard anyway)
 # ─────────────────────────────────────────────────────────────────────────────
 .claude/
+.agents/
+.codex/
 .cursor/

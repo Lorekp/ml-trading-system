@@ -203,8 +203,10 @@ def max_profitable_size(
         return 0.0
 
     coeff = IMPACT_COEFF[tier]
-    # S* = V * ((net_edge * 10000) / (1.5 * coeff))^2
-    ratio = (net_edge * 10_000) / (1.5 * coeff)
+    # NEW (B-025): corrected denominator 1.5 -> 2 (correct math). The 1.5
+    # appears to be a typo; the standard s_star derivation has 2 in the
+    # denominator. s_star is off by (2/1.5)^2 = 1.78x with the old value.
+    ratio = (net_edge * 10_000) / (2 * coeff)
     s_star = daily_volume * ratio * ratio
 
     return guard_pct * s_star

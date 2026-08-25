@@ -139,10 +139,8 @@ class KillSwitch:
         # R-1 fix (round-3 parity audit, 2026-05-08): pre-fix this
         # called ``self._equity.dropped_below_threshold`` which uses
         # ``drawdown_pct`` — drawdown from LIFETIME PEAK, not daily PnL.
-        # The config name (``max_daily_dd_pct``), the kill-switch
-        # docstring, and ``RUNBOOK_PAPER_V2.md`` all describe a
-        # day-bounded threshold (e.g., "halt if daily DD > 2%"); the
-        # implementation was peak-relative. After a winning week
+        # The config and kill-switch contract require a day-bounded
+        # threshold; the implementation was peak-relative. After a winning week
         # followed by a 1.5% loss day, peak-DD would NOT trip even
         # though the spec said it should; conversely after a 5% DD
         # ANY 0.01% further dip from the unmoved peak tripped. Both
@@ -216,7 +214,7 @@ class KillSwitch:
         WARN but don't trip — the venue can hiccup for a single order
         without indicating systemic failure.
 
-        E.2.8 in plan ``starry-rolling-rabin.md``.
+        This isolates a slow feed from systemic engine failure.
         """
         if not (math.isfinite(total_ms) and total_ms > threshold_ms):
             return

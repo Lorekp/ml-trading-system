@@ -1,7 +1,5 @@
 """Latency-telemetry tests for OrderManager.
 
-I3 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Three contracts under test:
 
 1. **Dry-run path**: ``place_and_wait`` populates ``submit_to_ack_ms``,

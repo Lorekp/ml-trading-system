@@ -1,7 +1,6 @@
 """Tier C-2: vega_stop_minute_usd threshold sweep with CPCV + OOS gate.
 
-Pre-committed (locked in plan
-``C:\\Users\\laure\\.claude\\plans\\now-check-empirically-from-eager-bird.md``):
+Historical candidate set and split design:
 
 * Candidates: ``{$5,000, $10,000, $25,000, $50,000}`` per-BTC × N total
   (4 candidates).
@@ -580,7 +579,7 @@ def render_report(baseline: CandidateResult,
             f"(baseline ${baseline.oos_worst_day_usd:,.0f}, cut "
             f"${best.oos_worst_day_usd - baseline.oos_worst_day_usd:+,.0f})",
             "",
-            "Next step: flip ``with_btc_production_filters_v2()`` default and"
+            "Next step: update ``with_historical_btc_v2()`` for the replay and"
             " regenerate canonical V2 trade log if user approves.",
         ]
     else:

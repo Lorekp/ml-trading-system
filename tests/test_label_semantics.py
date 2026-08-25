@@ -2,9 +2,8 @@
 
 At any label key T, `load_labels(VolModelConfig()).ln_vol[T]` must equal
 `log(vol of [T, T+freq))` — the 1-bar-ahead forecast target. This invariant
-was silently broken on 2026-04-11 when the BTC TSRV parquet was migrated
-from START-stamped to END-stamped without updating the downstream alignment
-logic (full diagnosis in `vol_model/output/LABEL_SHIFT_AUDIT.md`). The fix
+was broken on 2026-04-11 when the BTC TSRV parquet was migrated from
+START-stamped to END-stamped without updating the downstream alignment logic. The fix
 lives in `vol_model/labels.py::load_labels` (conditional -freq shift) +
 `_PER_ASSET_CALIBRATION["BTCUSDT"]["tsrv_end_stamped"] = True`.
 
@@ -25,10 +24,65 @@ import pandas as pd
 import pytest
 
 from vol_model.config import VolModelConfig
-from vol_model.labels import load_labels
+from vol_model.labels import detect_stamping, load_labels
 
 
 STAGE18_PREDS = Path("vol_model/output/BTCUSDT_pruned_svi_predictions.parquet")
+
+# Horizons the 7-horizon AWS sweep trains (120m descoped — no TSRV).
+ALL_HORIZONS = [5, 15, 30, 60, 240, 480, 1440]
+
+
+@pytest.mark.parametrize("h_min", ALL_HORIZONS)
+def test_label_window_is_T_to_T_plus_freq_all_horizons(h_min):
+    """MF-2 regression lock: at EVERY horizon, load_labels(cfg).ln_vol[T] must
+    equal log(vol of the raw bar covering exactly [T, T+freq)).
+
+    The pre-MF-2 loader trusted the global tsrv_end_stamped=True flag and
+    shifted -freq unconditionally, so on the START-stamped non-15m parquets the
+    label silently targeted [T+freq, T+2*freq). This parametrized probe makes
+    the entire non-15m bug class visible to CI.
+
+    Ground truth is stamping-agnostic: read raw TSRV, detect its true stamping,
+    and select the raw bar whose realised window is [T, T+freq):
+      START-stamped: that window is the bar indexed at T.
+      END-stamped:   that window is the bar indexed at T+freq.
+    """
+    p = Path(f"TSRV/output/BTCUSDT_tsrv_{h_min}m.parquet")
+    if not p.exists():
+        pytest.skip(f"TSRV {h_min}m parquet not present")
+
+    cfg = VolModelConfig(asset="BTCUSDT", freq_s=h_min * 60)
+    raw = pd.read_parquet(p, columns=["vol_ann"])
+    raw = raw[raw["vol_ann"] > 0]
+    stamping = detect_stamping(raw.index, h_min * 60)
+    assert stamping in ("START", "END"), f"ambiguous stamping at h={h_min}"
+    freq = pd.Timedelta(minutes=h_min)
+
+    lbl = load_labels(cfg, clip=False)
+
+    keys = lbl.index
+    if len(keys) > 500:
+        keys = keys[:: max(1, len(keys) // 500)][:500]
+
+    n_ok = n_checked = 0
+    for T in keys:
+        gt_key = T if stamping == "START" else T + freq
+        if gt_key not in raw.index:
+            continue
+        gt = float(np.log(raw.loc[gt_key, "vol_ann"]))
+        got = float(lbl.loc[T, "ln_vol"])
+        n_checked += 1
+        if np.isclose(got, gt, atol=1e-9):
+            n_ok += 1
+
+    assert n_checked > 100, f"h={h_min}: too few checkable keys ({n_checked})"
+    frac = n_ok / n_checked
+    assert frac > 0.999, (
+        f"h={h_min} ({stamping}-stamped): only {frac:.4f} of labels match the "
+        f"[T, T+freq) target ({n_ok}/{n_checked}). Pre-MF-2 this was 0.000 at "
+        f"non-15m horizons (label shifted one bar forward to [T+freq, T+2*freq))."
+    )
 
 
 @pytest.mark.skipif(
@@ -55,8 +109,8 @@ def test_btc_labels_match_stage18_predictions():
     cfg = VolModelConfig()
     assert cfg.asset == "BTCUSDT"
     assert cfg.tsrv_end_stamped is True, (
-        "BTC per-asset default must set tsrv_end_stamped=True — TSRV is end-stamped "
-        "since 2026-04-11 migration; see LABEL_SHIFT_AUDIT.md."
+        "BTC per-asset default must set tsrv_end_stamped=True because its TSRV "
+        "artifact is end-stamped."
     )
 
     labels = load_labels(cfg)
@@ -97,7 +151,7 @@ def test_btc_labels_are_not_nowcast_when_end_stamped_flag_true():
     This complements the byte-match test by explicitly verifying we are in the
     correct target (forward forecast), not the incorrect target (backward
     nowcast). The nowcast bug signature is `current[T] == saved[T-15min]` for
-    100% of rows — see LABEL_SHIFT_AUDIT.md Section 1.
+    every comparable row.
     """
     cfg = VolModelConfig()  # tsrv_end_stamped=True via per-asset default
     labels = load_labels(cfg)

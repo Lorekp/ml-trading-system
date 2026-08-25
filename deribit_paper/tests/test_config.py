@@ -145,7 +145,8 @@ def test_for_small_account_sets_safe_limits(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     cfg = PaperConfig.for_small_account(equity_usd=750.0)
     assert cfg.max_open_positions == 1
-    assert cfg.kill_switch_daily_dd_pct == 5.0
+    assert cfg.kill_switch_daily_dd_pct == PaperConfig().kill_switch_daily_dd_pct
+    assert cfg.kill_switch_daily_dd_pct == 2.0
     assert cfg.min_trade_floor is True
     assert cfg.dry_run is True  # must still default to safe
     # max_single_trade_btc must NOT be hardcoded — formula scales with equity

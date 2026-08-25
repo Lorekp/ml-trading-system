@@ -1,6 +1,6 @@
 """Bivariate Ornstein-Uhlenbeck calibrator + path simulator on log-vol.
 
-Cycle 2 Phase A infrastructure (plan: ``now-check-empirically-from-eager-bird.md``).
+Historical Cycle 2 Phase A infrastructure.
 
 Calibrates a bivariate OU process to BTC 1-minute (log_IV, log_RV) on a
 strictly pre-evaluation calibration window and simulates synthetic paths
@@ -72,7 +72,7 @@ CALIBRATION_WINDOW: tuple[pd.Timestamp, pd.Timestamp] = (
 )
 
 # Quarantine days dropped from BOTH calibration and evaluation
-# (matches scripts/forensic/audit_v2_tail_risks.py and the plan)
+# (matches scripts/forensic/audit_v2_tail_risks.py)
 QUARANTINE_DAYS: tuple[pd.Timestamp, ...] = (
     pd.Timestamp("2022-06-13", tz="UTC"),
     pd.Timestamp("2022-11-08", tz="UTC"),
@@ -333,8 +333,8 @@ def freeze_calibration(
     if out.exists() and not force:
         raise FileExistsError(
             f"OU calibration already frozen at {out}. Refusing to "
-            "overwrite. Pass force=True only if you have a NEW plan file "
-            "authorising recalibration."
+            "overwrite. Pass force=True only after an explicit protocol "
+            "revision authorises recalibration."
         )
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(params)

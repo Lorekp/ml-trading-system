@@ -70,9 +70,8 @@ def main():
                         help="Target bar cadence for the WHOLE pipeline: TSRV "
                              "input parquet, SVI calibration buckets, composite-"
                              "straddle bucketing, and output filenames. Default "
-                             "15 (legacy BTC production). At h=5 pass 5; at h=60 "
-                             "pass 60. Must divide 1440. See plan "
-                             "starry-rolling-rabin.md Phase 2h5.2a.")
+                             "15 (historical BTC default). At h=5 pass 5; at "
+                             "h=60 pass 60. Must divide 1440.")
     parser.add_argument("--end-date", type=str, default="",
                         help="Optional ISO timestamp upper bound for the merged "
                              "output. When set, rows with index > end_date are "

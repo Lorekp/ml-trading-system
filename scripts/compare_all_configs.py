@@ -1,4 +1,4 @@
-"""Compare NC and Compound PnL across all production + overlay configs.
+"""Compare NC and Compound PnL across invalidated historical configurations.
 
 Configs:
 - baseline V2             (backtester: BTC_v2_trade_log_baseline.parquet)
@@ -20,8 +20,8 @@ CONFIGS = [
     ("V2 + aligner(bias)", "vol_arb/output/BTC_v2_trade_log_aligned_bias.parquet", "backtester"),
     ("V2 + throttle(sc=0.5)", "vol_arb/output/BTC_v2_trade_log_throttled_static.parquet", "post-processor"),
     ("V2 + DFL A1 filter-25", "vol_arb/output/BTC_v2_trade_log_dfl_A1_backtester.parquet", "backtester"),
-    # NEW DEFAULT (2026-04-21): V2 + aligner + Kelly K1 long-side boost.
-    ("** DEFAULT: V2+aligner+KellyK1 **", "vol_arb/output/BTC_v2_trade_log.parquet", "backtester"),
+    # Historical reference (2026-04-21): V2 + aligner + Kelly K1 boost.
+    ("historical V2+aligner+KellyK1", "vol_arb/output/BTC_v2_trade_log.parquet", "backtester"),
 ]
 
 

@@ -1,7 +1,5 @@
 """Tests for ``scripts/h15_alignment_harness.py``.
 
-I4 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Three contracts under test:
 
 1. **Empty inputs**: when both live + V2 logs are empty, the script

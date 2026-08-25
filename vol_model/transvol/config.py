@@ -35,6 +35,17 @@ class TransVolConfig:
     loss_weight_jump: float = 0.2
     huber_delta: float = 5.0    # Huber delta on normalized jump_var (mean=1.0, delta=5x mean)
 
+    # ── R2 (TransVol rehab, 2026-06-22): log-target for continuous_var ──
+    # When True the continuous-variance head predicts log(continuous_var)
+    # directly (raw skew 309 -> log skew -0.39, near-Gaussian) with a plain
+    # MSE loss in log space — removing the softplus(bias=-11) + raw-1e-5
+    # gradient pathology the raw-variance target required. The head bias is
+    # re-initialised to ``cont_log_bias`` (train-mean of the log-target) so
+    # the model starts calibrated. When False (PRODUCTION DEFAULT) the model
+    # is byte-identical to the deployed ratio-form QLIKE + softplus head.
+    target_log: bool = False
+    cont_log_bias: float = 0.0   # train-mean of log(continuous_var); set per fold
+
     # Temporal splits (ISO dates, UTC)
     data_start: str = ""           # empty = use all data (no L2 filter)
     train_end: str = "2025-01-01"

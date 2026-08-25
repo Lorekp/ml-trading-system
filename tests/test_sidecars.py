@@ -1,7 +1,5 @@
 """Unit tests for ``vol_arb/sidecars.py``.
 
-R2 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
-
 Contract checks:
 
 1. ``load_kelly_mult`` returns ``None`` for missing path; correctly

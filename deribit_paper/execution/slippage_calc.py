@@ -8,7 +8,6 @@ observed spread instead of posting a limit that won't fill.
 
 Result is a ``max_slippage_pct`` value sized for ``OrderManager.place_ioc_taker``.
 
-C4 in plan ``C:\\Users\\laure\\.claude\\plans\\live-engine-h15-alignment-2026-04-26\\``.
 """
 from __future__ import annotations
 

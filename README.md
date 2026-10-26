@@ -1,10 +1,21 @@
-# ML Trading System
+# ML Trading System — a research and learning project
 
 A Python research monorepo for crypto realized-volatility estimation, volatility forecasting, options simulation, and multi-asset directional signals. It connects market-data preparation, model evaluation, execution simulation, and checks intended to catch misleading research results.
+
+I built this to investigate whether machine learning and automated research could produce useful trading strategies. It did not establish a reliable strategy worth putting capital behind. Several encouraging backtests turned out to depend on incorrect accounting, future information, or selection bias. I keep the project as a record of that work: the useful infrastructure, the mistakes, and the checks developed to catch them.
 
 **Research status: no strategy is currently validated for live capital.** The historical Deribit V2 profit result was invalidated because changes in an SVI surface fit were treated as executable option-price gains. Honest marking produced negative results. S3 failed its frozen validation gate; its later rescue results were non-causal. S5 directional research still requires a clean full-universe rerun and independent execution/cost evidence. Forecast metrics also need regeneration with pinned inputs and corrected label semantics.
 
 The maintained [status](docs/STATUS.md), [validation ledger](docs/VALIDATION.md), and [post-mortems](docs/postmortems/) explain these conclusions. Old experiment names, trade logs, and commit messages are not current performance claims.
+
+## What I learned
+
+- A fitted price surface can change without creating an executable trading opportunity. The V2 investigation led to marking against actual same-contract observations and rejecting weak price evidence.
+- A small timestamp mistake can make a model appear to predict the future. Label alignment, training-only transformations, and purged evaluation matter as much as model choice.
+- Repeatedly selecting the best-looking backtest is itself a source of bias. Research needs predeclared gates, untouched evaluation data, and recorded failures.
+- More automation makes independent validation more important. A successful run or a confident generated explanation is not evidence that its economics are correct.
+
+For a short introduction, start with the [V2 accounting post-mortem](docs/postmortems/2026-06-v2-fake-pnl.md) and the [look-ahead-bias post-mortem](docs/postmortems/2026-03-close-model-lookahead.md). They explain why apparently strong results were withdrawn. The engineering below is the main reusable output; the repository is not a trading recommendation.
 
 ## What is implemented
 

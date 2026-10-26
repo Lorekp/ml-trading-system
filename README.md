@@ -1,122 +1,109 @@
 # ML Trading System
 
-Research monorepo for crypto volatility forecasting, options backtesting, and
-multi-asset directional signals.
+A Python research monorepo for crypto realized-volatility estimation, volatility forecasting, options simulation, and multi-asset directional signals. It connects market-data preparation, model evaluation, execution simulation, and checks intended to catch misleading research results.
 
-> **Current status:** no strategy in this repository is validated for live
-> capital. The historical Deribit V2 result was invalidated by a PnL-marking
-> bug, S3 failed its frozen validation gate, and S5 still needs a clean
-> full-universe rerun. The data, forecasting, replay, and validation
-> infrastructure remain useful research assets.
+**Research status: no strategy is currently validated for live capital.** The historical Deribit V2 profit result was invalidated because changes in an SVI surface fit were treated as executable option-price gains. Honest marking produced negative results. S3 failed its frozen validation gate; its later rescue results were non-causal. S5 directional research still requires a clean full-universe rerun and independent execution/cost evidence. Forecast metrics also need regeneration with pinned inputs and corrected label semantics.
 
-## Start here
+The maintained [status](docs/STATUS.md), [validation ledger](docs/VALIDATION.md), and [post-mortems](docs/postmortems/) explain these conclusions. Old experiment names, trade logs, and commit messages are not current performance claims.
 
-- [Current status](docs/STATUS.md) — what is active, invalidated, and next.
-- [Architecture](docs/ARCHITECTURE.md) — the two research stacks and their
-  boundaries.
-- [Validation policy](docs/VALIDATION.md) — evidence standards and result
-  ledger.
-- [Post-mortems](docs/postmortems/) — scoped accounts of the major failures.
+## What is implemented
 
-Generated reports under `*/output/` and non-source artifacts produced by
-`experiments/` are supporting evidence, not current documentation.
+- Tick ingestion and dollar-bar processing, with two-scale realized volatility (TSRV), jump-robust estimators, semivariance, and quarticity.
+- Volatility labels and point-in-time features, LightGBM forecasting, walk-forward evaluation, and optional neural encoders.
+- Options alignment, SVI features, fees, sizing, and diagnostic marking to recorded same-contract option trades.
+- Directional feature, portfolio, slippage, and execution research.
+- Purged cross-validation, leakage regressions, and explicit PnL-realism, sizing, and selection-bias gates.
+- Replay, paper, and testnet infrastructure. Legacy exchange connectors exist, but their presence does not establish a deployable strategy.
 
-## Research areas
+## Architecture
 
-| Path | Responsibility |
+```text
+Market data -> downloader -> TSRV -> vol_model -> vol_arb
+                                                   -> deribit_paper
+Market data -> src/signal_engine -> src/live
+Shared      -> src/afml, validation, configs, tests
+```
+
+| Directory | Role |
 | --- | --- |
-| `TSRV/` | Trade-to-realized-volatility pipeline: dollar bars, TSRV, BPV, MedRV, jumps, and quarticity. |
-| `vol_model/` | Volatility labels, features, LightGBM/TransVol forecasting, and walk-forward evaluation. |
-| `vol_arb/` | Deribit option alignment, SVI/DVOL features, honest PnL, fees, and options backtesting. |
-| `deribit_paper/` | Paper/testnet replay infrastructure. Historical V2 settings are isolated from its CLI. |
-| `src/signal_engine/` | Parallel multi-asset directional research stack, including S5. |
-| `src/live/` | Directional execution infrastructure. Legacy real connectors exist, but current use is limited to demo/testnet research. |
-| `src/afml/` | Shared purged-CV, bootstrap, Deflated Sharpe, and labeling utilities. |
-| `downloader/` | Binance and Deribit ingestion. |
-| `experiments/` | Tracked research source; caches, data, logs, and generated reports stay local. |
-| `scripts/` | Research, audit, regeneration, and infrastructure drivers; names do not imply validated results. |
-| `tests/` | Unit, regression, causality, and data-dependent integration tests. |
+| `downloader/`, `TSRV/` | Data ingestion, sampling, realized-volatility labels |
+| `vol_model/` | Features, forecasting, label alignment, walk-forward drivers |
+| `vol_arb/` | Options research, honest marking, costs, risk, backtesting |
+| `deribit_paper/` | Replay/testnet machinery; historical V2 configuration is forensic material |
+| `src/signal_engine/`, `src/live/` | Directional research and execution infrastructure |
+| `src/afml/`, `validation/` | Financial ML utilities and evidence gates |
+| `scripts/`, `experiments/` | Research drivers, audits, and experiment source |
+| `tests/`, `deribit_paper/tests/` | Unit, regression, and artifact-dependent checks |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data flow and module
-contracts.
+See [architecture and contracts](docs/ARCHITECTURE.md) for module boundaries. Packages under `src/` are installed as top-level packages; root workflow packages currently run from the repository checkout.
 
 ## Setup
 
-Python 3.11 or newer is required.
+Use Python **3.11 or newer**, working from the repository root:
 
 ```bash
 python -m venv .venv
 # Linux/macOS
 source .venv/bin/activate
-# Windows PowerShell
-# .venv\Scripts\Activate.ps1
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev,full]"
 ```
 
-Install the `live` extra only for exchange/testnet work:
+The manifest uses minimum dependency versions rather than a locked environment. Install a CPU/CUDA-appropriate PyTorch build separately for neural or DRL modules. Exchange/testnet dependencies are also available through `python -m pip install -e ".[dev,full,live]"`. Configure credentials locally from `.env.example` only when the chosen workflow requires them.
+
+## Data and a first research workflow
+
+Market data, trained weights, caches, and generated results are excluded from version control. A fresh checkout can inspect code and run synthetic checks, but cannot reproduce the historical research by itself.
+
+The TSRV default aggregate-trade input is `data/binance-aggTrades-parquet/`; input settings live in `TSRV/config.py` and loader details in `TSRV/data_loader.py`. Use the downloader and conversion utilities to prepare the expected data rather than substituting arbitrary OHLCV files. Review [TSRV documentation](TSRV/README.md) and [forecasting documentation](vol_model/README.md) before starting a full run.
+
+With the required local trade data prepared, this builds a 15-minute label series, engineers features, and trains a local research model:
 
 ```bash
-python -m pip install -e ".[dev,full,live]"
+python -m TSRV.run_tsrv_series --asset BTCUSDT --tf 900 --no-plot
+python -m vol_model.run_engineer --asset BTCUSDT --tf 900
+python -m vol_model.run_train --asset BTCUSDT --tf 900 --no-shap
 ```
 
-PyTorch is intentionally not pinned because the correct wheel depends on the
-host's CPU/CUDA setup. Install it separately before using TransVol or DRL
-modules.
+`--tf` is measured in seconds. Labels are written under `TSRV/output/`; model features and results live under `vol_model/output/`. This is a research starting point, not a certified walk-forward result.
 
-The checkout does not include market data or model weights. Copy
-`.env.example` to `.env`, add credentials locally, and populate the ignored
-`data/` tree before running data-dependent pipelines.
-
-## Tests
+The more extensive walk-forward and options workflows need matching SVI, HAR-PD, prediction, and option-data artifacts. Inspect their arguments and subsystem documentation first:
 
 ```bash
-python -m pytest -q
+python -m downloader --help
+python -m vol_model.run_walkforward_pruned_svi_har_pd --help
+python -m vol_arb.run_pipeline --help
+python -m vol_arb.run_backtest --help
 ```
 
-The default configuration excludes tests marked `integration` or `slow`.
-Run those groups explicitly when their ignored artifacts or long numerical
-calibrations are appropriate:
+Treat timestamps, horizons, coverage, and input hashes as part of the data contract. TSRV files have different historical stamping conventions. Walk-forward callers must load labels with `clip=False` and fit clipping bounds on each training fold: `load_labels` still defaults to full-series clipping for older callers. Do not reuse cached predictions after changing these semantics.
 
-```bash
-python -m pytest -q -m integration
-python -m pytest -q -m slow
-```
+## Tests and evidence
 
-For a fast validity-oriented check:
+Start with the focused synthetic/regression checks:
 
 ```bash
 python -m pytest tests/test_label_semantics.py tests/test_honest_pnl.py tests/test_validation_gates.py -q
 ```
 
-Integration tests require large ignored artifacts and are not fresh-clone
-tests. A passing unit suite is necessary but does not validate a trading
-result; use the gates in [docs/VALIDATION.md](docs/VALIDATION.md).
-
-## Typical pipeline entry points
+Run the default suite or opt into additional groups:
 
 ```bash
-python -m downloader --help
-python -m TSRV.run_tsrv_series --help
-python -m vol_model.run_walkforward_pruned_svi_har_pd --help
-python -m vol_arb.run_pipeline --help
-python -m vol_arb.run_backtest --help
-python scripts/run_baseline_experiments.py --help
+python -m pytest -q
+python -m pytest -q -m integration
+python -m pytest -q -m slow
 ```
 
-The root workflow packages run from a repository checkout. The editable
-package installs the reusable modules under `src/`.
+The default pytest configuration excludes `integration` and `slow`. Artifact-dependent tests need their declared local files, and some checks skip when these are absent. A passing unit suite cannot establish profitability or validate historical input artifacts.
 
-## Repository policy
+The strict options-PnL gate admits only finite tier-1 observations with real trade prices on all four option legs. It requires minimum sample size and coverage, sign agreement, bounded aggregate error, and per-trade correlation. Mark-price fallbacks are diagnostic only; backward trade-tape matching is still not proof that an order could have filled. See [validation policy](docs/VALIDATION.md) before promoting any result.
 
-- Source, tests, configuration templates, and canonical Markdown under
-  `docs/` are versioned.
-- Raw data, caches, model weights, plots, logs, and generated reports are not.
-- A result is not a claim until its code, data window, reproduction command,
-  costs, fills, and validation gates are recorded.
-- Credentials belong only in environment variables or ignored local files.
-  Never put a key in YAML, source code, or a command committed to Git.
+## Limitations and attribution
 
-This is proprietary research software. It is not financial advice and is not
-licensed for redistribution.
+Open issues include invalid SVI sidecar coverage/stamping, unpinned historical inputs, unresolved forecast comparisons, incomplete S5 realism evidence, and suspected defects in canonical execution paths. The [correctness backlog](docs/KNOWN_ISSUES.md) records their scope. Large research workflows require external data and may be computationally expensive.
+
+This repository integrates established numerical and ML libraries, including NumPy, pandas, SciPy, scikit-learn, LightGBM, and optional neural tooling. AFML implementations cite Marcos López de Prado's *Advances in Financial Machine Learning* (2018); these methods are not claimed as original algorithms. Commit history records AI-assisted contributions.
+
+The project is proprietary research software. No redistribution license is supplied. Preserve source-level attribution and respect the separate licenses of dependencies and data providers.
